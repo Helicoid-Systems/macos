@@ -121,25 +121,57 @@ public final class GuidedServerSetupModel {
     public private(set) var backupDestination: String = ""
     public private(set) var installProgress: InstallProgress = .notStarted
     public private(set) var blocker: String?
+    public private(set) var isCheckingHost = false
+    public private(set) var hostPreflight: SSHHostPreflight?
+    public private(set) var initiatingManagerPublicKey: Data?
+    public private(set) var isPreparingManagerIdentity = false
 
-    public init() {}
+    public static let requiredHostChecks = [
+        "SSH reachability", "Operating system", "Service manager", "Administrator access",
+        "Disk space", "Product ports", "Existing installation",
+    ]
+    private let sshClient: SSHSetupClient
+    private let managerIdentityStore: ManagerIdentityStore
+    private var managerIdentity: ManagerSigningIdentity?
+    private var verificationTask: Task<Void, Never>?
+    private var verificationGeneration = UUID()
+
+    public init(sshClient: SSHSetupClient = SSHSetupClient(), managerIdentityStore: ManagerIdentityStore = ManagerIdentityStore()) {
+        self.sshClient = sshClient
+        self.managerIdentityStore = managerIdentityStore
+    }
+
+    public func prepareManagerIdentity() async {
+        guard managerIdentity == nil, !isPreparingManagerIdentity else { return }
+        isPreparingManagerIdentity = true
+        defer { isPreparingManagerIdentity = false }
+        do {
+            let identity = try await managerIdentityStore.loadOrCreate()
+            try Task.checkCancellation()
+            managerIdentity = identity
+            initiatingManagerPublicKey = identity.publicKey
+            generatedTrustIdentityNote = "Initiating Manager public key: " + identity.publicKey.map { String(format: "%02x", $0) }.joined()
+        } catch is CancellationError {
+            return
+        } catch {
+            blocker = (error as? HelicoidError)?.explanation ?? "The Manager identity could not be saved. Setup is stopped."
+        }
+    }
 
     public var canContinueFromCurrentPhase: Bool {
         switch phase {
         case .chooseHosting:
             return true
         case .connect:
-            return !sshAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return (try? SSHSetupAddress(sshAddress)) != nil && sshAuthMethod == .agentKey
         case .hostIdentity:
             return hostIdentity.isVerified
         case .checkHost:
-            return hostChecks.values.allSatisfy { status in
-                if case .passed = status { return true }
-                return false
-            } && !hostChecks.isEmpty
+            return hostIdentity.isVerified && Self.requiredHostChecks.allSatisfy { hostChecks[$0] == .passed }
         case .network:
             return !networkAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                && Int(productPort) != nil
+                && UInt16(productPort).map { $0 > 0 && ![21115, 21116, 21117].contains($0) } == true
+                && hostChecks["Product ports"] == .passed
         case .deploymentIdentity:
             return !deploymentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         case .administrator:
@@ -157,10 +189,14 @@ public final class GuidedServerSetupModel {
     }
 
     public func setSSHAddress(_ value: String) {
+        guard value != sshAddress else { return }
+        invalidateHostVerification()
         sshAddress = value
     }
 
     public func setSSHAuthMethod(_ method: SSHAuthMethod) {
+        guard method != sshAuthMethod else { return }
+        invalidateHostVerification()
         sshAuthMethod = method
     }
 
@@ -170,6 +206,11 @@ public final class GuidedServerSetupModel {
 
     public func setProductPort(_ value: String) {
         productPort = value
+        if let hostPreflight, let port = UInt16(value), port > 0 {
+            hostChecks = hostPreflight.checks(authorityPort: port)
+        } else if hostPreflight != nil {
+            hostChecks["Product ports"] = .needsAttention(detail: "Enter a valid port.")
+        }
     }
 
     public func setLanScope(_ value: String) {
@@ -198,6 +239,72 @@ public final class GuidedServerSetupModel {
 
     public func setHostCheck(_ name: String, status: HostCheckStatus) {
         hostChecks[name] = status
+    }
+
+    public func startHostCheck() {
+        guard !isCheckingHost else { return }
+        verificationTask = Task { [weak self] in await self?.verifyAndInspectHost() }
+    }
+
+    public func cancelHostCheck() {
+        verificationTask?.cancel()
+        verificationTask = nil
+        verificationGeneration = UUID()
+        isCheckingHost = false
+        if case .checking = hostIdentity { hostIdentity = .notChecked }
+    }
+
+    public func verifyAndInspectHost() async {
+        guard !isCheckingHost else { return }
+        let generation = UUID()
+        verificationGeneration = generation
+        isCheckingHost = true
+        let previousFingerprint: String?
+        if case .verified(let fingerprint) = hostIdentity { previousFingerprint = fingerprint }
+        else { previousFingerprint = nil }
+        hostIdentity = .checking
+        hostChecks = [:]
+        hostPreflight = nil
+        blocker = nil
+        defer {
+            if generation == verificationGeneration {
+                isCheckingHost = false
+                verificationTask = nil
+            }
+        }
+        do {
+            guard sshAuthMethod == .agentKey else {
+                throw HelicoidError.setupBlocked(reason: "Use an SSH key from your agent for this test installer.")
+            }
+            let result = try await sshClient.preflight(address: SSHSetupAddress(sshAddress))
+            try Task.checkCancellation()
+            guard generation == verificationGeneration else { return }
+            if let previousFingerprint, previousFingerprint != result.fingerprint {
+                hostIdentity = .changed(expected: previousFingerprint, actual: result.fingerprint)
+                blocker = HelicoidError.hostIdentityUnverified.explanation
+                return
+            }
+            hostIdentity = .verified(fingerprint: result.fingerprint)
+            hostPreflight = result.host
+            hostChecks = result.host.checks(authorityPort: UInt16(productPort) ?? 8920)
+            if networkAddress.isEmpty { networkAddress = try SSHSetupAddress(sshAddress).host }
+        } catch {
+            guard generation == verificationGeneration else { return }
+            if error is CancellationError || error as? SetupCommandError == .cancelled {
+                hostIdentity = .notChecked
+            } else {
+                let detail = (error as? HelicoidError)?.explanation ?? "SSH preflight failed or exceeded its time/output limit."
+                hostIdentity = .refused(detail: detail)
+                blocker = detail
+            }
+        }
+    }
+
+    private func invalidateHostVerification() {
+        cancelHostCheck()
+        hostIdentity = .notChecked
+        hostChecks = [:]
+        hostPreflight = nil
     }
 
     public func advance() {
@@ -232,9 +339,11 @@ public final class GuidedServerSetupModel {
     }
 
     public func reset() {
+        cancelHostCheck()
         phase = .chooseHosting
         hostIdentity = .notChecked
         hostChecks = [:]
+        hostPreflight = nil
         installProgress = .notStarted
         blocker = nil
     }

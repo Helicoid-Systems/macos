@@ -765,6 +765,7 @@ struct SetupModelRegressionTests {
         model.setHostCheck("SSH reachability", status: .passed)
         model.setHostCheck("Disk space", status: .passed)
         model.setHostCheck("Operating system", status: .passed)
+        for name in GuidedServerSetupModel.requiredHostChecks { model.setHostCheck(name, status: .passed) }
         model.advance()
         #expect(model.phase == .network)
     }

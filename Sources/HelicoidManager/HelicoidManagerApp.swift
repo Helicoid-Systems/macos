@@ -61,7 +61,11 @@ struct RootView: View {
                 GuidedSetupView()
             }
         }
-        .frame(minWidth: 720, minHeight: 480)
+        .frame(
+            minWidth: session.screen == .guidedSetup ? 560 : 720,
+            minHeight: session.screen == .guidedSetup ? 360 : 480
+        )
+        .background(SetupWindowChrome(isEnabled: session.screen == .guidedSetup))
     }
 }
 
