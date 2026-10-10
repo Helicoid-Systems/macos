@@ -86,10 +86,12 @@ Fixture mode and development-server mode are independent and must not be conflat
 Mac manager offers **Linux SSH only**. Install never claims success without
 integrated server packages.
 
-Setup uses a custom native dialog layout with an inline step indicator and
-Cancel/Back/Continue controls along the bottom. Its window title-bar strip is
-hidden during setup and restored on exit. Fields include SSH and Linux-folder
-examples; Manager key details expand on demand.
+Setup opens directly to the SSH address in a compact custom native dialog.
+Its title is **Server Setup · Helicoid Manager**, with no navigation bar,
+step counter, large heading or introductory paragraph. Verification and host
+checks share one screen; details, advanced network settings and optional
+backups expand on demand. Cancel/Back/Continue stay along the bottom, and
+exiting setup restores the original window title and size.
 
 The native wizard uses the system OpenSSH client with strict host-key checking,
 key authentication and bounded read-only preflight. Unknown or changed keys stop

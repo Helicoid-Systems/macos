@@ -131,23 +131,28 @@ No remote installation, service, firewall or server data change occurred. Intel
 runtime, notarization and the full appearance/accessibility matrix are unchanged
 release gates.
 
-## Custom native setup dialog, 2026-10-10
+## Minimal native setup dialog, 2026-10-10
 
-Removed the setup header bar, window title and title-bar separator during setup;
-normal window chrome is restored on exit. Replaced nested scrolling with one
-native form per step, moved Cancel/Back/Continue into one footer, added inline
-progress and plain instructions, and moved Manager key details into a disclosure.
-The SSH verification action now occupies the primary footer button. Unsupported
-password authentication and the disabled single-choice hosting selector are no
-longer presented as choices. Linux folder fields include examples and identify
-the remote host explicitly.
+Setup opens at the SSH address, with no introductory screen, phase counter,
+large heading or repeated description. The native title reads
+`Server Setup · Helicoid Manager`; there is no custom navigation bar or
+separator. Verification and compatibility share one screen, with details
+available on demand. Network options, Manager identity and optional backup
+location use disclosures. Linux storage defaults to `/var/lib/helicoid`.
+Cancel restores the original window title and size.
 
 - `HELICOID_FORCE_ICON_FALLBACK=1 ./scripts/build.sh`: exit 0; **95 tests in
   18 suites passed**, release apps packaged and complete signatures verified.
-- Native CUA: required fields disable Continue; trusted SSH verification succeeds;
-  all seven compatibility checks pass; network defaults appear; identity details
-  expand; administrator and remote-folder instructions display; Escape returns to
-  Connect with the original window title. Final packaged build was reopened and
-  its setup navigation and hidden title confirmed through accessibility state.
+- Native CUA on the final packaged build: empty SSH and deployment/admin fields
+  disable the primary button; actual trusted SSH preflight succeeds; the
+  disclosure shows the verified fingerprint and all seven passed checks.
+  Continue goes directly to Network; Back traverses the combined check screen
+  to Connect. Deployment, administrator, storage and review screens have no
+  repeated introductory heading. The storage default and collapsed backup
+  option display correctly. Escape returns to the original Manager window.
 - Source diff whitespace check passed. Full VoiceOver, light appearance, and the
   complete window-size matrix remain unverified. Installation remains pending.
+
+Layout references reviewed online: [Little Snitch setup](https://help.obdev.at/littlesnitch6/intro-install)
+and [Tailscale macOS permission flow](https://tailscale.com/docs/concepts/macos-sysext).
+Borrowed focused native dialogs and a clear primary action; no assets copied.
