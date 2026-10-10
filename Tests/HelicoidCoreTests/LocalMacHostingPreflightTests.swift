@@ -199,8 +199,22 @@ struct LocalMacHostingPreflightTests {
 
     @Test("Invalid preflight payload refuses rather than passes checks")
     func invalidPayloadRefuses() async {
+        let emptyName = LocalHostPreflight(
+            computerName: "",
+            osVersion: "27.0.1",
+            architecture: "arm64",
+            launchdAvailable: true,
+            administratorAccess: true,
+            freeBytes: 8_000_000_000,
+            productPath: .absent,
+            launchdService: .absent,
+            listeners: .complete(tcpPorts: [], udpPorts: [])
+        )
+        await #expect(throws: HelicoidError.self) {
+            try await LocalMacSetupClient(inspector: StubLocalInspector(.facts(emptyName))).preflight()
+        }
         let oversized = LocalHostPreflight(
-            computerName: String(repeating: "x", count: 65),
+            computerName: String(repeating: "x", count: LocalHostPreflight.computerNameMaxUTF8 + 1),
             osVersion: "27.0.1",
             architecture: "arm64",
             launchdAvailable: true,
@@ -227,6 +241,30 @@ struct LocalMacHostingPreflightTests {
         await #expect(throws: HelicoidError.self) {
             try await LocalMacSetupClient(inspector: StubLocalInspector(.facts(duplicated))).preflight()
         }
+    }
+
+    @Test("Long legitimate hostnames validate; display truncation is not identity")
+    func longHostnameValidates() throws {
+        // Real CI/OS hostnames can exceed the old 64-byte product-friendly-name bound.
+        let longName = "runner-" + String(repeating: "a", count: 200) + ".ci.example.internal"
+        #expect(longName.utf8.count > 64)
+        #expect(longName.utf8.count <= LocalHostPreflight.computerNameMaxUTF8)
+        let preflight = LocalHostPreflight(
+            computerName: longName,
+            osVersion: "27.0.1",
+            architecture: "arm64",
+            launchdAvailable: true,
+            administratorAccess: true,
+            freeBytes: 8_000_000_000,
+            productPath: .absent,
+            launchdService: .absent,
+            listeners: .complete(tcpPorts: [22], udpPorts: [5353])
+        )
+        try preflight.validate()
+        let display = LocalHostPreflight.displayComputerName(longName)
+        #expect(display.utf8.count <= LocalHostPreflight.computerNameDisplayMaxUTF8)
+        #expect(display.hasSuffix("…"))
+        #expect(LocalHostPreflight.displayComputerName("lab-mac") == "lab-mac")
     }
 
     @Test("Inspector failure surfaces as setup block")
@@ -297,12 +335,14 @@ struct LocalMacHostingPreflightTests {
             lsofKey("UDP"): emptyListen,
             launchdKey: SetupCommandResult(exitStatus: 0, output: Data("system/com.helicoid.server = {\n}\n".utf8)),
         ])
-        // Plan paths do not exist on this host, so plist state is absent; loaded must still conflict.
+        // Paths are absent by construction; loaded-without-plist must still conflict.
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("helicoid-launchd-\(UUID().uuidString)", isDirectory: true)
         let plan = LocalHostingOwnershipPlan(
-            productRootPath: "/tmp/hs-production-20261010/no-product",
-            dataPath: "/tmp/hs-production-20261010/no-product/Data",
+            productRootPath: scratch.appendingPathComponent("no-product").path,
+            dataPath: scratch.appendingPathComponent("no-product/Data").path,
             launchdLabel: "com.helicoid.server",
-            launchdPlistPath: "/tmp/hs-production-20261010/no-product.plist"
+            launchdPlistPath: scratch.appendingPathComponent("no-product.plist").path
         )
         let result = try await SystemLocalHostingInspector(runner: runner, plan: plan).inspect()
         #expect(result.launchdService == .conflicting(plist: .absent, loaded: true))
@@ -310,14 +350,19 @@ struct LocalMacHostingPreflightTests {
     }
 
     @Test("resourceState uses lstat so dangling symlinks are conflicts")
-    func resourceStateDetectsDanglingSymlink() {
-        let link = "/tmp/hs-production-20261010/dangling-\(UUID().uuidString)"
-        unlink(link)
-        #expect(symlink("/tmp/hs-production-20261010/no-such-target", link) == 0)
-        #expect(SystemLocalHostingInspector.resourceState(at: link) == .brokenSymlink)
-        #expect(SystemLocalHostingInspector.resourceState(at: "/tmp/hs-production-20261010/absent-\(UUID().uuidString)") == .absent)
+    func resourceStateDetectsDanglingSymlink() throws {
+        // Unique owned directory under the process temporary root; cleanup only this directory.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("helicoid-resource-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let link = dir.appendingPathComponent("dangling-link")
+        let missingTarget = dir.appendingPathComponent("no-such-target")
+        #expect(symlink(missingTarget.path, link.path) == 0)
+        #expect(SystemLocalHostingInspector.resourceState(at: link.path) == .brokenSymlink)
+        #expect(SystemLocalHostingInspector.resourceState(at: dir.appendingPathComponent("absent").path) == .absent)
         #expect(SystemLocalHostingInspector.resourceState(at: "/") == .present)
-        unlink(link)
     }
 
     @Test("getgrouplist stays inside the configured bound")
@@ -477,10 +522,16 @@ struct LocalMacHostingPreflightTests {
     @Test("Live read-only preflight on this Mac is structurally valid")
     func liveLocalPreflight() async throws {
         let result = try await LocalMacSetupClient().preflight()
+        // Validate the real OS/host/port facts; do not bypass validation or swallow failure.
         try result.validate()
         #expect(!result.computerName.isEmpty)
+        #expect(result.computerName.utf8.count <= LocalHostPreflight.computerNameMaxUTF8)
+        #expect(LocalHostPreflight.displayComputerName(result.computerName)
+            .utf8.count <= LocalHostPreflight.computerNameDisplayMaxUTF8)
         #expect(result.osVersion.contains("."))
         #expect(result.architecture == "arm64" || result.architecture == "x86_64")
+        #expect(result.listeners.tcpPorts.count <= 1024)
+        #expect(result.listeners.udpPorts.count <= 1024)
         // Host state varies (occupied ports, existing paths, non-elevated listeners).
         #expect(result.checks().count == GuidedServerSetupModel.requiredLocalChecks.count)
         // Without elevation, listener completeness must be represented, not claimed.

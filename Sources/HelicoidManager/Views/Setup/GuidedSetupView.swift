@@ -206,7 +206,7 @@ struct GuidedSetupView: View {
                     DisclosureGroup("Details") {
                         if model.route == .thisMac {
                             if let local = model.localPreflight {
-                                Text("Computer: \(local.computerName)")
+                                Text("Computer: \(LocalHostPreflight.displayComputerName(local.computerName))")
                                     .font(.caption.monospaced())
                                 Text("\(local.osVersion) · \(local.architecture)")
                                     .font(.caption.monospaced())

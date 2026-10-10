@@ -100,6 +100,13 @@ the dedicated Helicoid ports and an existing installation. Existing listeners on
 80/443 are informational and are preserved. Cancellation ends the local SSH child;
 it does not claim to roll back remote operations.
 
+The This Mac route uses bounded read-only local inspection (OS/architecture,
+privileges, disk, product path, launchd service, ports). The system hostname is
+informational display text (shown truncated in the UI) and is not a product
+identity; legitimate long hostnames validate. Without elevation, listener
+inspection is explicitly incomplete and Product ports cannot pass. Installation
+stays unavailable in this build.
+
 Opening setup creates or loads the initiating Manager's Ed25519 identity through
 macOS Keychain. Only its public key is shown. Corrupt or inaccessible stored
 identities are refused rather than silently replaced. Package apply and MFA

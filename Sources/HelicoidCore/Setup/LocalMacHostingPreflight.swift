@@ -83,6 +83,11 @@ public enum ListenerInspection: Equatable, Sendable {
 /// Read-only facts about this Mac. No privileged writes or elevation while gathering them.
 /// Unknown required facts never count as passed.
 public struct LocalHostPreflight: Equatable, Sendable {
+    /// `HOST_NAME_MAX` on Darwin. Hostname is informational display text, not a product identity.
+    public static let computerNameMaxUTF8 = 255
+    /// Compact UI bound; display truncation never changes identity validation.
+    public static let computerNameDisplayMaxUTF8 = 64
+
     public let version: Int
     public let computerName: String
     public let osVersion: String
@@ -111,13 +116,32 @@ public struct LocalHostPreflight: Equatable, Sendable {
     }
 
     public func validate() throws {
-        guard version == 1, computerName.utf8.count <= 64, osVersion.utf8.count <= 32,
+        guard version == 1,
+              !computerName.isEmpty,
+              computerName.utf8.count <= Self.computerNameMaxUTF8,
+              osVersion.utf8.count <= 32,
               architecture.utf8.count <= 32,
               listeners.tcpPorts.count <= 1024, listeners.udpPorts.count <= 1024,
               Set(listeners.tcpPorts).count == listeners.tcpPorts.count,
               Set(listeners.udpPorts).count == listeners.udpPorts.count else {
             throw HelicoidError.setupBlocked(reason: "Invalid local host preflight response.")
         }
+    }
+
+    /// Display-only truncation for compact UI. Hostname is not treated as an identity.
+    public static func displayComputerName(_ name: String, maxUTF8: Int = computerNameDisplayMaxUTF8) -> String {
+        guard name.utf8.count > maxUTF8 else { return name }
+        let ellipsis = "…"
+        let budget = max(0, maxUTF8 - ellipsis.utf8.count)
+        var truncated = String()
+        var used = 0
+        for character in name {
+            let width = String(character).utf8.count
+            if used + width > budget { break }
+            truncated.append(character)
+            used += width
+        }
+        return truncated + ellipsis
     }
 
     public func checks(authorityPort: UInt16 = 8920,
