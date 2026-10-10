@@ -49,6 +49,7 @@ struct HelicoidComputerApp: App {
 
 struct StatusMenuContent: View {
     @Environment(ComputerStatusModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -70,11 +71,7 @@ struct StatusMenuContent: View {
 
             Button("Open Status Window") {
                 NSApp.activate(ignoringOtherApps: true)
-                if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "status" }) {
-                    window.makeKeyAndOrderFront(nil)
-                } else {
-                    NSApp.sendAction(Selector(("showWindows:")), to: nil, from: nil)
-                }
+                openWindow(id: "status")
             }
 
             Button("Quit Helicoid Computer") {
