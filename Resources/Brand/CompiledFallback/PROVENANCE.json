@@ -1,0 +1,21 @@
+{
+  "generatedOn": "2026-10-10",
+  "toolchain": "Xcode 27.0 (27A266a), actool",
+  "minimumDeploymentTarget": "15.0",
+  "source": "Exact role-specific layered icon sources in this repository",
+  "purpose": "Native .icns fallback when the installed actool cannot compile the approved .icon format; no artwork changes.",
+  "files": [
+    {
+      "file": "Manager.icns",
+      "role": "Mac manager",
+      "sha256": "c86694e40f3442b6928df7b5b106c2014eec32850739648822629519a56d81bd",
+      "bytes": 90955
+    },
+    {
+      "file": "Computer.icns",
+      "role": "Mac monitored computer",
+      "sha256": "873e64555f16ac647daa451d0dc34fc939f4de7605c5deff936eefe6ea82ff45",
+      "bytes": 58804
+    }
+  ]
+}
