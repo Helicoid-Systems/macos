@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "providedOn": "2026-10-09",
+  "provenance": "User-supplied original branding assets",
+  "identityRole": "Shared company and product identity, confirmed by the user",
+  "artworkLicense": null,
+  "sources": [
+    {
+      "path": "HS App icon.icon",
+      "role": "Original baseline app icon source; retained for the Mac monitored-computer app and planned Windows resources",
+      "derivedPlatformAssets": "Not generated"
+    },
+    {
+      "path": "HS Manager App icon.icon",
+      "role": "Editable Mac manager app icon source, selected by the user",
+      "providedOn": "2026-10-10",
+      "platform": "macOS",
+      "appRole": "manager",
+      "derivedPlatformAssets": "Not generated"
+    },
+    {
+      "path": "hs logo.svg",
+      "role": "Logo with dark lettering for light surfaces",
+      "viewBox": "0 0 2000 2000"
+    },
+    {
+      "path": "hs logo white.svg",
+      "role": "Logo with white lettering for dark surfaces",
+      "viewBox": "0 0 2000 2000"
+    }
+  ],
+  "files": [
+    {
+      "path": "HS App icon.icon/Assets/hs stripe.svg",
+      "bytes": 1358,
+      "sha256": "0d41b93ce1c4ee017e4516534bb1884c77978f9a7ff6edf6ad633857d560fb01"
+    },
+    {
+      "path": "HS App icon.icon/Assets/hs text.svg",
+      "bytes": 3548,
+      "sha256": "24c05bca221ca5455086a269e7b9b68d5d503c1608d73d57428c31eb733f3aee"
+    },
+    {
+      "path": "HS App icon.icon/icon.json",
+      "bytes": 2182,
+      "sha256": "ae154c552dcf8b8e2d7c16b6fb355013e9133f8df9410bb87746913a20398eca"
+    },
+    {
+      "path": "hs logo.svg",
+      "bytes": 4074,
+      "sha256": "36455cf5b44d1d3a72d5218de5433f53a332f37cc4acc9a31aaa9e643086d271"
+    },
+    {
+      "path": "hs logo white.svg",
+      "bytes": 4096,
+      "sha256": "12b5df88c873c892f4eee969996b9b26254d9f62743805a9e6d3aa277fab5869"
+    },
+    {
+      "path": "HS Manager App icon.icon/Assets/gridmakerpro-grid-only-300dpi-2026-10-10.png",
+      "bytes": 1158480,
+      "sha256": "8019d371bdd6d717b8c94d1e9826bebdc52c870b05bcf6f6b7c15cd5b22d8f92"
+    },
+    {
+      "path": "HS Manager App icon.icon/Assets/hs stripe.svg",
+      "bytes": 1358,
+      "sha256": "0d41b93ce1c4ee017e4516534bb1884c77978f9a7ff6edf6ad633857d560fb01"
+    },
+    {
+      "path": "HS Manager App icon.icon/Assets/hs text.svg",
+      "bytes": 3548,
+      "sha256": "24c05bca221ca5455086a269e7b9b68d5d503c1608d73d57428c31eb733f3aee"
+    },
+    {
+      "path": "HS Manager App icon.icon/icon.json",
+      "bytes": 3369,
+      "sha256": "2b89dc9fe8952bc6dc15202ed2fc15f279e438c78491ef92dee8b3e499ffb952"
+    }
+  ],
+  "updatedOn": "2026-10-10",
+  "assignments": [
+    {
+      "platform": "macOS",
+      "appRole": "manager",
+      "source": "HS Manager App icon.icon",
+      "status": "Confirmed source; native integration not implemented"
+    },
+    {
+      "platform": "macOS",
+      "appRole": "monitored computer",
+      "source": "HS App icon.icon",
+      "status": "Existing source retained"
+    },
+    {
+      "platform": "Windows",
+      "appRole": "manager and monitored computer",
+      "source": "HS App icon.icon",
+      "status": "Existing source retained; native exports not generated"
+    }
+  ]
+}

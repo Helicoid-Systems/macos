@@ -1,0 +1,75 @@
+# macOS CI — Helicoid Manager / Helicoid Computer
+
+name: macOS
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-and-build:
+    name: Test and build
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26+ / Swift 6.2+
+        run: |
+          # Prefer an installed Xcode that supports swift-tools-version 6.2.
+          if [ -d /Applications/Xcode_26.4.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.4.app/Contents/Developer
+          elif [ -d /Applications/Xcode_26.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+          else
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          fi
+          xcodebuild -version
+          swift --version
+          swift package dump-package >/dev/null
+
+      - name: Test
+        run: |
+          xcrun swift test --package-path .
+
+      - name: Build release
+        run: |
+          xcrun swift build -c release --package-path .
+
+      - name: Package apps
+        run: |
+          ./scripts/build.sh
+
+      - name: Upload apps
+        uses: actions/upload-artifact@v4
+        with:
+          name: helicoid-macos-apps
+          path: dist/
+          if-no-files-found: error
+
+  intel-source-build:
+    name: Intel source compatibility
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26+ / Swift 6.2+
+        run: |
+          # Prefer an installed Xcode that supports swift-tools-version 6.2.
+          if [ -d /Applications/Xcode_26.4.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.4.app/Contents/Developer
+          elif [ -d /Applications/Xcode_26.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+          else
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          fi
+          xcodebuild -version
+          swift --version
+          swift package dump-package >/dev/null
+
+      - name: Build for x86_64 (source compatibility)
+        run: |
+          xcrun swift build -c release --arch x86_64 --package-path .
