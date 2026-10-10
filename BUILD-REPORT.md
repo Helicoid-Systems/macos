@@ -1,10 +1,10 @@
 # BUILD-REPORT — Helicoid macOS (apps/macos)
 
-Date: 2026-10-10 (post-review fixes)  
-Owner path: `apps/macos/**` only  
-Product: Helicoid / Helicoid Systems  
-Apps: Helicoid Manager, Helicoid Computer  
-Toolchain: Xcode 27.0 (27A266a), Apple Swift 6.4  
+Date: 2026-10-10 (post-review fixes)
+Owner path: `apps/macos/**` only
+Product: Helicoid / Helicoid Systems
+Apps: Helicoid Manager, Helicoid Computer
+Toolchain: Xcode 27.0 (27A266a), Apple Swift 6.4
 
 ## Coordinator review defects — status
 
@@ -79,3 +79,5 @@ No git operations. No global installs. Brand artwork sources unchanged (four-fil
 Final packaged source passes 77 tests in 15 suites. Both release apps package with compiled layered icons and ad-hoc signatures. Live loopback integration with the actual server and both native client libraries passes 21 checks (19 HTTP operations and two client probes). This is development transport proof, not production authentication or remote viewing.
 
 Native Manager navigation was driven through Choose Hosting into SSH details; missing SSH address disables Continue. Production Connect remains disabled. Removed the simulated SSH identity verifier: entering a fingerprint no longer creates a verified host. Actual host-key verification remains unavailable. Required login expiry, capabilities, account revision, MFA state and health readiness now fail closed when malformed.
+
+Final packaged Manager CUA check: production Connect disabled; Guided Setup advances into SSH address entry; after entering example.invalid, Host Identity explains real verification is unavailable and Continue remains disabled. No SSH connection or deployment occurred.

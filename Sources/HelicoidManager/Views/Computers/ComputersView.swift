@@ -545,5 +545,3 @@ struct ActionComposerView: View {
         .frame(minWidth: 420, minHeight: 320)
     }
 }
-
-
