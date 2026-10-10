@@ -109,6 +109,7 @@ struct SSHSetupTests {
         let runner = SSHFixtureRunner(SetupCommandResult(exitStatus: 0, output: facts,
             errorOutput: Data("debug1: Server host key: ssh-ed25519 \(fingerprint)\n".utf8)))
         let model = GuidedServerSetupModel(sshClient: SSHSetupClient(runner: runner))
+        model.setRoute(.existingLinuxSSH)
         model.setSSHAddress("ubuntu@host")
         await model.verifyAndInspectHost()
         #expect(model.hostIdentity.isVerified)
@@ -123,6 +124,7 @@ struct SSHSetupTests {
         let runner = SSHFixtureRunner(SetupCommandResult(exitStatus: 0, output: facts,
             errorOutput: Data("debug1: Server host key: ssh-ed25519 \(fingerprint)\n".utf8)))
         let model = GuidedServerSetupModel(sshClient: SSHSetupClient(runner: runner))
+        model.setRoute(.existingLinuxSSH)
         model.setSSHAddress("ubuntu@host")
         await model.verifyAndInspectHost()
         model.setProductPort("443")

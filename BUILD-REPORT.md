@@ -156,3 +156,11 @@ Cancel restores the original window title and size.
 Layout references reviewed online: [Little Snitch setup](https://help.obdev.at/littlesnitch6/intro-install)
 and [Tailscale macOS permission flow](https://tailscale.com/docs/concepts/macos-sysext).
 Borrowed focused native dialogs and a clear primary action; no assets copied.
+
+## MiMo-V2.6-Pro continuation: local Mac preflight
+
+Coordinator run on 10 October 2026. Sanitized session export `ses_ffe5ed8b01754ffejl2HRxPgba` contains only provider `xiaomi` / model `mimo-v2.6-pro` for this work package. Prior setup/About/window changes and supplied artwork were preserved and tested with the package.
+
+`HELICOID_BUILD_DIR=<isolated scratch> HELICOID_DIST_DIR=<checkpoint> bash scripts/build.sh` exited 0: 122 tests in 19 suites, both release builds, original layered-icon compilation, both app bundles, and `codesign --verify --deep --strict` with ad-hoc signatures. Actual packaged Manager UI: production Connect disabled; Guided Server Setup offers This Mac and Existing Linux Server; Check This Mac refuses incomplete unprivileged listener visibility. Disk-space failure was also observed and cleared only after deleting stale generated build cache. No host resource was installed.
+
+Parser/loaded-service/symlink/cancellation cases use fixtures; the live read-only probe and native wizard were exercised on Apple Silicon/macOS 27.0.1. Elevated complete-listener inspection, Service Management registration, all endpoint permissions/capture/input, public connections, Intel runtime and Developer ID/notarization are Not Verified. This is a development prerequisite checkpoint, not a passed media or deployment gate.

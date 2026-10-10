@@ -1,7 +1,7 @@
 import SwiftUI
 import HelicoidCore
 
-/// W17 Guided server setup — Mac manager: Linux SSH only (H01–H12).
+/// W17 Guided server setup — Mac manager: This Mac and Linux SSH (H01–H12).
 struct GuidedSetupView: View {
     @Environment(ManagerSession.self) private var session
     @State private var model = GuidedServerSetupModel()
@@ -12,14 +12,11 @@ struct GuidedSetupView: View {
                 DevelopmentBanner()
             }
 
-            HStack(spacing: 0) {
-                Spacer(minLength: 0)
-                phaseForm
-                    .frame(maxWidth: 560)
-                Spacer(minLength: 0)
-            }
-            .frame(maxHeight: .infinity)
-            .padding(.horizontal, 24)
+            phaseForm
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 560)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal, 24)
 
             if let blocker = model.blocker {
                 Label(blocker, systemImage: "exclamationmark.triangle")
@@ -33,7 +30,9 @@ struct GuidedSetupView: View {
             HStack(spacing: 12) {
                 Button("Cancel") {
                     model.reset()
-                    session.screen = .connect
+                    withAnimation(.easeOut(duration: 0.22)) {
+                        session.screen = .connect
+                    }
                 }
                 .keyboardShortcut(.cancelAction)
 
@@ -53,22 +52,20 @@ struct GuidedSetupView: View {
         }
         .onDisappear { model.cancelHostCheck() }
         .task {
-            if model.phase == .chooseHosting {
-                model.advance()
-                model.setStoragePath("/var/lib/helicoid")
-            }
             await model.prepareManagerIdentity()
         }
     }
 
     private var continueDisabledReason: String {
         switch model.phase {
+        case .chooseHosting:
+            "Choose a hosting route before continuing."
         case .connect:
             "Enter a valid SSH address and use key authentication."
         case .hostIdentity:
             "Verify the SSH host identity before continuing. A changed key or refusal performs no writes."
         case .checkHost:
-            "Every host check must pass before continuing."
+            "Every required check must pass before continuing. Unknown checks block."
         case .network:
             "Enter the server address and a valid product port."
         case .deploymentIdentity:
@@ -88,9 +85,17 @@ struct GuidedSetupView: View {
         model.phase == .hostIdentity || model.phase == .checkHost
     }
 
+    private var requiredChecks: [String] {
+        GuidedServerSetupModel.requiredHostChecks(for: model.route)
+    }
+
     private var hostChecksPassed: Bool {
-        model.hostIdentity.isVerified && GuidedServerSetupModel.requiredHostChecks.allSatisfy {
-            model.hostChecks[$0] == .passed
+        let checksPass = requiredChecks.allSatisfy { model.hostChecks[$0] == .passed }
+        switch model.route {
+        case .thisMac:
+            return checksPass
+        case .existingLinuxSSH:
+            return model.hostIdentity.isVerified && checksPass
         }
     }
 
@@ -98,7 +103,15 @@ struct GuidedSetupView: View {
         switch model.phase {
         case .connect: "Check Server"
         case .hostIdentity, .checkHost:
-            model.isCheckingHost ? "Checking…" : hostChecksPassed ? "Continue" : "Check Again"
+            if model.isCheckingHost {
+                "Checking…"
+            } else if hostChecksPassed {
+                "Continue"
+            } else if model.hostChecks.isEmpty {
+                model.route == .thisMac ? "Check This Mac" : "Check Server"
+            } else {
+                "Check Again"
+            }
         case .review: "Install"
         case .install: "Install Unavailable"
         case .ready: "Done"
@@ -107,7 +120,10 @@ struct GuidedSetupView: View {
     }
 
     private func continueSetup() {
-        if model.phase == .connect {
+        if model.phase == .chooseHosting {
+            model.setStoragePath(model.route.defaultStoragePath)
+            model.advance()
+        } else if model.phase == .connect {
             model.advance()
             model.startHostCheck()
         } else if isHostCheck {
@@ -124,14 +140,33 @@ struct GuidedSetupView: View {
 
     private func goBack() {
         model.cancelHostCheck()
-        if model.phase == .checkHost { model.back() }
+        if model.phase == .checkHost && model.route == .existingLinuxSSH { model.back() }
         model.back()
     }
 
     @ViewBuilder
     private var phaseForm: some View {
         switch model.phase {
-        case .chooseHosting, .connect:
+        case .chooseHosting:
+            Form {
+                Section {
+                    Picker("Hosting route", selection: Binding(
+                        get: { model.route },
+                        set: { model.setRoute($0) }
+                    )) {
+                        ForEach(HostingRoute.allCases, id: \.self) { route in
+                            Text(route.title).tag(route)
+                        }
+                    }
+                    .pickerStyle(.radioGroup)
+                    Text(model.route.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+
+        case .connect:
             Form {
                 Section {
                     TextField("SSH address", text: Binding(
@@ -149,23 +184,46 @@ struct GuidedSetupView: View {
             Form {
                 Section {
                     if model.isCheckingHost {
-                        ProgressView("Checking server…")
+                        ProgressView(model.route == .thisMac ? "Checking this Mac…" : "Checking server…")
                     } else if hostChecksPassed {
-                        Label("Server checks passed", systemImage: "checkmark.circle.fill")
+                        Label("Host checks passed", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
+                    } else if model.route == .thisMac {
+                        if let failure = model.localPreflightFailure {
+                            Text(failure)
+                        } else {
+                            Text("Run the read-only preflight to inspect this Mac. No privileged writes are performed.")
+                                .foregroundStyle(.secondary)
+                        }
                     } else if !model.hostIdentity.isVerified {
                         Text(model.hostIdentity.explanation)
                     }
                     if !model.isCheckingHost && !hostChecksPassed {
-                        ForEach(GuidedServerSetupModel.requiredHostChecks, id: \.self) { name in
+                        ForEach(requiredChecks, id: \.self) { name in
                             if case .needsAttention = model.hostChecks[name] { checkRow(name) }
                         }
                     }
                     DisclosureGroup("Details") {
-                        Text(model.hostIdentity.explanation)
-                            .font(.caption.monospaced())
-                            .textSelection(.enabled)
-                        ForEach(GuidedServerSetupModel.requiredHostChecks, id: \.self) { checkRow($0) }
+                        if model.route == .thisMac {
+                            if let local = model.localPreflight {
+                                Text("Computer: \(local.computerName)")
+                                    .font(.caption.monospaced())
+                                Text("\(local.osVersion) · \(local.architecture)")
+                                    .font(.caption.monospaced())
+                                Text("Preflight is read-only. Installation is not performed by this build.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else if let failure = model.localPreflightFailure {
+                                Text(failure)
+                                    .font(.caption.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                        } else {
+                            Text(model.hostIdentity.explanation)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                        }
+                        ForEach(requiredChecks, id: \.self) { checkRow($0) }
                     }
                 }
             }
@@ -239,16 +297,16 @@ struct GuidedSetupView: View {
 
         case .storage:
             Form {
-                Section("Linux server storage") {
+                Section(model.route == .thisMac ? "Mac storage" : "Linux server storage") {
                     TextField("Server data folder", text: Binding(
                         get: { model.storagePath },
                         set: { model.setStoragePath($0) }
-                    ), prompt: Text("/var/lib/helicoid"))
+                    ), prompt: Text(model.route.defaultStoragePath))
                     DisclosureGroup("Backup location (optional)") {
                         TextField("Encrypted backup folder", text: Binding(
                             get: { model.backupDestination },
                             set: { model.setBackupDestination($0) }
-                        ), prompt: Text("/path/on/linux/server"))
+                        ), prompt: Text(model.route == .thisMac ? "/path/on/this/mac" : "/path/on/linux/server"))
                     }
                 }
             }
@@ -276,8 +334,6 @@ struct GuidedSetupView: View {
                     .font(.body)
                     .foregroundStyle(.secondary)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .padding(.top, 24)
 
         case .ready:
             VStack(alignment: .leading, spacing: 12) {
@@ -286,8 +342,6 @@ struct GuidedSetupView: View {
                 Text("Next, enroll a Windows computer.")
                     .foregroundStyle(.secondary)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .padding(.top, 24)
         }
     }
 

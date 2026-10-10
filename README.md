@@ -130,3 +130,9 @@ Independent copies (build does not read a sibling checkout):
 
 - `BUILD-REPORT.md` — build evidence, verification boundaries, technical IDs
 - `Resources/Contracts/http-v1.md` — vendored server HTTP contract (version 1)
+
+## Local hosting prerequisite (10 October 2026)
+
+Guided setup offers **This Mac** and **Existing Linux Server**. This Mac performs bounded, read-only OS/architecture, privilege, disk, product-path, launchd-service and listener checks. Unknown facts block progress. Unprivileged listener inspection is explicitly incomplete; this checkpoint does not install or register a launchd service or claim Server Ready for Enrollment. Windows local hosting is offered by the Windows app.
+
+Fresh coordinator verification: 122 Swift tests in 19 suites, both release app bundles, the supplied layered icons, and deep strict ad-hoc signature checks passed. The packaged Manager was exercised through This Mac → Check This Mac and refused incomplete listener inspection. Intel runtime, privileged installation, live preview/control and production signing remain Not Verified.
