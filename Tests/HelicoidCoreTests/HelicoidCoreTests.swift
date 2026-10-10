@@ -279,6 +279,7 @@ struct GuidedServerSetupTests {
         model.advance()
         model.setHostCheck("SSH reachability", status: .passed)
         model.setHostCheck("Disk space", status: .passed)
+        for name in GuidedServerSetupModel.requiredHostChecks { model.setHostCheck(name, status: .passed) }
         model.advance()
         model.setNetworkAddress("192.168.1.10")
         model.advance()
@@ -313,6 +314,8 @@ struct GuidedServerSetupTests {
         model.setHostCheck("SSH reachability", status: .needsAttention(detail: "refused"))
         #expect(!model.canContinueFromCurrentPhase)
         model.setHostCheck("SSH reachability", status: .passed)
+        #expect(!model.canContinueFromCurrentPhase)
+        for name in GuidedServerSetupModel.requiredHostChecks { model.setHostCheck(name, status: .passed) }
         #expect(model.canContinueFromCurrentPhase)
     }
 }
