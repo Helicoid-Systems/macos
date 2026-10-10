@@ -89,3 +89,44 @@ Direct archive inspection found that earlier CI bundles did not contain complete
 Fresh clean temporary builds passed the forced fallback path and the layered compilation path. Final CI archive inspection must verify signatures, executable modes, minimum OS and both role icons after download. This does not claim Developer ID, notarization or the full installed appearance matrix.
 
 Coordinator corrected the menu status-window action to SwiftUI openWindow(id: "status") after source review. The updated apps build/package and verify their full signatures. Native endpoint launch inspection hit a Computer Use timeout; this change is compile/package verified, with endpoint window reopen still unverified at runtime.
+
+## Guided SSH and Manager identity integration, 2026-10-10
+
+This section supersedes the earlier unavailable-SSH observations. The new wizard
+uses `/usr/bin/ssh` with strict existing host trust and a fixed read-only Python
+preflight supplied through stdin. Checks cannot be manually marked passed.
+Address/authentication changes invalidate prior host results. Unknown/changed
+keys, malformed or missing facts, occupied product ports and failed commands
+deny continuation. Stdin and combined stdout/stderr have size bounds; process
+timeouts and cancellation terminate the local child.
+
+Fresh verification:
+
+- `HELICOID_SSH_TEST_ADDRESS=ubuntu@57.131.161.27 swift test`: **90 tests passed**,
+  including actual trusted SSH to Ubuntu 26.04 x86-64, product ports free and
+  existing web listeners retained. This preceded the identity additions.
+- `swift test` after Keychain integration: **95 tests passed**; the explicitly
+  gated live-host test is disabled without its environment variable.
+- Regression red then green: OpenSSH CRLF fingerprint output was rejected;
+  newline-aware parsing accepts it while absent/ambiguous fingerprints refuse.
+- Regression red then green: a descendant retaining a pipe delayed timeout to
+  2 seconds; refusal now finishes under 1 second (observed 0.057 seconds).
+- `HELICOID_FORCE_ICON_FALLBACK=1 ./scripts/build.sh`: release apps packaged and
+  both complete ad-hoc signatures verified with approved artwork fallbacks.
+- Native CUA navigation: production Connect disabled; Guided Setup → SSH address
+  → verified actual public host fingerprint → all seven checks Passed → Network
+  shows the target address and port 8920 → Deployment Identity shows the real
+  Manager public key. Restarting the app and repeating the path showed the same
+  Keychain-backed public key. Only public metadata was inspected.
+
+Manager keys use CryptoKit Ed25519 and a nonsynchronizing Keychain item. Atomic
+creation uses the persisted winner if another instance races. Invalid version,
+corrupt bytes or failed persistence returns no usable identity and never rotates
+trust silently. Signing size limits, real signature verification, altered-message
+refusal, concurrency and corruption are covered by the identity tests.
+
+Installation, signed package apply, MFA bootstrap, public TLS, live relayed pixels
+and remote input remain **NOT VERIFIED / pending implementation** in this slice.
+No remote installation, service, firewall or server data change occurred. Intel
+runtime, notarization and the full appearance/accessibility matrix are unchanged
+release gates.

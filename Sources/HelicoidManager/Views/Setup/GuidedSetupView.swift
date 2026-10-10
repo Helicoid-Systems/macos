@@ -70,12 +70,14 @@ struct GuidedSetupView: View {
             }
             .padding()
         }
+        .onDisappear { model.cancelHostCheck() }
+        .task { await model.prepareManagerIdentity() }
     }
 
     private var continueDisabledReason: String {
         switch model.phase {
         case .connect:
-            "Enter an SSH address to continue."
+            "Enter a valid SSH address and use key authentication."
         case .hostIdentity:
             "Verify the SSH host identity before continuing. A changed key or refusal performs no writes."
         case .checkHost:
@@ -185,7 +187,12 @@ struct GuidedSetupView: View {
                         Text(model.hostIdentity.explanation)
                             .multilineTextAlignment(.trailing)
                     }
-                    Text("SSH host verification is unavailable in this development build. Setup cannot continue until it can compare the server’s actual host key with a trusted value.")
+                    Button(model.isCheckingHost ? "Checking…" : "Verify and Check Host") {
+                        model.startHostCheck()
+                    }
+                    .disabled(model.isCheckingHost)
+                    if model.isCheckingHost { ProgressView().controlSize(.small) }
+                    Text("Uses your existing trusted SSH host keys. An unknown or changed key stops setup; verify it independently through the server provider before adding it to SSH trust.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -195,9 +202,9 @@ struct GuidedSetupView: View {
         case .checkHost:
             Form {
                 Section("Host Checks") {
-                    checkRow("SSH reachability")
-                    checkRow("Disk space")
-                    checkRow("Operating system")
+                    ForEach(GuidedServerSetupModel.requiredHostChecks, id: \.self) { checkRow($0) }
+                    Button("Refresh Checks") { model.startHostCheck() }
+                        .disabled(model.isCheckingHost)
                     Text("Continue is enabled only when every required check passes.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -237,6 +244,20 @@ struct GuidedSetupView: View {
                     Text("Trust identity is generated at install time on the server. Identity replacement stops prior trust.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if model.isPreparingManagerIdentity {
+                        ProgressView("Preparing Manager identity…")
+                    } else if !model.generatedTrustIdentityNote.isEmpty {
+                        Text(model.generatedTrustIdentityNote)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                        Text("The private signing key is saved in your Mac’s Keychain.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Label("Manager identity unavailable", systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.orange)
+                        Button("Retry Keychain") { Task { await model.prepareManagerIdentity() } }
+                    }
                 }
             }
             .formStyle(.grouped)
@@ -317,10 +338,6 @@ struct GuidedSetupView: View {
             switch status {
             case .pending:
                 Text("Pending").foregroundStyle(.secondary)
-                Button("Pass") { model.setHostCheck(name, status: .passed) }
-                Button("Attention") {
-                    model.setHostCheck(name, status: .needsAttention(detail: "Needs attention"))
-                }
             case .checking:
                 ProgressView().controlSize(.small)
             case .passed:
@@ -329,7 +346,6 @@ struct GuidedSetupView: View {
             case .needsAttention(let detail):
                 Label(detail, systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
-                Button("Pass") { model.setHostCheck(name, status: .passed) }
             }
         }
     }

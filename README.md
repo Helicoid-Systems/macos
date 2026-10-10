@@ -86,6 +86,27 @@ Fixture mode and development-server mode are independent and must not be conflat
 Mac manager offers **Linux SSH only**. Install never claims success without
 integrated server packages.
 
+The native wizard uses the system OpenSSH client with strict host-key checking,
+key authentication and bounded read-only preflight. Unknown or changed keys stop
+setup. It checks Ubuntu 26.04 on x86-64, systemd, noninteractive sudo, storage,
+the dedicated Helicoid ports and an existing installation. Existing listeners on
+80/443 are informational and are preserved. Cancellation ends the local SSH child;
+it does not claim to roll back remote operations.
+
+Opening setup creates or loads the initiating Manager's Ed25519 identity through
+macOS Keychain. Only its public key is shown. Corrupt or inaccessible stored
+identities are refused rather than silently replaced. Package apply and MFA
+bootstrap are still pending integration; this build cannot reach Ready.
+
+An optional read-only host regression is enabled explicitly:
+
+```bash
+HELICOID_SSH_TEST_ADDRESS=user@host swift test --filter SSHLiveSetupTests
+```
+
+The host regression targets the approved Ubuntu 26.04 development host with
+occupied web ports; it requires an already trusted SSH key and performs no install.
+
 ### Remote view
 
 View-only remote window shows honest **Engine Unavailable**. Take Control is
