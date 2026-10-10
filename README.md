@@ -86,6 +86,11 @@ Fixture mode and development-server mode are independent and must not be conflat
 Mac manager offers **Linux SSH only**. Install never claims success without
 integrated server packages.
 
+Setup uses a custom native dialog layout with an inline step indicator and
+Cancel/Back/Continue controls along the bottom. Its window title-bar strip is
+hidden during setup and restored on exit. Fields include SSH and Linux-folder
+examples; Manager key details expand on demand.
+
 The native wizard uses the system OpenSSH client with strict host-key checking,
 key authentication and bounded read-only preflight. Unknown or changed keys stop
 setup. It checks Ubuntu 26.04 on x86-64, systemd, noninteractive sudo, storage,

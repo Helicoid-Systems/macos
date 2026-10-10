@@ -130,3 +130,24 @@ and remote input remain **NOT VERIFIED / pending implementation** in this slice.
 No remote installation, service, firewall or server data change occurred. Intel
 runtime, notarization and the full appearance/accessibility matrix are unchanged
 release gates.
+
+## Custom native setup dialog, 2026-10-10
+
+Removed the setup header bar, window title and title-bar separator during setup;
+normal window chrome is restored on exit. Replaced nested scrolling with one
+native form per step, moved Cancel/Back/Continue into one footer, added inline
+progress and plain instructions, and moved Manager key details into a disclosure.
+The SSH verification action now occupies the primary footer button. Unsupported
+password authentication and the disabled single-choice hosting selector are no
+longer presented as choices. Linux folder fields include examples and identify
+the remote host explicitly.
+
+- `HELICOID_FORCE_ICON_FALLBACK=1 ./scripts/build.sh`: exit 0; **95 tests in
+  18 suites passed**, release apps packaged and complete signatures verified.
+- Native CUA: required fields disable Continue; trusted SSH verification succeeds;
+  all seven compatibility checks pass; network defaults appear; identity details
+  expand; administrator and remote-folder instructions display; Escape returns to
+  Connect with the original window title. Final packaged build was reopened and
+  its setup navigation and hidden title confirmed through accessibility state.
+- Source diff whitespace check passed. Full VoiceOver, light appearance, and the
+  complete window-size matrix remain unverified. Installation remains pending.
