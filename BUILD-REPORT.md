@@ -164,3 +164,18 @@ Coordinator run on 10 October 2026. Sanitized session export `ses_ffe5ed8b01754f
 `HELICOID_BUILD_DIR=<isolated scratch> HELICOID_DIST_DIR=<checkpoint> bash scripts/build.sh` exited 0: 122 tests in 19 suites, both release builds, original layered-icon compilation, both app bundles, and `codesign --verify --deep --strict` with ad-hoc signatures. Actual packaged Manager UI: production Connect disabled; Guided Server Setup offers This Mac and Existing Linux Server; Check This Mac refuses incomplete unprivileged listener visibility. Disk-space failure was also observed and cleared only after deleting stale generated build cache. No host resource was installed.
 
 Parser/loaded-service/symlink/cancellation cases use fixtures; the live read-only probe and native wizard were exercised on Apple Silicon/macOS 27.0.1. Elevated complete-listener inspection, Service Management registration, all endpoint permissions/capture/input, public connections, Intel runtime and Developer ID/notarization are Not Verified. This is a development prerequisite checkpoint, not a passed media or deployment gate.
+
+## Native CI repair (commit `6fd17e5`, run `38082769211`)
+
+Failed CI proof: native macOS job failed the Local Mac hosting preflight suite (3 issues). Root causes observed in `macos-ci-failure.log`:
+
+1. `resourceState uses lstat so dangling symlinks are conflicts` wrote a symlink into coordinator-specific `/tmp/hs-production-20261010/…` whose parent does not exist on CI (`symlink(...) → -1`, state `.absent` instead of `.brokenSymlink`).
+2. `Live read-only preflight on this Mac is structurally valid` threw `setupBlocked("Invalid local host preflight response.")`. `validate()` applied the product-friendly-name 64-byte bound to the system hostname, which is informational display text and can legitimately exceed that bound on CI hosts.
+
+Repaired proof (this working tree, not yet a new CI run):
+
+- Symlink/absent fixtures now use a unique directory under `FileManager.default.temporaryDirectory` and clean up only that directory.
+- Hostname is validated at `HOST_NAME_MAX` (255 bytes) and is not treated as an identity; `displayComputerName` truncates to 64 UTF-8 bytes for UI only. Empty name and 256-byte name still refuse. Deterministic regression `Long legitimate hostnames validate; display truncation is not identity` reproduces a 227-byte legitimate name.
+- Live probe still runs full `validate()` on real OS/hostname/port facts (no bypass, no swallowed failure) and still refuses to claim complete listeners without elevation.
+
+Commands after the fix: `xcrun swift test` → **123 tests / 19 suites passed**; debug and release builds of `HelicoidManager` and `HelicoidComputer` succeeded; `xcrun swift build -c release --arch x86_64` succeeded (x86_64 deprecation warning only). A fresh native CI run is still required to close the failed job; this is local repaired proof.
