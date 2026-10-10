@@ -753,6 +753,7 @@ struct SetupModelRegressionTests {
     @MainActor
     func advanceWorks() {
         let model = GuidedServerSetupModel()
+        model.setRoute(.existingLinuxSSH)
         #expect(model.phase == .chooseHosting)
         model.advance()
         #expect(model.phase == .connect)
@@ -765,7 +766,7 @@ struct SetupModelRegressionTests {
         model.setHostCheck("SSH reachability", status: .passed)
         model.setHostCheck("Disk space", status: .passed)
         model.setHostCheck("Operating system", status: .passed)
-        for name in GuidedServerSetupModel.requiredHostChecks { model.setHostCheck(name, status: .passed) }
+        for name in GuidedServerSetupModel.requiredHostChecks(for: .existingLinuxSSH) { model.setHostCheck(name, status: .passed) }
         model.advance()
         #expect(model.phase == .network)
     }
@@ -774,6 +775,7 @@ struct SetupModelRegressionTests {
     @MainActor
     func identityGateBlocks() {
         let model = GuidedServerSetupModel()
+        model.setRoute(.existingLinuxSSH)
         model.setSSHAddress("server.lan")
         model.advance()
         model.advance()

@@ -243,18 +243,22 @@ struct OverviewModelTests {
 
 @Suite("Guided server setup")
 struct GuidedServerSetupTests {
-    @Test("Mac manager exposes only Linux SSH route")
+    @Test("Mac manager exposes This Mac and Linux SSH routes")
     @MainActor
-    func linuxSSHOnly() {
+    func hostingRoutes() {
         let model = GuidedServerSetupModel()
-        #expect(HostingRoute.allCases == [.existingLinuxSSH])
+        #expect(HostingRoute.allCases == [.thisMac, .existingLinuxSSH])
+        #expect(model.route == .thisMac)
         #expect(model.phase == .chooseHosting)
+        #expect(HostingRoute.thisMac.detail.contains("Windows app"))
+        #expect(HostingRoute.existingLinuxSSH.detail.contains("Windows app"))
     }
 
     @Test("Host identity gate blocks continue")
     @MainActor
     func hostIdentityGate() {
         let model = GuidedServerSetupModel()
+        model.setRoute(.existingLinuxSSH)
         model.setSSHAddress("server.lan")
         model.advance()
         #expect(model.phase == .connect)
@@ -272,6 +276,7 @@ struct GuidedServerSetupTests {
     @MainActor
     func installNeverClaimsSuccess() {
         let model = GuidedServerSetupModel()
+        model.setRoute(.existingLinuxSSH)
         model.setSSHAddress("server.lan")
         model.advance()
         model.advance()
@@ -279,7 +284,7 @@ struct GuidedServerSetupTests {
         model.advance()
         model.setHostCheck("SSH reachability", status: .passed)
         model.setHostCheck("Disk space", status: .passed)
-        for name in GuidedServerSetupModel.requiredHostChecks { model.setHostCheck(name, status: .passed) }
+        for name in GuidedServerSetupModel.requiredHostChecks(for: .existingLinuxSSH) { model.setHostCheck(name, status: .passed) }
         model.advance()
         model.setNetworkAddress("192.168.1.10")
         model.advance()
@@ -304,6 +309,7 @@ struct GuidedServerSetupTests {
     @MainActor
     func checkHostRequiresPassed() {
         let model = GuidedServerSetupModel()
+        model.setRoute(.existingLinuxSSH)
         model.setSSHAddress("server.lan")
         model.advance()
         model.advance()
@@ -315,7 +321,7 @@ struct GuidedServerSetupTests {
         #expect(!model.canContinueFromCurrentPhase)
         model.setHostCheck("SSH reachability", status: .passed)
         #expect(!model.canContinueFromCurrentPhase)
-        for name in GuidedServerSetupModel.requiredHostChecks { model.setHostCheck(name, status: .passed) }
+        for name in GuidedServerSetupModel.requiredHostChecks(for: .existingLinuxSSH) { model.setHostCheck(name, status: .passed) }
         #expect(model.canContinueFromCurrentPhase)
     }
 }

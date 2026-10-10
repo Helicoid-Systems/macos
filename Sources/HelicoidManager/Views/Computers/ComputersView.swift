@@ -171,7 +171,9 @@ struct ComputersView: View {
             }
             if session.overview.authorizedInventory.isEmpty {
                 Button("Guided Server Setup") {
-                    session.screen = .guidedSetup
+                    withAnimation(.easeOut(duration: 0.22)) {
+                        session.screen = .guidedSetup
+                    }
                 }
             }
         }

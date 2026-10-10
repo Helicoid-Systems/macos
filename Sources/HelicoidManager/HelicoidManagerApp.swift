@@ -15,16 +15,11 @@ struct HelicoidManagerApp: App {
             RootView()
                 .environment(session)
         }
+        .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About Helicoid Manager") {
-                    NSApplication.shared.orderFrontStandardAboutPanel(options: [
-                        .applicationName: "Helicoid Manager",
-                        .applicationVersion: "0.1.0",
-                        .credits: NSAttributedString(
-                            string: "Helicoid Systems. Computer monitoring."
-                        ),
-                    ])
+                    AboutWindow.show()
                 }
             }
             // Use the system View menu; do not add a second View command menu.
@@ -61,9 +56,14 @@ struct RootView: View {
                 GuidedSetupView()
             }
         }
+        .id(session.screen)
+        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+        .animation(.easeOut(duration: 0.22), value: session.screen)
         .frame(
             minWidth: session.screen == .guidedSetup ? 560 : 720,
-            minHeight: session.screen == .guidedSetup ? 360 : 480
+            maxWidth: .infinity,
+            minHeight: session.screen == .guidedSetup ? 360 : 480,
+            maxHeight: .infinity
         )
         .background(SetupWindowChrome(isEnabled: session.screen == .guidedSetup))
     }

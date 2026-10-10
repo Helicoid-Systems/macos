@@ -8,65 +8,57 @@ struct ConnectView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            BrandMark()
-                .padding(.top, 28)
+            VStack(spacing: 0) {
+                BrandMark()
 
-            Text("Connect to Server")
-                .font(.title2.weight(.semibold))
-                .padding(.top, 12)
+                Text("Connect to Server")
+                    .font(.title2.weight(.semibold))
+                    .padding(.top, 12)
 
-            Text("Helicoid Manager needs a Helicoid server on your network.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-
-            Text(session.transportDescription)
-                .font(.caption)
-                .foregroundStyle(session.isDevelopmentServerMode ? .orange : .secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-                .padding(.top, 4)
-
-            Form {
-                Section {
-                    TextField("Server address", text: Binding(
-                        get: { session.serverAddress },
-                        set: { session.serverAddress = $0 }
-                    ))
-                    .textContentType(.URL)
-                    .accessibilityLabel("Server address")
-
-                    if session.isDevelopmentServerMode {
-                        TextField("Manager identity (optional)", text: Binding(
-                            get: { session.managerPublicIdentity ?? "" },
-                            set: { session.managerPublicIdentity = $0.isEmpty ? nil : $0 }
+                Form {
+                    Section {
+                        TextField("Server address", text: Binding(
+                            get: { session.serverAddress },
+                            set: { session.serverAddress = $0 }
                         ))
-                        .accessibilityLabel("Manager public identity")
-                        .help("Development manager identity fixture used for approval checks.")
-                    }
+                        .textContentType(.URL)
+                        .accessibilityLabel("Server address")
 
-                    if !session.allowsConnect {
-                        Text("Connect is unavailable. \(session.transportDescription)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                        if session.isDevelopmentServerMode {
+                            TextField("Manager identity (optional)", text: Binding(
+                                get: { session.managerPublicIdentity ?? "" },
+                                set: { session.managerPublicIdentity = $0.isEmpty ? nil : $0 }
+                            ))
+                            .accessibilityLabel("Manager public identity")
+                            .help("Development manager identity fixture used for approval checks.")
+                        }
 
-                    if let failure = session.connectError {
-                        InlineErrorView(failure: failure)
+                        if !session.allowsConnect {
+                            Text("Connect is unavailable. \(session.transportDescription)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if let failure = session.connectError {
+                            InlineErrorView(failure: failure)
+                        }
                     }
-                } footer: {
-                    Text("Discovery may suggest an address. It never establishes trust.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                }
+                .formStyle(.grouped)
+                .frame(maxWidth: 440)
+
+                if !session.trustedProfiles.isEmpty {
+                    TrustedProfilesList(profiles: session.trustedProfiles)
                 }
             }
-            .formStyle(.grouped)
-            .frame(maxWidth: 440)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             HStack {
                 Button("Guided Server Setup") {
-                    session.screen = .guidedSetup
+                    withAnimation(.easeOut(duration: 0.22)) {
+                        session.screen = .guidedSetup
+                    }
                 }
                 .buttonStyle(.link)
 
@@ -96,11 +88,8 @@ struct ConnectView: View {
             }
             .padding(.horizontal, 28)
             .padding(.bottom, 28)
-
-            if !session.trustedProfiles.isEmpty {
-                TrustedProfilesList(profiles: session.trustedProfiles)
-            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -110,41 +99,47 @@ struct VerifyServerView: View {
     @State private var isTrusting = false
 
     var body: some View {
-        VStack(spacing: 16) {
-            BrandMark()
-                .padding(.top, 28)
+        VStack(spacing: 0) {
+            VStack(spacing: 0) {
+                BrandMark()
 
-            Text("Verify Server")
-                .font(.title2.weight(.semibold))
+                Text("Verify Server")
+                    .font(.title2.weight(.semibold))
+                    .padding(.top, 12)
 
-            if let identity = session.pendingIdentity {
-                Form {
-                    LabeledContent("Deployment", value: identity.deploymentName)
-                    LabeledContent("Address", value: session.serverAddress)
-                    LabeledContent("Identity fingerprint", value: identity.verificationFingerprint)
-                    Text(identity.trustedSourceNote)
+                if let identity = session.pendingIdentity {
+                    Form {
+                        LabeledContent("Deployment", value: identity.deploymentName)
+                        LabeledContent("Address", value: session.serverAddress)
+                        LabeledContent("Identity fingerprint", value: identity.verificationFingerprint)
+                        Text(identity.trustedSourceNote)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .formStyle(.grouped)
+                    .frame(maxWidth: 480)
+
+                    if let failure = session.connectError {
+                        InlineErrorView(failure: failure)
+                    }
+
+                    Text("A changed identity later stops access. Discovery does not establish trust.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                } else {
+                    Text("No identity is waiting for verification.")
+                        .foregroundStyle(.secondary)
                 }
-                .formStyle(.grouped)
-                .frame(maxWidth: 480)
-
-                if let failure = session.connectError {
-                    InlineErrorView(failure: failure)
-                }
-
-                Text("A changed identity later stops access. Discovery does not establish trust.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-            } else {
-                Text("No identity is waiting for verification.")
-                    .foregroundStyle(.secondary)
             }
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             HStack {
                 Button("Back") {
-                    session.screen = .connect
+                    withAnimation(.easeOut(duration: 0.22)) {
+                        session.screen = .connect
+                    }
                 }
                 Spacer()
                 Button {
@@ -166,6 +161,7 @@ struct VerifyServerView: View {
             .padding(.horizontal, 28)
             .padding(.bottom, 28)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -175,58 +171,64 @@ struct SignInView: View {
     @State private var isSigningIn = false
 
     var body: some View {
-        VStack(spacing: 16) {
-            BrandMark()
-                .padding(.top, 28)
+        VStack(spacing: 0) {
+            VStack(spacing: 0) {
+                BrandMark()
 
-            Text("Sign In")
-                .font(.title2.weight(.semibold))
+                Text("Sign In")
+                    .font(.title2.weight(.semibold))
+                    .padding(.top, 12)
 
-            if let identity = session.verifiedIdentity {
-                Text("Connected to \(identity.deploymentName)")
-                    .foregroundStyle(.secondary)
-            }
-
-            Form {
-                Section {
-                    TextField("Username", text: Binding(
-                        get: { session.username },
-                        set: { session.username = $0 }
-                    ))
-                    .textContentType(.username)
-                    SecureField("Password", text: Binding(
-                        get: { session.password },
-                        set: { session.password = $0 }
-                    ))
-                    .textContentType(.password)
-                } footer: {
-                    Text("Organization-managed local accounts. No external identity provider is required.")
-                        .font(.caption)
+                if let identity = session.verifiedIdentity {
+                    Text("Connected to \(identity.deploymentName)")
                         .foregroundStyle(.secondary)
                 }
 
-                if let error = session.signInError {
+                Form {
                     Section {
-                        InlineErrorView(error: error)
-                        if session.phase == .pendingManagerApproval {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Manager pending approval")
-                                    .font(.caption.weight(.semibold))
-                                Text("This management computer is waiting for administrator approval. Ask an administrator to approve the manager identity, then try again. No computer screens are available yet.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                        TextField("Username", text: Binding(
+                            get: { session.username },
+                            set: { session.username = $0 }
+                        ))
+                        .textContentType(.username)
+                        SecureField("Password", text: Binding(
+                            get: { session.password },
+                            set: { session.password = $0 }
+                        ))
+                        .textContentType(.password)
+                    } footer: {
+                        Text("Organization-managed local accounts. No external identity provider is required.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let error = session.signInError {
+                        Section {
+                            InlineErrorView(error: error)
+                            if session.phase == .pendingManagerApproval {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Manager pending approval")
+                                        .font(.caption.weight(.semibold))
+                                    Text("This management computer is waiting for administrator approval. Ask an administrator to approve the manager identity, then try again. No computer screens are available yet.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .accessibilityElement(children: .combine)
                             }
-                            .accessibilityElement(children: .combine)
                         }
                     }
                 }
+                .formStyle(.grouped)
+                .frame(maxWidth: 440)
             }
-            .formStyle(.grouped)
-            .frame(maxWidth: 440)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             HStack {
                 Button("Back") {
-                    session.screen = .verify
+                    withAnimation(.easeOut(duration: 0.22)) {
+                        session.screen = .verify
+                    }
                 }
                 Spacer()
                 Button {
@@ -252,12 +254,13 @@ struct SignInView: View {
             .padding(.horizontal, 28)
             .padding(.bottom, 28)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
 struct BrandMark: View {
     var body: some View {
-        Image(systemName: "shield.lefthalf.filled")
+        Image(systemName: "server.rack")
             .font(.system(size: 36, weight: .light))
             .foregroundStyle(.tint)
             .accessibilityHidden(true)

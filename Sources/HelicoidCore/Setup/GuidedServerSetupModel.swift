@@ -2,15 +2,34 @@ import Foundation
 import Observation
 
 /// Guided server setup (W17) for the Mac manager.
-/// Mac manager exposes Linux SSH only. Windows local hosting is installed by opening
-/// the Windows app on the Windows host. No local macOS server route exists in version 1.
+/// Mac manager offers This Mac and Existing Linux SSH. Windows hosting is installed
+/// by opening the Windows app on the Windows host. Local installation stays
+/// unavailable until a verified server adapter is integrated.
 public enum HostingRoute: String, Hashable, Sendable, CaseIterable {
+    case thisMac
     case existingLinuxSSH
 
-    public var title: String { "Existing Linux Server" }
+    public var title: String {
+        switch self {
+        case .thisMac: "This Mac"
+        case .existingLinuxSSH: "Existing Linux Server"
+        }
+    }
 
     public var detail: String {
-        "Connect to an existing Linux server over SSH. Windows hosting is installed by opening the Helicoid Windows app on the Windows host."
+        switch self {
+        case .thisMac:
+            "Host Helicoid on this Mac. Preflight is read-only; installation stays unavailable until a verified server package is integrated. Windows hosting is installed by opening the Helicoid Windows app on the Windows host."
+        case .existingLinuxSSH:
+            "Connect to an existing Linux server over SSH. Windows hosting is installed by opening the Helicoid Windows app on the Windows host."
+        }
+    }
+
+    public var defaultStoragePath: String {
+        switch self {
+        case .thisMac: LocalHostingOwnershipPlan.current.dataPath
+        case .existingLinuxSSH: "/var/lib/helicoid"
+        }
     }
 }
 
@@ -106,7 +125,7 @@ public enum InstallProgress: Hashable, Sendable {
 @Observable
 public final class GuidedServerSetupModel {
     public private(set) var phase: SetupPhase = .chooseHosting
-    public private(set) var route: HostingRoute = .existingLinuxSSH
+    public private(set) var route: HostingRoute = .thisMac
     public private(set) var sshAddress: String = ""
     public private(set) var sshAuthMethod: SSHAuthMethod = .agentKey
     public private(set) var hostIdentity: HostIdentityResult = .notChecked
@@ -123,21 +142,40 @@ public final class GuidedServerSetupModel {
     public private(set) var blocker: String?
     public private(set) var isCheckingHost = false
     public private(set) var hostPreflight: SSHHostPreflight?
+    public private(set) var localPreflight: LocalHostPreflight?
+    public private(set) var localPreflightFailure: String?
     public private(set) var initiatingManagerPublicKey: Data?
     public private(set) var isPreparingManagerIdentity = false
 
-    public static let requiredHostChecks = [
+    public nonisolated static let requiredHostChecks = [
         "SSH reachability", "Operating system", "Service manager", "Administrator access",
         "Disk space", "Product ports", "Existing installation",
     ]
+
+    public nonisolated static let requiredLocalChecks = [
+        "Operating system", "Administrator access", "Disk space",
+        "Product path", "Service manager", "Product ports",
+    ]
+
+    public nonisolated static func requiredHostChecks(for route: HostingRoute) -> [String] {
+        switch route {
+        case .thisMac: requiredLocalChecks
+        case .existingLinuxSSH: requiredHostChecks
+        }
+    }
+
     private let sshClient: SSHSetupClient
+    private let localClient: LocalMacSetupClient
     private let managerIdentityStore: ManagerIdentityStore
     private var managerIdentity: ManagerSigningIdentity?
     private var verificationTask: Task<Void, Never>?
     private var verificationGeneration = UUID()
 
-    public init(sshClient: SSHSetupClient = SSHSetupClient(), managerIdentityStore: ManagerIdentityStore = ManagerIdentityStore()) {
+    public init(sshClient: SSHSetupClient = SSHSetupClient(),
+                localClient: LocalMacSetupClient = LocalMacSetupClient(),
+                managerIdentityStore: ManagerIdentityStore = ManagerIdentityStore()) {
         self.sshClient = sshClient
+        self.localClient = localClient
         self.managerIdentityStore = managerIdentityStore
     }
 
@@ -167,7 +205,14 @@ public final class GuidedServerSetupModel {
         case .hostIdentity:
             return hostIdentity.isVerified
         case .checkHost:
-            return hostIdentity.isVerified && Self.requiredHostChecks.allSatisfy { hostChecks[$0] == .passed }
+            // Unknown or missing required checks never count as passed.
+            let checksPass = Self.requiredHostChecks(for: route).allSatisfy { hostChecks[$0] == .passed }
+            switch route {
+            case .thisMac:
+                return checksPass
+            case .existingLinuxSSH:
+                return hostIdentity.isVerified && checksPass
+            }
         case .network:
             return !networkAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && UInt16(productPort).map { $0 > 0 && ![21115, 21116, 21117].contains($0) } == true
@@ -188,6 +233,30 @@ public final class GuidedServerSetupModel {
         }
     }
 
+    /// SSH-only phases are skipped on This Mac. Both routes join at Check Host.
+    private var phaseOrder: [SetupPhase] {
+        switch route {
+        case .thisMac:
+            return [.chooseHosting, .checkHost, .network, .deploymentIdentity, .administrator, .storage, .review, .install, .ready]
+        case .existingLinuxSSH:
+            return SetupPhase.allCases
+        }
+    }
+
+    public func setRoute(_ value: HostingRoute) {
+        guard value != route else { return }
+        route = value
+        cancelHostCheck()
+        hostIdentity = .notChecked
+        hostChecks = [:]
+        hostPreflight = nil
+        localPreflight = nil
+        localPreflightFailure = nil
+        installProgress = .notStarted
+        blocker = nil
+        phase = .chooseHosting
+    }
+
     public func setSSHAddress(_ value: String) {
         guard value != sshAddress else { return }
         invalidateHostVerification()
@@ -206,10 +275,21 @@ public final class GuidedServerSetupModel {
 
     public func setProductPort(_ value: String) {
         productPort = value
-        if let hostPreflight, let port = UInt16(value), port > 0 {
-            hostChecks = hostPreflight.checks(authorityPort: port)
-        } else if hostPreflight != nil {
-            hostChecks["Product ports"] = .needsAttention(detail: "Enter a valid port.")
+        guard let port = UInt16(value), port > 0 else {
+            if hostPreflight != nil || localPreflight != nil {
+                hostChecks["Product ports"] = .needsAttention(detail: "Enter a valid port.")
+            }
+            return
+        }
+        switch route {
+        case .thisMac:
+            if let localPreflight {
+                hostChecks = localPreflight.checks(authorityPort: port)
+            }
+        case .existingLinuxSSH:
+            if let hostPreflight {
+                hostChecks = hostPreflight.checks(authorityPort: port)
+            }
         }
     }
 
@@ -259,12 +339,7 @@ public final class GuidedServerSetupModel {
         let generation = UUID()
         verificationGeneration = generation
         isCheckingHost = true
-        let previousFingerprint: String?
-        if case .verified(let fingerprint) = hostIdentity { previousFingerprint = fingerprint }
-        else { previousFingerprint = nil }
-        hostIdentity = .checking
         hostChecks = [:]
-        hostPreflight = nil
         blocker = nil
         defer {
             if generation == verificationGeneration {
@@ -273,28 +348,50 @@ public final class GuidedServerSetupModel {
             }
         }
         do {
-            guard sshAuthMethod == .agentKey else {
-                throw HelicoidError.setupBlocked(reason: "Use an SSH key from your agent for this test installer.")
+            switch route {
+            case .thisMac:
+                localPreflight = nil
+                localPreflightFailure = nil
+                let result = try await localClient.preflight()
+                try Task.checkCancellation()
+                guard generation == verificationGeneration else { return }
+                localPreflight = result
+                hostChecks = result.checks(authorityPort: UInt16(productPort) ?? 8920)
+            case .existingLinuxSSH:
+                let previousFingerprint: String?
+                if case .verified(let fingerprint) = hostIdentity { previousFingerprint = fingerprint }
+                else { previousFingerprint = nil }
+                hostIdentity = .checking
+                hostPreflight = nil
+                guard sshAuthMethod == .agentKey else {
+                    throw HelicoidError.setupBlocked(reason: "Use an SSH key from your agent for this test installer.")
+                }
+                let result = try await sshClient.preflight(address: SSHSetupAddress(sshAddress))
+                try Task.checkCancellation()
+                guard generation == verificationGeneration else { return }
+                if let previousFingerprint, previousFingerprint != result.fingerprint {
+                    hostIdentity = .changed(expected: previousFingerprint, actual: result.fingerprint)
+                    blocker = HelicoidError.hostIdentityUnverified.explanation
+                    return
+                }
+                hostIdentity = .verified(fingerprint: result.fingerprint)
+                hostPreflight = result.host
+                hostChecks = result.host.checks(authorityPort: UInt16(productPort) ?? 8920)
+                if networkAddress.isEmpty { networkAddress = try SSHSetupAddress(sshAddress).host }
             }
-            let result = try await sshClient.preflight(address: SSHSetupAddress(sshAddress))
-            try Task.checkCancellation()
-            guard generation == verificationGeneration else { return }
-            if let previousFingerprint, previousFingerprint != result.fingerprint {
-                hostIdentity = .changed(expected: previousFingerprint, actual: result.fingerprint)
-                blocker = HelicoidError.hostIdentityUnverified.explanation
-                return
-            }
-            hostIdentity = .verified(fingerprint: result.fingerprint)
-            hostPreflight = result.host
-            hostChecks = result.host.checks(authorityPort: UInt16(productPort) ?? 8920)
-            if networkAddress.isEmpty { networkAddress = try SSHSetupAddress(sshAddress).host }
         } catch {
             guard generation == verificationGeneration else { return }
             if error is CancellationError || error as? SetupCommandError == .cancelled {
-                hostIdentity = .notChecked
+                if route == .existingLinuxSSH { hostIdentity = .notChecked }
+                else { localPreflightFailure = nil }
             } else {
-                let detail = (error as? HelicoidError)?.explanation ?? "SSH preflight failed or exceeded its time/output limit."
-                hostIdentity = .refused(detail: detail)
+                let detail = (error as? HelicoidError)?.explanation ?? "Host preflight failed or exceeded its time/output limit."
+                switch route {
+                case .thisMac:
+                    localPreflightFailure = detail
+                case .existingLinuxSSH:
+                    hostIdentity = .refused(detail: detail)
+                }
                 blocker = detail
             }
         }
@@ -305,6 +402,8 @@ public final class GuidedServerSetupModel {
         hostIdentity = .notChecked
         hostChecks = [:]
         hostPreflight = nil
+        localPreflight = nil
+        localPreflightFailure = nil
     }
 
     public func advance() {
@@ -313,7 +412,7 @@ public final class GuidedServerSetupModel {
             return
         }
         blocker = nil
-        let order = SetupPhase.allCases
+        let order = phaseOrder
         guard let index = order.firstIndex(of: phase), index + 1 < order.count else {
             return
         }
@@ -332,7 +431,7 @@ public final class GuidedServerSetupModel {
     }
 
     public func back() {
-        let order = SetupPhase.allCases
+        let order = phaseOrder
         guard let index = order.firstIndex(of: phase), index > 0 else { return }
         phase = order[index - 1]
         blocker = nil
@@ -344,22 +443,34 @@ public final class GuidedServerSetupModel {
         hostIdentity = .notChecked
         hostChecks = [:]
         hostPreflight = nil
+        localPreflight = nil
+        localPreflightFailure = nil
         installProgress = .notStarted
         blocker = nil
     }
 
     /// Summary of exact changes that *would* be applied. Never claims they were applied.
     public func reviewChanges() -> [String] {
-        [
-            "Route: \(route.title) (SSH \(sshAddress))",
+        var lines = [
+            "Route: \(route.title)",
             "Listeners: \(networkAddress):\(productPort), LAN scope: \(lanScope.isEmpty ? "unset" : lanScope)",
             "Deployment name: \(deploymentName)",
             "Administrator: \(administratorUsername) (MFA required; recovery handling not skipped)",
             "Storage: \(storagePath)",
             "Backup destination: \(backupDestination.isEmpty ? "unset" : backupDestination)",
-            "Host identity: \(hostIdentity.explanation)",
-            "Install: \(installProgressExplanation)",
         ]
+        switch route {
+        case .thisMac:
+            let plan = LocalHostingOwnershipPlan.current
+            lines.append("This Mac: \(localPreflight?.computerName ?? "unknown"), \(localPreflight?.osVersion ?? "unknown"), \(localPreflight?.architecture ?? "unknown")")
+            lines.append("Planned product path (not applied): \(plan.productRootPath)")
+            lines.append("Planned launchd service (not applied): \(plan.launchdLabel) at \(plan.launchdPlistPath)")
+            lines.append("Install: \(installProgressExplanation)")
+        case .existingLinuxSSH:
+            lines.append("Host identity: \(hostIdentity.explanation)")
+            lines.append("Install: \(installProgressExplanation)")
+        }
+        return lines
     }
 
     public var installProgressExplanation: String {
