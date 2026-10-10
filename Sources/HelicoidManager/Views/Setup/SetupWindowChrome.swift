@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// Keeps the setup dialog's window controls while removing the title-bar strip.
+/// Keeps a native setup title and window controls without a separate navigation strip.
 /// Restores the previous chrome when the Manager leaves setup.
 struct SetupWindowChrome: NSViewRepresentable {
     var isEnabled: Bool
@@ -25,6 +25,8 @@ struct SetupWindowChrome: NSViewRepresentable {
 final class WindowChromeView: NSView {
     var isEnabled = false
     private weak var styledWindow: NSWindow?
+    private var savedTitle = ""
+    private var savedFrame = NSRect.zero
     private var savedTitleVisibility: NSWindow.TitleVisibility = .visible
     private var savedTransparency = false
     private var savedFullSizeContent = false
@@ -43,22 +45,28 @@ final class WindowChromeView: NSView {
         }
         guard styledWindow !== window else { return }
         styledWindow = window
+        savedTitle = window.title
+        savedFrame = window.frame
         savedTitleVisibility = window.titleVisibility
         savedTransparency = window.titlebarAppearsTransparent
         savedFullSizeContent = window.styleMask.contains(.fullSizeContentView)
         savedSeparatorStyle = window.titlebarSeparatorStyle
-        window.titleVisibility = .hidden
+        window.title = "Server Setup · Helicoid Manager"
+        window.titleVisibility = .visible
         window.titlebarAppearsTransparent = true
         window.titlebarSeparatorStyle = .none
         window.styleMask.insert(.fullSizeContentView)
+        window.setContentSize(NSSize(width: 600, height: 400))
     }
 
     func restoreChrome() {
         guard let styledWindow else { return }
+        styledWindow.title = savedTitle
         styledWindow.titleVisibility = savedTitleVisibility
         styledWindow.titlebarAppearsTransparent = savedTransparency
         styledWindow.titlebarSeparatorStyle = savedSeparatorStyle
         if !savedFullSizeContent { styledWindow.styleMask.remove(.fullSizeContentView) }
+        styledWindow.setFrame(savedFrame, display: true)
         self.styledWindow = nil
     }
 }

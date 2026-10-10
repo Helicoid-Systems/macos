@@ -12,21 +12,6 @@ struct GuidedSetupView: View {
                 DevelopmentBanner()
             }
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text(stepDescription)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(stepTitle)
-                    .font(.title2.weight(.semibold))
-                Text(subtitle)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: 560, alignment: .leading)
-            .padding(.horizontal, 24)
-            .padding(.top, 40)
-            .padding(.bottom, 8)
-
             HStack(spacing: 0) {
                 Spacer(minLength: 0)
                 phaseForm
@@ -54,27 +39,26 @@ struct GuidedSetupView: View {
 
                 Spacer()
 
-                if model.phase != .chooseHosting {
-                    Button("Back") { model.back() }
+                if model.phase != .chooseHosting && model.phase != .connect {
+                    Button("Back", action: goBack)
                 }
 
-                Button(nextButtonTitle) {
-                    if model.phase == .hostIdentity && !model.hostIdentity.isVerified {
-                        model.startHostCheck()
-                    } else {
-                        model.advance()
-                    }
-                }
+                Button(nextButtonTitle, action: continueSetup)
                 .keyboardShortcut(.defaultAction)
-                .disabled(model.isCheckingHost || (model.phase != .hostIdentity && !model.canContinueFromCurrentPhase))
+                .disabled(model.isCheckingHost || (!isHostCheck && !model.canContinueFromCurrentPhase))
                 .help(model.canContinueFromCurrentPhase ? nextButtonTitle : continueDisabledReason)
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 20)
         }
-        .ignoresSafeArea(.container, edges: .top)
         .onDisappear { model.cancelHostCheck() }
-        .task { await model.prepareManagerIdentity() }
+        .task {
+            if model.phase == .chooseHosting {
+                model.advance()
+                model.setStoragePath("/var/lib/helicoid")
+            }
+            await model.prepareManagerIdentity()
+        }
     }
 
     private var continueDisabledReason: String {
@@ -100,11 +84,21 @@ struct GuidedSetupView: View {
         }
     }
 
+    private var isHostCheck: Bool {
+        model.phase == .hostIdentity || model.phase == .checkHost
+    }
+
+    private var hostChecksPassed: Bool {
+        model.hostIdentity.isVerified && GuidedServerSetupModel.requiredHostChecks.allSatisfy {
+            model.hostChecks[$0] == .passed
+        }
+    }
+
     private var nextButtonTitle: String {
         switch model.phase {
-        case .chooseHosting: "Get Started"
-        case .hostIdentity where model.isCheckingHost: "Checking…"
-        case .hostIdentity where !model.hostIdentity.isVerified: "Verify Server"
+        case .connect: "Check Server"
+        case .hostIdentity, .checkHost:
+            model.isCheckingHost ? "Checking…" : hostChecksPassed ? "Continue" : "Check Again"
         case .review: "Install"
         case .install: "Install Unavailable"
         case .ready: "Done"
@@ -112,110 +106,67 @@ struct GuidedSetupView: View {
         }
     }
 
-    private var stepDescription: String {
-        let preparation = SetupPhase.allCases.prefix(while: { $0 != .install })
-        if let index = preparation.firstIndex(of: model.phase) {
-            return "Server Setup · Step \(index + 1) of \(preparation.count)"
-        }
-        return "Server Setup"
-    }
-
-    private var stepTitle: String {
-        switch model.phase {
-        case .chooseHosting: "Set up your Helicoid server"
-        case .connect: "Where is your Linux server?"
-        case .hostIdentity: "Verify your server"
-        case .checkHost: "Check compatibility"
-        case .network: "How will computers connect?"
-        case .deploymentIdentity: "Name your deployment"
-        case .administrator: "Choose an administrator"
-        case .storage: "Choose storage locations"
-        case .review: "Review your installation"
-        case .install: "Installation unavailable"
-        case .ready: "Your server is ready for enrollment"
+    private func continueSetup() {
+        if model.phase == .connect {
+            model.advance()
+            model.startHostCheck()
+        } else if isHostCheck {
+            if hostChecksPassed {
+                if model.phase == .hostIdentity { model.advance() }
+                model.advance()
+            } else {
+                model.startHostCheck()
+            }
+        } else {
+            model.advance()
         }
     }
 
-    private var subtitle: String {
-        switch model.phase {
-        case .chooseHosting:
-            "Connect to an existing Linux server. We’ll check it and show you the installation changes before you apply them."
-        case .connect:
-            "Use the same username and host you use to connect with SSH."
-        case .hostIdentity:
-            "Check the server against your Mac’s trusted SSH hosts before continuing."
-        case .checkHost:
-            "All checks must pass. If something needs attention, resolve it and check again."
-        case .network:
-            "Use an address reachable by your Manager and Windows computers."
-        case .deploymentIdentity:
-            "Pick a name you’ll recognize when connecting to this server."
-        case .administrator:
-            "This account will manage enrollment and permissions. Set up MFA during installation."
-        case .storage:
-            "These folders are on the Linux server, not on your Mac."
-        case .review:
-            "Check the services, files, ports, and storage changes before installing."
-        case .install:
-            "This development build cannot install the server yet."
-        case .ready:
-            "Next, enroll a Windows computer and verify live viewing."
-        }
+    private func goBack() {
+        model.cancelHostCheck()
+        if model.phase == .checkHost { model.back() }
+        model.back()
     }
 
     @ViewBuilder
     private var phaseForm: some View {
         switch model.phase {
-        case .chooseHosting:
+        case .chooseHosting, .connect:
             Form {
-                Section("You’ll need") {
-                    Label("An Ubuntu 26.04 server", systemImage: "server.rack")
-                    Label("SSH key access from this Mac", systemImage: "key")
-                    Label("Administrator privileges on the server", systemImage: "person.badge.key")
-                }
                 Section {
-                    Text("Setup checks your server first. You’ll review every installation change before anything is installed.")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .formStyle(.grouped)
-
-        case .connect:
-            Form {
-                Section("Linux SSH") {
                     TextField("SSH address", text: Binding(
                         get: { model.sshAddress },
                         set: { model.setSSHAddress($0) }
                     ), prompt: Text("ubuntu@server.example.com"))
-                    LabeledContent("Authentication", value: "SSH key from this Mac")
-                    Text("For a custom SSH port, use username@host:port.")
+                    Text("Connect with your Mac’s SSH key. For a custom port, use username@host:port.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)
 
-        case .hostIdentity:
+        case .hostIdentity, .checkHost:
             Form {
-                Section("Host Identity") {
-                    LabeledContent("Current result") {
+                Section {
+                    if model.isCheckingHost {
+                        ProgressView("Checking server…")
+                    } else if hostChecksPassed {
+                        Label("Server checks passed", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else if !model.hostIdentity.isVerified {
                         Text(model.hostIdentity.explanation)
-                            .multilineTextAlignment(.trailing)
                     }
-                    if model.isCheckingHost { ProgressView().controlSize(.small) }
-                    Text("Uses your existing trusted SSH host keys. An unknown or changed key stops setup; verify it independently through the server provider before adding it to SSH trust.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .formStyle(.grouped)
-
-        case .checkHost:
-            Form {
-                Section("Host Checks") {
-                    ForEach(GuidedServerSetupModel.requiredHostChecks, id: \.self) { checkRow($0) }
-                    Button("Refresh Checks") { model.startHostCheck() }
-                        .disabled(model.isCheckingHost)
+                    if !model.isCheckingHost && !hostChecksPassed {
+                        ForEach(GuidedServerSetupModel.requiredHostChecks, id: \.self) { name in
+                            if case .needsAttention = model.hostChecks[name] { checkRow(name) }
+                        }
+                    }
+                    DisclosureGroup("Details") {
+                        Text(model.hostIdentity.explanation)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                        ForEach(GuidedServerSetupModel.requiredHostChecks, id: \.self) { checkRow($0) }
+                    }
                 }
             }
             .formStyle(.grouped)
@@ -227,24 +178,26 @@ struct GuidedSetupView: View {
                         get: { model.networkAddress },
                         set: { model.setNetworkAddress($0) }
                     ))
-                    TextField("Connection port", text: Binding(
-                        get: { model.productPort },
-                        set: { model.setProductPort($0) }
-                    ))
-                    TextField("LAN scope (optional)", text: Binding(
-                        get: { model.lanScope },
-                        set: { model.setLanScope($0) }
-                    ))
-                    Text("The default connection port is 8920. Rendezvous and relay use ports 21115–21117.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    DisclosureGroup("Advanced") {
+                        TextField("Connection port", text: Binding(
+                            get: { model.productPort },
+                            set: { model.setProductPort($0) }
+                        ))
+                        TextField("LAN scope (optional)", text: Binding(
+                            get: { model.lanScope },
+                            set: { model.setLanScope($0) }
+                        ))
+                        Text("Default: 8920. Rendezvous and relay: 21115–21117.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             .formStyle(.grouped)
 
         case .deploymentIdentity:
             Form {
-                Section("Deployment Identity") {
+                Section {
                     TextField("Deployment name", text: Binding(
                         get: { model.deploymentName },
                         set: { model.setDeploymentName($0) }
@@ -252,8 +205,8 @@ struct GuidedSetupView: View {
                     if model.isPreparingManagerIdentity {
                         ProgressView("Preparing Manager identity…")
                     } else if !model.generatedTrustIdentityNote.isEmpty {
-                        Label("Manager identity saved in Keychain", systemImage: "checkmark.shield")
-                        DisclosureGroup("Identity details") {
+                        DisclosureGroup("Manager identity") {
+                            Label("Saved in Keychain", systemImage: "checkmark.shield")
                             Text(model.generatedTrustIdentityNote)
                                 .font(.caption.monospaced())
                                 .textSelection(.enabled)
@@ -272,12 +225,12 @@ struct GuidedSetupView: View {
 
         case .administrator:
             Form {
-                Section("Administrator") {
+                Section {
                     TextField("Administrator username", text: Binding(
                         get: { model.administratorUsername },
                         set: { model.setAdministratorUsername($0) }
                     ))
-                    Text("Installation will ask you to enroll an authenticator app and save recovery material. This account does not receive viewing permission automatically.")
+                    Text("You’ll add an authenticator app during installation. Viewing permissions are assigned separately.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -286,18 +239,17 @@ struct GuidedSetupView: View {
 
         case .storage:
             Form {
-                Section("Storage and Backups") {
+                Section("Linux server storage") {
                     TextField("Server data folder", text: Binding(
                         get: { model.storagePath },
                         set: { model.setStoragePath($0) }
                     ), prompt: Text("/var/lib/helicoid"))
-                    TextField("Encrypted backup folder (optional)", text: Binding(
-                        get: { model.backupDestination },
-                        set: { model.setBackupDestination($0) }
-                    ), prompt: Text("/path/on/linux/server"))
-                    Text("Enter absolute Linux paths. You’ll review them before installation.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    DisclosureGroup("Backup location (optional)") {
+                        TextField("Encrypted backup folder", text: Binding(
+                            get: { model.backupDestination },
+                            set: { model.setBackupDestination($0) }
+                        ), prompt: Text("/path/on/linux/server"))
+                    }
                 }
             }
             .formStyle(.grouped)
@@ -323,9 +275,6 @@ struct GuidedSetupView: View {
                 Text(model.installProgressExplanation)
                     .font(.body)
                     .foregroundStyle(.secondary)
-                Text("Server Ready for Enrollment is not claimed. No partial install is reported as success.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .padding(.top, 24)
@@ -334,7 +283,7 @@ struct GuidedSetupView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Label("Server Ready for Enrollment", systemImage: "checkmark.circle")
                     .font(.headline)
-                Text("Deployment Verified requires later enrolled endpoint evidence and is never marked by setup alone.")
+                Text("Next, enroll a Windows computer.")
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
