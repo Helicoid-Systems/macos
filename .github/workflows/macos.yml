@@ -42,10 +42,15 @@ jobs:
           ./scripts/build.sh
 
       - name: Upload apps
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "dist/Helicoid Manager.app" "dist/Helicoid Manager.zip"
+          ditto -c -k --sequesterRsrc --keepParent "dist/Helicoid Computer.app" "dist/Helicoid Computer.zip"
+
+      - name: Upload app archives
         uses: actions/upload-artifact@v4
         with:
           name: helicoid-macos-apps
-          path: dist/
+          path: dist/*.zip
           if-no-files-found: error
 
   intel-source-build:
