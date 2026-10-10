@@ -62,6 +62,7 @@ struct RootView: View {
             }
         }
         .frame(minWidth: 720, minHeight: 480)
+        .background(SetupWindowChrome(isEnabled: session.screen == .guidedSetup))
     }
 }
 
