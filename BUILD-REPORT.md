@@ -81,3 +81,9 @@ Final packaged source passes 77 tests in 15 suites. Both release apps package wi
 Native Manager navigation was driven through Choose Hosting into SSH details; missing SSH address disables Continue. Production Connect remains disabled. Removed the simulated SSH identity verifier: entering a fingerprint no longer creates a verified host. Actual host-key verification remains unavailable. Required login expiry, capabilities, account revision, MFA state and health readiness now fail closed when malformed.
 
 Final packaged Manager CUA check: production Connect disabled; Guided Setup advances into SSH address entry; after entering example.invalid, Host Identity explains real verification is unavailable and Continue remains disabled. No SSH connection or deployment occurred.
+
+## Coordinator archive correction
+
+Direct archive inspection found that earlier CI bundles did not contain complete app signatures and icon compilation failures were tolerated. Those artifacts are superseded. The corrected packager requires an approved icon: it compiles the layered source when supported or verifies the checked-in .icns fallback against provenance. Fallbacks were generated from the exact approved role artwork using Xcode 27.0 actool with a 15.0 minimum target. Both packaging paths now ad-hoc sign the complete app and run `codesign --verify --deep --strict`.
+
+Fresh clean temporary builds passed the forced fallback path and the layered compilation path. Final CI archive inspection must verify signatures, executable modes, minimum OS and both role icons after download. This does not claim Developer ID, notarization or the full installed appearance matrix.
