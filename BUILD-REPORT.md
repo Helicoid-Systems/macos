@@ -10,6 +10,8 @@ Coordinator `HELICOID_BUILD_DIR=/tmp/hs-build/macos-tls-package HELICOID_DIST_DI
 
 Native [CI38146856209](https://github.com/Helicoid-Systems/macos/actions/runs/38146856209) at `dab66917ce71714fa9484b3d2c1efb9ba19c087f` **Failed**14 issues: TLS helpers start, but positive requests and exact body-rejection cases receive cancellation; a separate SSH command-runner timing assertion also fails. The native trust cause remains unproven until the next run supplies exact `decision`, `step`, `osStatus`, `cfDomain` and `cfCode`. This candidate does not pass the native gate yet. Earlier failed runs:38143728598 (`8efc0fd`, dated LibreSSL fixture),38144537088 (`7ef997b`, READY timeout),38145963036 (`17caa1e`, READY timeout). Intel source compilation passed those runs; it is not runtime evidence.
 
+The next fixture-only candidate removes ambient request/self-sign extension configuration and checks DER extension OID uniqueness, positive CA/keyCertSign and the retained invalid-CA shape. Both local OpenSSL3.6.4 and LibreSSL3.3.6 generate one copy of each intended extension. The original local DER also had no duplicates, so native root cause remains unproven. Coordinator verification used a frozen `c098c02` snapshot plus only the two fixture files, excluding the concurrent SSH task: **177 tests in27 suites passed** (21.458s). Production transport/build code is unchanged by this fixture package. Fresh Mac15 CI remains required.
+
 Trust adoption, production authentication, capture/input, public routing, installed hosting/recovery and Developer ID/notarization remain incomplete. The records below are historical evidence and do not state the current test count.
 
 Date: 2026-10-10 (post-review fixes)
