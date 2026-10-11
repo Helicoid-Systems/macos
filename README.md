@@ -57,7 +57,7 @@ Enabled only with `--development-server`. The client accepts loopback only
 (`127.0.0.1`, `[::1]`, or `localhost` that resolves to loopback). It never
 claims a verified production server identity. Tokens are memory-only.
 
-Production mode stays closed until a trusted server identity is implemented.
+Production mode stays closed until persisted deployment trust adoption and authentication are integrated. The pinned HTTPS transport below is independently tested and does not enable production Connect.
 
 Fixture mode and development-server mode are independent and must not be conflated.
 
@@ -83,8 +83,7 @@ Fixture mode and development-server mode are independent and must not be conflat
 
 ### Guided server setup
 
-Mac manager offers **Linux SSH only**. Install never claims success without
-integrated server packages.
+Mac manager offers **This Mac** read-only preflight and **Existing Linux Server** via verified SSH. Install never claims success without integrated server packages.
 
 Setup opens directly to the SSH address in a compact custom native dialog.
 Its title is **Server Setup · Helicoid Manager**, with no navigation bar,
@@ -143,3 +142,10 @@ Independent copies (build does not read a sibling checkout):
 Guided setup offers **This Mac** and **Existing Linux Server**. This Mac performs bounded, read-only OS/architecture, privilege, disk, product-path, launchd-service and listener checks. Unknown facts block progress. Unprivileged listener inspection is explicitly incomplete; this checkpoint does not install or register a launchd service or claim Server Ready for Enrollment. Windows local hosting is offered by the Windows app.
 
 Fresh coordinator verification: 122 Swift tests in 19 suites, both release app bundles, the supplied layered icons, and deep strict ad-hoc signature checks passed. The packaged Manager was exercised through This Mac → Check This Mac and refused incomplete listener inspection. Intel runtime, privileged installation, live preview/control and production signing remain Not Verified.
+
+
+## Pinned HTTPS prerequisite (11 October 2026)
+
+`DeploymentTLSIdentity` accepts an independently supplied deployment CA and SHA-256 pin. `PinnedHTTPSTransport` uses native Security hostname, chain, validity and server-authentication checks with that sole anchor, TLS1.2 minimum, no redirects or online CA fetch, and bounded streaming/cancellation. Invalid trust, body bounds and operation deadlines fail closed. Deployment trust adoption and production sign-in remain unavailable.
+
+The coordinator passed **168 Swift tests in 25 suites**, including genuine disposable TLS sockets, wrong CA/name/expiry/EKU, redirects, body overflow, cancellation, disposal and concurrent startup. Both Apple Silicon release bundles passed strict ad-hoc signature verification. Developer ID/notarization, Intel runtime, installed worker capture/input and preview/control remain **Not Verified**.

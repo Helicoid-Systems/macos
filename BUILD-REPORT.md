@@ -1,5 +1,11 @@
 # BUILD-REPORT — Helicoid macOS (apps/macos)
 
+## Current pinned HTTPS prerequisite, 11 October 2026
+
+MiMo Code exported metadata confirms `xiaomi/mimo-v2.6-pro`. The coordinator reviewed and repaired native CA KeyUsage validation, request registration versus disposal, structured deadline/cancellation, pre-append streaming caps, actual URLSessionTask cancellation and bounded owned fixture process teardown. Normal network races cannot trigger process-fatal assertions. Native trust uses the sole independently supplied CA with hostname/chain/date/EKU checks and no AIA/OS-root fallback.
+
+Fresh `HELICOID_BUILD_DIR=/tmp/hs-build/macos-tls-package HELICOID_DIST_DIR=/tmp/hs-build/macos-tls-dist ./scripts/build.sh` passed **168 tests in25 suites**, release build, supplied layered-icon compilation and both app packages. `codesign --verify --deep --strict` passed for both ad-hoc signed arm64 bundles. `xcrun swift build -c release --arch x86_64 --scratch-path /tmp/hs-build/macos-tls-intel` also passed; both binaries are x86_64 (compile only). Native CI for this revision is pending. Trust adoption, production authentication, capture/input, public routing, installed hosting/recovery and Developer ID/notarization remain incomplete. The records below are historical evidence and do not state the current test count.
+
 Date: 2026-10-10 (post-review fixes)
 Owner path: `apps/macos/**` only
 Product: Helicoid / Helicoid Systems
