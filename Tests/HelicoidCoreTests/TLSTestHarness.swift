@@ -128,35 +128,107 @@ enum TLSTestHarness {
         }
     }
 
+    /// Owned named section used for every fixture extension file.
+    /// Both `x509 -req` and `ca` select this section explicitly so no ambient
+    /// default section can contribute a second copy of an extension.
+    static let extensionSection = "helicoid_ext"
+
+    /// Owned minimal `req` config: DN only. Never carries request/x509
+    /// extensions, so ambient LibreSSL/OpenSSL defaults cannot inject
+    /// duplicate extension OIDs into a CSR or self-signed root.
+    static func ownedRequestConfig(commonName: String) -> String {
+        """
+        [req]
+        prompt = no
+        distinguished_name = dn
+
+        [dn]
+        CN = \(commonName)
+        """
+    }
+
+    /// Owned self-sign config: extensions only from `extensionSection`.
+    /// Used instead of `req -x509 -addext` + ambient config, which can
+    /// emit the same extension twice under some provider default configs.
+    static func ownedSelfSignConfig(commonName: String, extensions: String) -> String {
+        """
+        [req]
+        prompt = no
+        distinguished_name = dn
+        x509_extensions = \(extensionSection)
+
+        [dn]
+        CN = \(commonName)
+
+        [\(extensionSection)]
+        \(extensions)
+        """
+    }
+
+    /// Owned extfile body with a named section for `x509 -req` / `ca`.
+    static func ownedExtFile(extensions: String) -> String {
+        """
+        [\(extensionSection)]
+        \(extensions)
+        """
+    }
+
+    private static func writeOwnedFile(_ contents: String, to url: URL) throws {
+        try contents.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Self-signed root via owned config (no `-addext`, no ambient extensions).
+    private static func selfSignedCA(
+        name: String,
+        commonName: String,
+        extensions: String,
+        directory: URL
+    ) throws -> URL {
+        let key = directory.appendingPathComponent("\(name).key")
+        let crt = directory.appendingPathComponent("\(name).crt")
+        let cnf = directory.appendingPathComponent("\(name)-selfsign.cnf")
+        try writeOwnedFile(
+            ownedSelfSignConfig(commonName: commonName, extensions: extensions),
+            to: cnf
+        )
+        try openssl([
+            "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", key.path, "-out", crt.path,
+            "-days", "365", "-nodes",
+            "-config", cnf.path,
+        ])
+        return crt
+    }
+
     private static func generatePKI(directory: URL) throws -> PKI {
         let caKey = directory.appendingPathComponent("ca.key")
-        let caCrt = directory.appendingPathComponent("ca.crt")
+        let caCrtURL = try selfSignedCA(
+            name: "ca",
+            commonName: "Helicoid Disposable Test CA",
+            extensions: """
+            basicConstraints=critical,CA:TRUE
+            keyUsage=critical,keyCertSign,cRLSign
+            """,
+            directory: directory
+        )
+        let caCrt = caCrtURL.path
         let caDer = directory.appendingPathComponent("ca.der")
 
         try openssl([
-            "req", "-x509", "-newkey", "rsa:2048",
-            "-keyout", caKey.path, "-out", caCrt.path,
-            "-days", "365", "-nodes",
-            "-subj", "/CN=Helicoid Disposable Test CA",
-            "-addext", "basicConstraints=critical,CA:TRUE",
-            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
-        ])
-
-        try openssl([
-            "x509", "-in", caCrt.path, "-outform", "DER", "-out", caDer.path,
+            "x509", "-in", caCrt, "-outform", "DER", "-out", caDer.path,
         ])
 
         // Foreign CA (independent root).
+        let foreignCACrt = try selfSignedCA(
+            name: "foreign-ca",
+            commonName: "Helicoid Foreign Test CA",
+            extensions: """
+            basicConstraints=critical,CA:TRUE
+            keyUsage=critical,keyCertSign,cRLSign
+            """,
+            directory: directory
+        )
         let foreignCAKey = directory.appendingPathComponent("foreign-ca.key")
-        let foreignCACrt = directory.appendingPathComponent("foreign-ca.crt")
-        try openssl([
-            "req", "-x509", "-newkey", "rsa:2048",
-            "-keyout", foreignCAKey.path, "-out", foreignCACrt.path,
-            "-days", "365", "-nodes",
-            "-subj", "/CN=Helicoid Foreign Test CA",
-            "-addext", "basicConstraints=critical,CA:TRUE",
-            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
-        ])
 
         func signedServer(
             name: String,
@@ -171,11 +243,14 @@ enum TLSTestHarness {
             let csr = directory.appendingPathComponent("\(name).csr")
             let crt = directory.appendingPathComponent("\(name).crt")
             let extFile = directory.appendingPathComponent("\(name).ext")
-            try ext.write(to: extFile, atomically: true, encoding: .utf8)
+            let reqConfig = directory.appendingPathComponent("\(name)-req.cnf")
+            let section = extensionSection
+            try writeOwnedFile(ownedExtFile(extensions: ext), to: extFile)
+            try writeOwnedFile(ownedRequestConfig(commonName: "placeholder"), to: reqConfig)
             try openssl([
                 "req", "-newkey", "rsa:2048",
                 "-keyout", key.path, "-out", csr.path,
-                "-nodes", "-subj", subject,
+                "-nodes", "-config", reqConfig.path, "-subj", subject,
             ])
             if let notBefore, let notAfter {
                 // Portable dated signing. `x509 -not_before/-not_after` is
@@ -189,9 +264,7 @@ enum TLSTestHarness {
                 try FileManager.default.createDirectory(at: newCerts, withIntermediateDirectories: true)
                 try Data().write(to: index)
                 try Data("01\n".utf8).write(to: serial)
-                // `ca -extfile` needs a named extensions section.
-                let section = "dated_ext"
-                try "[\(section)]\n\(ext)\n".write(to: extFile, atomically: true, encoding: .utf8)
+                // `ca -extfile` selects the owned named extensions section.
                 let config = """
                 [ ca ]
                 default_ca = CA_default
@@ -232,6 +305,7 @@ enum TLSTestHarness {
                     "x509", "-req", "-in", csr.path,
                     "-CA", caCrt, "-CAkey", caKey, "-CAcreateserial",
                     "-out", crt.path, "-extfile", extFile.path,
+                    "-extensions", section,
                     "-days", "365",
                 ])
             }
@@ -240,7 +314,7 @@ enum TLSTestHarness {
 
         let good = try signedServer(
             name: "server",
-            caCrt: caCrt.path,
+            caCrt: caCrt,
             caKey: caKey.path,
             subject: "/CN=127.0.0.1",
             ext: """
@@ -266,7 +340,7 @@ enum TLSTestHarness {
 
         let expired = try signedServer(
             name: "expired-server",
-            caCrt: caCrt.path,
+            caCrt: caCrt,
             caKey: caKey.path,
             subject: "/CN=127.0.0.1",
             ext: """
@@ -281,7 +355,7 @@ enum TLSTestHarness {
 
         let nonServerAuth = try signedServer(
             name: "clientauth-server",
-            caCrt: caCrt.path,
+            caCrt: caCrt,
             caKey: caKey.path,
             subject: "/CN=127.0.0.1",
             ext: """
@@ -294,7 +368,7 @@ enum TLSTestHarness {
 
         let wrongHost = try signedServer(
             name: "wronghost-server",
-            caCrt: caCrt.path,
+            caCrt: caCrt,
             caKey: caKey.path,
             subject: "/CN=wrong.example",
             ext: """
@@ -306,17 +380,16 @@ enum TLSTestHarness {
         )
 
         // CA:TRUE with digitalSignature only (no keyCertSign) — invalid as an anchor.
-        let noKeySignCAKey = directory.appendingPathComponent("nokeysign-ca.key")
-        let noKeySignCACrt = directory.appendingPathComponent("nokeysign-ca.crt")
+        let noKeySignCACrt = try selfSignedCA(
+            name: "nokeysign-ca",
+            commonName: "Helicoid NoKeySign CA",
+            extensions: """
+            basicConstraints=critical,CA:TRUE
+            keyUsage=critical,digitalSignature
+            """,
+            directory: directory
+        )
         let noKeySignCADERURL = directory.appendingPathComponent("nokeysign-ca.der")
-        try openssl([
-            "req", "-x509", "-newkey", "rsa:2048",
-            "-keyout", noKeySignCAKey.path, "-out", noKeySignCACrt.path,
-            "-days", "365", "-nodes",
-            "-subj", "/CN=Helicoid NoKeySign CA",
-            "-addext", "basicConstraints=critical,CA:TRUE",
-            "-addext", "keyUsage=critical,digitalSignature",
-        ])
         try openssl([
             "x509", "-in", noKeySignCACrt.path, "-outform", "DER", "-out", noKeySignCADERURL.path,
         ])
