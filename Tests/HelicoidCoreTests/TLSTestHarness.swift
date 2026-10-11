@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 @testable import HelicoidCore
 
@@ -378,27 +379,45 @@ enum TLSTestHarness {
 
     /// TEST-ONLY owned child with bounded startup and teardown.
     ///
+    /// Process output is pumped from owned nonblocking pipe fds (`poll`/`read`),
+    /// not Foundation readability handlers or main-runloop notifications, so
+    /// readiness never depends on notification scheduling. Both stdout and
+    /// stderr are pumped during readiness, `awaitExit`, and teardown. Capture
+    /// buffers are bounded; excess bytes are drained and discarded so the child
+    /// never blocks on a full pipe. A complete final drain runs before any
+    /// descriptor is closed.
+    ///
     /// Termination observation is installed before launch. `stop()` never
     /// blocks on an unbounded `waitUntilExit`. After a graceful SIGTERM
-    /// window only this process's own PID is force-killed. Pipes are closed
-    /// and readability handlers detached on dispose.
+    /// window only this process's own PID is force-killed.
     ///
     /// Exit observation is non-consumable: `waitUntil` cannot eat a
     /// termination signal out from under a later `stop()`. `isRunning == false`
     /// is terminal success at entry and after any bounded observation window.
     final class OwnedChild: @unchecked Sendable {
+        /// Per-stream capture bound. Excess is still read (and discarded) so
+        /// the child never blocks; the overflow is flagged for diagnostics.
+        private static let captureLimit = 1 << 20
+
         private let process = Process()
-        private let stdout: Pipe
-        private let stderr: Pipe
         private let exitLatch = ExitLatch()
         private let bufferLock = NSLock()
         private var stdoutBuffer = Data()
         private var stderrBuffer = Data()
+        private var stdoutTruncated = false
+        private var stderrTruncated = false
+        private var stdoutEOF = false
+        private var stderrEOF = false
+        private var pumpFinished = true
+        private var pumpStopRequested = false
         private var stopped = false
 
-        init(stdout: Pipe, stderr: Pipe) {
-            self.stdout = stdout
-            self.stderr = stderr
+        // Owned read ends. Write ends are closed in the parent after spawn so
+        // child exit produces a true EOF. Closed for good in `stop()`.
+        private var stdoutReadFD: Int32 = -1
+        private var stderrReadFD: Int32 = -1
+
+        init() {
             // Observe termination BEFORE launch so exit can never be missed.
             let latch = exitLatch
             process.terminationHandler = { _ in
@@ -420,6 +439,14 @@ enum TLSTestHarness {
             process.isRunning ? nil : process.terminationStatus
         }
 
+        /// True once stdout hit EOF. A readiness regression uses this to prove
+        /// a newline READY arrived without consuming the child's lifetime.
+        var hasSeenStdoutEOF: Bool {
+            bufferLock.lock()
+            defer { bufferLock.unlock() }
+            return stdoutEOF
+        }
+
         func configure(
             executable: URL,
             arguments: [String],
@@ -430,45 +457,55 @@ enum TLSTestHarness {
             if let currentDirectory {
                 process.currentDirectoryURL = currentDirectory
             }
-            process.standardOutput = stdout
-            process.standardError = stderr
         }
 
         /// Launch. Throws on startup failure within a bounded window.
         func launch() throws {
+            var stdoutPipe: [Int32] = [0, 0]
+            var stderrPipe: [Int32] = [0, 0]
+            guard pipe(&stdoutPipe) == 0 else {
+                throw HarnessError.commandFailed("pipe stdout", -1, errnoText())
+            }
+            guard pipe(&stderrPipe) == 0 else {
+                close(stdoutPipe[0])
+                close(stdoutPipe[1])
+                throw HarnessError.commandFailed("pipe stderr", -1, errnoText())
+            }
+            stdoutReadFD = stdoutPipe[0]
+            stderrReadFD = stderrPipe[0]
+            let stdoutWriteFD = stdoutPipe[1]
+            let stderrWriteFD = stderrPipe[1]
+
+            guard setNonBlocking(stdoutReadFD), setNonBlocking(stderrReadFD) else {
+                close(stdoutWriteFD)
+                close(stderrWriteFD)
+                closeReadFDs()
+                throw HarnessError.commandFailed("fcntl O_NONBLOCK", -1, errnoText())
+            }
+
+            // Parent owns the read ends; the child receives the write ends.
+            process.standardOutput = FileHandle(fileDescriptor: stdoutWriteFD, closeOnDealloc: false)
+            process.standardError = FileHandle(fileDescriptor: stderrWriteFD, closeOnDealloc: false)
+
             do {
                 try process.run()
             } catch {
-                detachPipes()
+                close(stdoutWriteFD)
+                close(stderrWriteFD)
+                closeReadFDs()
                 throw HarnessError.commandFailed(
                     "launch \(process.executableURL?.path ?? "?")",
                     -1,
                     String(describing: error)
                 )
             }
-            // Drain pipes on background reads so children never block on a full pipe.
-            stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let chunk = handle.availableData
-                guard let self else { return }
-                if chunk.isEmpty {
-                    handle.readabilityHandler = nil
-                    return
-                }
-                self.bufferLock.lock()
-                self.stdoutBuffer.append(chunk)
-                self.bufferLock.unlock()
-            }
-            stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let chunk = handle.availableData
-                guard let self else { return }
-                if chunk.isEmpty {
-                    handle.readabilityHandler = nil
-                    return
-                }
-                self.bufferLock.lock()
-                self.stderrBuffer.append(chunk)
-                self.bufferLock.unlock()
-            }
+            // `run()` returns after posix_spawn has duplicated the write ends
+            // into the child. Closing the parent's copies gives a true EOF when
+            // the child exits, independent of Foundation pipe bookkeeping.
+            close(stdoutWriteFD)
+            close(stderrWriteFD)
+
+            startPump()
         }
 
         func takeStdout() -> Data {
@@ -483,9 +520,29 @@ enum TLSTestHarness {
             return stderrBuffer
         }
 
+        /// Bounded child-state diagnostic for startup failure/timeout.
+        /// Surfaces exit state and capped stderr so a native CI attempt is
+        /// diagnosable from the error text alone.
+        func failureDiagnostics() -> String {
+            bufferLock.lock()
+            let err = stderrBuffer
+            let truncated = stderrTruncated
+            let outEOF = stdoutEOF
+            let errEOF = stderrEOF
+            bufferLock.unlock()
+            let running = isRunning
+            let statusText = terminationStatus.map { String(describing: $0) } ?? "nil"
+            let errText = err.isEmpty
+                ? "<empty>"
+                : (String(data: err, encoding: .utf8) ?? "<non-utf8 stderr \(err.count) bytes>")
+            let suffix = truncated ? "…(truncated)" : ""
+            return "running=\(running) status=\(statusText) stdoutEOF=\(outEOF) stderrEOF=\(errEOF) stderr=\(errText)\(suffix)"
+        }
+
         /// Wait until `deadline` for `predicate` over the stdout buffer.
         /// Never blocks past the deadline. Returns false on timeout.
-        /// Does not consume termination state.
+        /// Does not consume termination state. The fd pump runs independently
+        /// of this loop, so readiness does not depend on run-loop scheduling.
         func waitUntil(
             timeout: TimeInterval,
             predicate: (Data) -> Bool
@@ -506,7 +563,8 @@ enum TLSTestHarness {
 
         /// Bounded teardown. Graceful SIGTERM, then SIGKILL of owned PID only.
         /// Unexpected survivors are reported as `teardownFailed` — not
-        /// disguised as best-effort reaping.
+        /// disguised as best-effort reaping. Completes a final stdout/stderr
+        /// drain before any descriptor is closed.
         func stop(
             gracefulTimeout: TimeInterval = 2.0,
             forceTimeout: TimeInterval = 1.0
@@ -519,34 +577,44 @@ enum TLSTestHarness {
                 return
             }
 
-            defer { detachPipes() }
+            var teardownError: HarnessError?
 
             // Terminal success at entry: already dead children are never signaled.
-            if isTerminated {
-                return
+            if !isTerminated {
+                process.terminate()
+                if !waitForExit(gracefulTimeout) {
+                    // Recheck immediately before SIGKILL. Never signal an exited child.
+                    if !isTerminated {
+                        // Owned child PID only — captured for the diagnostic message.
+                        let ownedPID = process.processIdentifier
+                        if ownedPID > 0 {
+                            kill(ownedPID, SIGKILL)
+                        }
+                        if !waitForExit(forceTimeout) {
+                            teardownError = HarnessError.teardownFailed(
+                                "owned child pid=\(ownedPID) still running after SIGTERM+\(gracefulTimeout)s and SIGKILL+\(forceTimeout)s"
+                            )
+                        }
+                    }
+                }
             }
 
-            process.terminate()
-            if waitForExit(gracefulTimeout) {
-                return
+            // Retire the pump first so the final drain cannot race another reader.
+            requestPumpStop()
+            let pumpGone = waitForPumpFinish(1.0)
+            if pumpGone {
+                finalDrain()
+                closeReadFDs()
+            }
+            // Retain descriptors if the reader survives, and make the incomplete
+            // drain observable. Closing them could race a live reader.
+            if !pumpGone, teardownError == nil {
+                teardownError = HarnessError.teardownFailed("owned output pump did not retire within 1s")
             }
 
-            // Recheck immediately before SIGKILL. Never signal an exited child.
-            guard !isTerminated else {
-                return
+            if let teardownError {
+                throw teardownError
             }
-            // Owned child PID only — captured for the diagnostic message.
-            let ownedPID = process.processIdentifier
-            if ownedPID > 0 {
-                kill(ownedPID, SIGKILL)
-            }
-            if waitForExit(forceTimeout) {
-                return
-            }
-
-            throw HarnessError.teardownFailed(
-                "owned child pid=\(ownedPID) still running after SIGTERM+\(gracefulTimeout)s and SIGKILL+\(forceTimeout)s"
-            )
         }
 
         /// Bounded wait for termination. `isRunning == false` (or the exit
@@ -566,14 +634,179 @@ enum TLSTestHarness {
             return isTerminated
         }
 
-        private func detachPipes() {
-            stdout.fileHandleForReading.readabilityHandler = nil
-            stderr.fileHandleForReading.readabilityHandler = nil
-            // Close owned descriptors; ignore already-closed.
-            try? stdout.fileHandleForReading.close()
-            try? stderr.fileHandleForReading.close()
-            try? stdout.fileHandleForWriting.close()
-            try? stderr.fileHandleForWriting.close()
+        // MARK: Owned fd pump
+
+        private func setNonBlocking(_ fd: Int32) -> Bool {
+            let flags = fcntl(fd, F_GETFL, 0)
+            guard flags >= 0 else { return false }
+            return fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0
+        }
+
+        private func errnoText() -> String {
+            String(cString: strerror(errno))
+        }
+
+        private func startPump() {
+            bufferLock.lock()
+            pumpFinished = false
+            pumpStopRequested = false
+            bufferLock.unlock()
+            let thread = Thread { [weak self] in
+                self?.runPump()
+            }
+            thread.name = "TLSTestHarness.OwnedChild.pump"
+            thread.start()
+        }
+
+        private func runPump() {
+            while true {
+                bufferLock.lock()
+                let stopping = pumpStopRequested
+                let outDone = stdoutEOF
+                let errDone = stderrEOF
+                bufferLock.unlock()
+                if stopping || (outDone && errDone) {
+                    break
+                }
+
+                var fds = [
+                    pollfd(fd: stdoutReadFD, events: Int16(POLLIN), revents: 0),
+                    pollfd(fd: stderrReadFD, events: Int16(POLLIN), revents: 0),
+                ]
+                let ready = poll(&fds, nfds_t(fds.count), 50)
+                if ready < 0 {
+                    if errno == EINTR {
+                        continue
+                    }
+                    break
+                }
+                if ready == 0 {
+                    continue
+                }
+                if fds[0].revents != 0 {
+                    pumpFD(stdoutReadFD, isStdout: true)
+                }
+                if fds[1].revents != 0 {
+                    pumpFD(stderrReadFD, isStdout: false)
+                }
+            }
+            // Drain anything still queued before retiring, then publish done.
+            pumpFD(stdoutReadFD, isStdout: true)
+            pumpFD(stderrReadFD, isStdout: false)
+            bufferLock.lock()
+            pumpFinished = true
+            bufferLock.unlock()
+        }
+
+        /// Nonblocking read of one owned fd until EAGAIN or EOF.
+        /// Handles EINTR; unknown read errors are treated as end of stream.
+        /// Excess bytes past `captureLimit` are discarded, never left unread.
+        private func pumpFD(_ fd: Int32, isStdout: Bool) {
+            guard fd >= 0 else { return }
+            var chunk = [UInt8](repeating: 0, count: 4096)
+            while true {
+                let n = read(fd, &chunk, chunk.count)
+                if n > 0 {
+                    appendCaptured(Data(chunk[0..<n]), isStdout: isStdout)
+                } else if n == 0 {
+                    markEOF(isStdout: isStdout)
+                    return
+                } else {
+                    if errno == EINTR {
+                        continue
+                    }
+                    if errno == EAGAIN || errno == EWOULDBLOCK {
+                        return
+                    }
+                    markEOF(isStdout: isStdout)
+                    return
+                }
+            }
+        }
+
+        private func appendCaptured(_ data: Data, isStdout: Bool) {
+            bufferLock.lock()
+            defer { bufferLock.unlock() }
+            if isStdout {
+                if stdoutBuffer.count >= Self.captureLimit {
+                    stdoutTruncated = true
+                    return
+                }
+                let room = Self.captureLimit - stdoutBuffer.count
+                if data.count <= room {
+                    stdoutBuffer.append(data)
+                } else {
+                    stdoutBuffer.append(data.prefix(room))
+                    stdoutTruncated = true
+                }
+            } else {
+                if stderrBuffer.count >= Self.captureLimit {
+                    stderrTruncated = true
+                    return
+                }
+                let room = Self.captureLimit - stderrBuffer.count
+                if data.count <= room {
+                    stderrBuffer.append(data)
+                } else {
+                    stderrBuffer.append(data.prefix(room))
+                    stderrTruncated = true
+                }
+            }
+        }
+
+        private func markEOF(isStdout: Bool) {
+            bufferLock.lock()
+            if isStdout {
+                stdoutEOF = true
+            } else {
+                stderrEOF = true
+            }
+            bufferLock.unlock()
+        }
+
+        private func requestPumpStop() {
+            bufferLock.lock()
+            pumpStopRequested = true
+            bufferLock.unlock()
+        }
+
+        private func waitForPumpFinish(_ timeout: TimeInterval) -> Bool {
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                bufferLock.lock()
+                let done = pumpFinished
+                bufferLock.unlock()
+                if done {
+                    return true
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            bufferLock.lock()
+            let done = pumpFinished
+            bufferLock.unlock()
+            return done
+        }
+
+        /// Complete final drain of both owned fds. Only called after the pump
+        /// has retired, so no concurrent reader can race the descriptors.
+        private func finalDrain() {
+            pumpFD(stdoutReadFD, isStdout: true)
+            pumpFD(stderrReadFD, isStdout: false)
+        }
+
+        private func closeReadFDs() {
+            bufferLock.lock()
+            let outFD = stdoutReadFD
+            let errFD = stderrReadFD
+            stdoutReadFD = -1
+            stderrReadFD = -1
+            bufferLock.unlock()
+            if outFD >= 0 {
+                close(outFD)
+            }
+            if errFD >= 0 {
+                close(errFD)
+            }
         }
     }
 
@@ -607,7 +840,7 @@ enum TLSTestHarness {
     static func startServer(cert: URL, key: URL) throws -> Server {
         try ensureTool("python3")
         let script = try writeServerScript()
-        let child = OwnedChild(stdout: Pipe(), stderr: Pipe())
+        let child = OwnedChild()
         child.configure(
             executable: URL(fileURLWithPath: "/usr/bin/env"),
             arguments: ["python3", script.path, cert.path, key.path, "127.0.0.1", "0"],
@@ -669,7 +902,7 @@ enum TLSTestHarness {
     }
 
     private static func ensureTool(_ name: String) throws {
-        let child = OwnedChild(stdout: Pipe(), stderr: Pipe())
+        let child = OwnedChild()
         child.configure(
             executable: URL(fileURLWithPath: "/usr/bin/env"),
             arguments: ["which", name]
@@ -683,7 +916,7 @@ enum TLSTestHarness {
     }
 
     private static func openssl(_ arguments: [String]) throws {
-        let child = OwnedChild(stdout: Pipe(), stderr: Pipe())
+        let child = OwnedChild()
         child.configure(
             executable: URL(fileURLWithPath: "/usr/bin/env"),
             arguments: ["openssl"] + arguments
@@ -718,13 +951,14 @@ enum TLSTestHarness {
         if let readyPort, sawReady {
             return readyPort
         }
-        if !child.isRunning {
-            let err = String(data: child.takeStderr(), encoding: .utf8) ?? ""
-            try? child.stop(gracefulTimeout: 0.5, forceTimeout: 0.5)
-            throw HarnessError.commandFailed("python3 tls server", -1, err)
-        }
+        // Surface bounded child stderr/exit state so a native attempt is diagnosable.
+        let diagnostics = child.failureDiagnostics()
+        let wasRunning = child.isRunning
         try? child.stop(gracefulTimeout: 0.5, forceTimeout: 0.5)
-        throw HarnessError.timeout("TLS server READY")
+        if !wasRunning {
+            throw HarnessError.commandFailed("python3 tls server", -1, diagnostics)
+        }
+        throw HarnessError.timeout("TLS server READY — \(diagnostics)")
     }
 
     /// Disposable Python HTTPS helper. TEST-ONLY.
