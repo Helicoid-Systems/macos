@@ -156,6 +156,12 @@ public final class PinnedHTTPSTransport: HTTPTransport, @unchecked Sendable {
     /// Number of registered in-flight operations (for tests/inspection).
     public var activeOperationCount: Int { registry.activeCount }
 
+    /// Last pinned TLS trust decision (test/diagnostics seam).
+    /// Bounded and non-secret: native codes and host names only.
+    var lastTrustDiagnostic: TrustEvaluationDiagnostic? {
+        sessionDelegate.lastTrustDiagnostic
+    }
+
     // MARK: - HTTPTransport
 
     public func bytes(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
@@ -549,6 +555,10 @@ final class BodySink: @unchecked Sendable {
     private var finished = false
     private var pendingResult: Result<(Data, URLResponse), Error>?
     private weak var dataTask: URLSessionDataTask?
+    /// Recorded trust decision for this task. Lets a later auth-challenge
+    /// cancellation surface as a structured trust failure instead of bare
+    /// `HelicoidError.cancelled`. Bounded, non-secret.
+    private var trustDiagnostic: TrustEvaluationDiagnostic?
 
     init(maxBytes: Int) {
         self.maxBytes = maxBytes
@@ -558,6 +568,16 @@ final class BodySink: @unchecked Sendable {
     func bindDataTask(_ task: URLSessionDataTask) {
         lock.lock()
         dataTask = task
+        lock.unlock()
+    }
+
+    /// Record the trust decision for this task (test/structured-error seam).
+    /// A refusal replaces any earlier value so the first hard failure is kept.
+    func recordTrustDiagnostic(_ diagnostic: TrustEvaluationDiagnostic) {
+        lock.lock()
+        if trustDiagnostic == nil || diagnostic.decision != .accepted {
+            trustDiagnostic = diagnostic
+        }
         lock.unlock()
     }
 
@@ -630,7 +650,8 @@ final class BodySink: @unchecked Sendable {
     func complete(error: Error?) {
         lock.lock()
         if let error {
-            finish(.failure(BodySink.mapNSURLError(error)))
+            // Owner's own trust decision only — never another task's.
+            finish(.failure(BodySink.mapNSURLError(error, trustDiagnostic: trustDiagnostic)))
         } else if let resp = response {
             finish(.success((data, resp)))
         } else {
@@ -674,9 +695,38 @@ final class BodySink: @unchecked Sendable {
         return nil
     }
 
-    private static func mapNSURLError(_ error: Error) -> HelicoidError {
+    /// Map transport completion errors to `HelicoidError`.
+    ///
+    /// URLSession reports an auth-challenge refusal as task cancellation
+    /// (`NSURLErrorCancelled` / `userCancelledAuthentication`). When a trust
+    /// refusal was recorded for this task, that cause is surfaced instead of
+    /// bare `.cancelled` so native failures stay actionable. Genuine task
+    /// cancellation (dispose / `Task.cancel`) still maps to `.cancelled`.
+    private static func mapNSURLError(
+        _ error: Error,
+        trustDiagnostic: TrustEvaluationDiagnostic?
+    ) -> HelicoidError {
         if let helicoid = error as? HelicoidError {
             return helicoid
+        }
+        if let trustDiagnostic, trustDiagnostic.decision != .accepted {
+            if error is CancellationError {
+                return .invalidInput(field: "server_trust", detail: trustDiagnostic.description)
+            }
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain {
+                let code = URLError.Code(rawValue: nsError.code)
+                switch code {
+                case .cancelled, .userCancelledAuthentication,
+                     .secureConnectionFailed, .serverCertificateUntrusted,
+                     .serverCertificateHasBadDate, .serverCertificateHasUnknownRoot,
+                     .serverCertificateNotYetValid, .clientCertificateRejected,
+                     .clientCertificateRequired, .appTransportSecurityRequiresSecureConnection:
+                    return .invalidInput(field: "server_trust", detail: trustDiagnostic.description)
+                default:
+                    break
+                }
+            }
         }
         if error is CancellationError {
             return .cancelled
@@ -704,6 +754,63 @@ final class BodySink: @unchecked Sendable {
     }
 }
 
+// MARK: - Trust decision diagnostic
+
+/// Bounded, non-secret record of one pinned TLS trust decision.
+///
+/// Exposes native Security evaluation codes (`OSStatus`, `CFError` domain/code)
+/// so a native CI failure is actionable. Never carries certificate bytes, PEM,
+/// private keys, credentials, or raw `CFError` prose (OS text may embed identity).
+struct TrustEvaluationDiagnostic: Equatable, Sendable, CustomStringConvertible {
+    enum Decision: String, Equatable, Sendable {
+        case accepted
+        case refusedAuthMethod
+        case refusedHostMismatch
+        case refusedPin
+        case refusedCAParse
+        case refusedSetup
+        case refusedEvaluate
+    }
+
+    let decision: Decision
+    /// Setup/evaluate step that produced the decision (e.g. "evaluate").
+    let step: String
+    let host: String
+    let expectedHost: String
+    /// Raw `URLAuthenticationChallenge.protectionSpace.authenticationMethod`.
+    let authenticationMethod: String
+    let serverTrustPresent: Bool
+    /// Chain length recorded only after the configured evaluation result.
+    /// Unknown-method / setup refusals report 0 and never probe `SecTrust`.
+    let certificateCount: Int
+    let osStatus: Int32?
+    let cfErrorDomain: String?
+    let cfErrorCode: Int?
+
+    /// Fixed-width, code-only summary safe for structured error details.
+    var description: String {
+        var parts: [String] = [
+            "decision=\(decision.rawValue)",
+            "step=\(step)",
+            "host=\(host)",
+            "expectedHost=\(expectedHost)",
+            "authMethod=\(authenticationMethod)",
+            "serverTrust=\(serverTrustPresent)",
+            "certs=\(certificateCount)",
+        ]
+        if let osStatus {
+            parts.append("osStatus=\(osStatus)")
+        }
+        if let cfErrorDomain {
+            parts.append("cfDomain=\(cfErrorDomain)")
+        }
+        if let cfErrorCode {
+            parts.append("cfCode=\(cfErrorCode)")
+        }
+        return parts.joined(separator: " ")
+    }
+}
+
 // MARK: - Trust + redirect + data delegate
 
 /// URLSession delegate holding immutable pinned CA/root state and per-task body sinks.
@@ -717,12 +824,21 @@ final class PinnedTrustDelegate: NSObject, URLSessionTaskDelegate, URLSessionDel
     private let expectedHost: String
     private let sinkLock = NSLock()
     private var sinks: [Int: BodySink] = [:]
+    private var _lastTrustDiagnostic: TrustEvaluationDiagnostic?
 
     init(caDER: Data, caFingerprintSHA256: String, expectedHost: String) {
         self.caDER = caDER
         self.caFingerprintSHA256 = caFingerprintSHA256
         self.expectedHost = expectedHost
         super.init()
+    }
+
+    /// Last trust decision (internal inspection seam). Bounded and non-secret.
+    /// Never used as a cross-task completion fallback.
+    var lastTrustDiagnostic: TrustEvaluationDiagnostic? {
+        sinkLock.lock()
+        defer { sinkLock.unlock() }
+        return _lastTrustDiagnostic
     }
 
     func registerSink(_ sink: BodySink, taskID: Int) {
@@ -743,6 +859,16 @@ final class PinnedTrustDelegate: NSObject, URLSessionTaskDelegate, URLSessionDel
         return sinks[taskID]
     }
 
+    /// Record the trust decision on the owning sink only.
+    /// A missing/retired task id never writes another sink.
+    private func recordTrustDiagnostic(_ diagnostic: TrustEvaluationDiagnostic, taskID: Int) {
+        sinkLock.lock()
+        _lastTrustDiagnostic = diagnostic
+        let owner = sinks[taskID]
+        sinkLock.unlock()
+        owner?.recordTrustDiagnostic(diagnostic)
+    }
+
     // MARK: Redirects
 
     /// Never follow redirects, including same-origin authentication redirects.
@@ -758,23 +884,20 @@ final class PinnedTrustDelegate: NSObject, URLSessionTaskDelegate, URLSessionDel
 
     // MARK: Auth challenges
 
-    /// Task-level auth challenge (server trust). Unknown challenges cancel.
+    /// Task-level auth challenge. ServerTrust is delivered here **with the
+    /// owning task** when the session-level handler is omitted (Apple:
+    /// `urlSession(_:task:didReceive:completionHandler:)`). Unknown auth,
+    /// host mismatch, and failed pinned evaluation cancel exactly once.
+    ///
+    /// There is intentionally no `urlSession(_:didReceive:completionHandler:)`
+    /// session handler: that path has no task id and cannot own a sink.
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        handleChallenge(challenge, completionHandler: completionHandler)
-    }
-
-    /// Session-level auth challenge (server trust). Unknown challenges cancel.
-    func urlSession(
-        _ session: URLSession,
-        didReceive challenge: URLAuthenticationChallenge,
-        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
-    ) {
-        handleChallenge(challenge, completionHandler: completionHandler)
+        handleChallenge(challenge, taskID: task.taskIdentifier, completionHandler: completionHandler)
     }
 
     // MARK: Body streaming
@@ -797,25 +920,61 @@ final class PinnedTrustDelegate: NSObject, URLSessionTaskDelegate, URLSessionDel
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        // Owner sink only. Never substitute another task's trust diagnostic.
         sink(for: task.taskIdentifier)?.complete(error: error)
         unregisterSink(taskID: task.taskIdentifier)
     }
 
     private func handleChallenge(
         _ challenge: URLAuthenticationChallenge,
+        taskID: Int,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              let trust = challenge.protectionSpace.serverTrust else {
+        let method = challenge.protectionSpace.authenticationMethod
+        let presentedHost = DeploymentTLSIdentity.normalizeHostForCompare(challenge.protectionSpace.host)
+        let expected = DeploymentTLSIdentity.normalizeHostForCompare(expectedHost)
+        let trust = challenge.protectionSpace.serverTrust
+
+        func refuse(_ diagnostic: TrustEvaluationDiagnostic) {
+            recordTrustDiagnostic(diagnostic, taskID: taskID)
             completionHandler(.cancelAuthenticationChallenge, nil)
+        }
+
+        // Unknown method / missing serverTrust: refuse without probing SecTrust.
+        guard method == NSURLAuthenticationMethodServerTrust, let trust else {
+            refuse(TrustEvaluationDiagnostic(
+                decision: .refusedAuthMethod,
+                step: "auth-method",
+                host: presentedHost,
+                expectedHost: expected,
+                authenticationMethod: method,
+                serverTrustPresent: trust != nil,
+                certificateCount: 0,
+                osStatus: nil,
+                cfErrorDomain: nil,
+                cfErrorCode: nil
+            ))
             return
         }
-        let host = DeploymentTLSIdentity.normalizeHostForCompare(challenge.protectionSpace.host)
-        guard host == DeploymentTLSIdentity.normalizeHostForCompare(expectedHost) else {
-            completionHandler(.cancelAuthenticationChallenge, nil)
+        guard presentedHost == expected else {
+            refuse(TrustEvaluationDiagnostic(
+                decision: .refusedHostMismatch,
+                step: "host-match",
+                host: presentedHost,
+                expectedHost: expected,
+                authenticationMethod: method,
+                serverTrustPresent: true,
+                certificateCount: 0,
+                osStatus: nil,
+                cfErrorDomain: nil,
+                cfErrorCode: nil
+            ))
             return
         }
-        if evaluateServerTrust(trust, host: host) {
+
+        let diagnostic = evaluateServerTrust(trust, host: presentedHost, method: method)
+        recordTrustDiagnostic(diagnostic, taskID: taskID)
+        if diagnostic.decision == .accepted {
             completionHandler(.useCredential, URLCredential(trust: trust))
         } else {
             completionHandler(.cancelAuthenticationChallenge, nil)
@@ -823,33 +982,90 @@ final class PinnedTrustDelegate: NSObject, URLSessionTaskDelegate, URLSessionDel
     }
 
     /// Full pinned evaluation. Pin match is necessary but not sufficient.
-    func evaluateServerTrust(_ trust: SecTrust, host: String) -> Bool {
+    ///
+    /// Strictness is unchanged: single operator CA as sole anchor
+    /// (`SecTrustSetAnchorCertificatesOnly(true)`), no OS/browser roots,
+    /// network fetch disabled (no AIA/CA downloads), SSL host policy.
+    /// Call order is preserved. Failures record native codes only.
+    ///
+    /// `SecTrustGetCertificateCount` is intentionally **not** called before
+    /// evaluation: count access can implicitly evaluate trust under a stale
+    /// policy/network state. Chain length is recorded only after the
+    /// configured evaluate result. Setup/pin refusals report 0 and never probe.
+    func evaluateServerTrust(
+        _ trust: SecTrust,
+        host: String,
+        method: String = NSURLAuthenticationMethodServerTrust
+    ) -> TrustEvaluationDiagnostic {
+        let expected = DeploymentTLSIdentity.normalizeHostForCompare(expectedHost)
+        let normalizedHost = DeploymentTLSIdentity.normalizeHostForCompare(host)
+
+        func diagnostic(
+            decision: TrustEvaluationDiagnostic.Decision,
+            step: String,
+            osStatus: Int32? = nil,
+            cfError: CFError? = nil,
+            certificateCount: Int = 0
+        ) -> TrustEvaluationDiagnostic {
+            // Code fields only. Never copy CFError prose (may embed identity).
+            let domain = cfError.map { CFErrorGetDomain($0) as String }
+            let code = cfError.map { CFErrorGetCode($0) }
+            return TrustEvaluationDiagnostic(
+                decision: decision,
+                step: step,
+                host: normalizedHost,
+                expectedHost: expected,
+                authenticationMethod: method,
+                serverTrustPresent: true,
+                certificateCount: certificateCount,
+                osStatus: osStatus,
+                cfErrorDomain: domain,
+                cfErrorCode: code
+            )
+        }
+
         let digest = SHA256.hash(data: caDER).map { String(format: "%02x", $0) }.joined()
         guard digest == caFingerprintSHA256 else {
-            return false
+            return diagnostic(decision: .refusedPin, step: "pin-match")
         }
 
         guard let caCert = SecCertificateCreateWithData(nil, caDER as CFData) else {
-            return false
+            return diagnostic(decision: .refusedCAParse, step: "ca-parse")
         }
-        guard SecTrustSetAnchorCertificates(trust, [caCert] as CFArray) == errSecSuccess else {
-            return false
+        let setAnchors = SecTrustSetAnchorCertificates(trust, [caCert] as CFArray)
+        guard setAnchors == errSecSuccess else {
+            return diagnostic(decision: .refusedSetup, step: "set-anchors", osStatus: setAnchors)
         }
         // No OS/browser root fallback (SecTrustSetAnchorCertificatesOnly(true)).
-        guard SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess else {
-            return false
+        let anchorsOnly = SecTrustSetAnchorCertificatesOnly(trust, true)
+        guard anchorsOnly == errSecSuccess else {
+            return diagnostic(decision: .refusedSetup, step: "anchors-only", osStatus: anchorsOnly)
         }
         // Online AIA/CA downloads disabled.
-        guard SecTrustSetNetworkFetchAllowed(trust, false) == errSecSuccess else {
-            return false
+        let noFetch = SecTrustSetNetworkFetchAllowed(trust, false)
+        guard noFetch == errSecSuccess else {
+            return diagnostic(decision: .refusedSetup, step: "network-fetch-false", osStatus: noFetch)
         }
 
-        let policy = SecPolicyCreateSSL(true, host as CFString)
-        guard SecTrustSetPolicies(trust, policy) == errSecSuccess else {
-            return false
+        let policy = SecPolicyCreateSSL(true, normalizedHost as CFString)
+        let setPolicy = SecTrustSetPolicies(trust, policy)
+        guard setPolicy == errSecSuccess else {
+            return diagnostic(decision: .refusedSetup, step: "set-policies", osStatus: setPolicy)
         }
 
+        // Evaluate exactly once under sole-anchor / no-AIA / SSL host policy.
+        // Only after that result is the chain count recorded.
         var error: CFError?
-        return SecTrustEvaluateWithError(trust, &error)
+        let evaluated = SecTrustEvaluateWithError(trust, &error)
+        let certificateCount = SecTrustGetCertificateCount(trust)
+        if evaluated {
+            return diagnostic(decision: .accepted, step: "evaluate", certificateCount: certificateCount)
+        }
+        return diagnostic(
+            decision: .refusedEvaluate,
+            step: "evaluate",
+            cfError: error,
+            certificateCount: certificateCount
+        )
     }
 }
