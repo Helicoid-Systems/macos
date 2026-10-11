@@ -962,9 +962,27 @@ enum TLSTestHarness {
     }
 
     /// Disposable Python HTTPS helper. TEST-ONLY.
+    ///
+    /// Binds literal-loopback without `HTTPServer.server_bind`'s synchronous
+    /// `socket.getfqdn` reverse-DNS lookup (unbounded before READY). Startup
+    /// is covered by a 10s `faulthandler` watchdog that dumps stacks to the
+    /// owned stderr and exits if READY was not reached; cancelled only after
+    /// the real TLS listener is up. Phase markers on stderr make a future
+    /// 15s READY timeout diagnosable. PKI paths only — never file contents.
     private static func writeServerScript() throws -> URL {
         let script = """
-        import http.server, json, ssl, sys, time
+        import faulthandler, http.server, json, socketserver, ssl, sys, time
+
+        class LoopbackHTTPServer(http.server.HTTPServer):
+            # TEST-ONLY: standard TCP bind only. Deliberately skips
+            # http.server.HTTPServer.server_bind's socket.getfqdn() reverse
+            # DNS lookup so READY cannot block on network name resolution.
+            # server_name/server_port come from the actual bound address.
+            def server_bind(self):
+                socketserver.TCPServer.server_bind(self)
+                host, port = self.server_address[:2]
+                self.server_name = host
+                self.server_port = port
 
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -1054,12 +1072,23 @@ enum TLSTestHarness {
 
         if __name__ == "__main__":
             certfile, keyfile, host, port = sys.argv[1:5]
-            server = http.server.HTTPServer((host, int(port)), Handler)
+            # Startup watchdog: if READY is not reached within 10s, dump
+            # stacks to owned stderr and exit so the Swift timeout path can
+            # surface a hang site instead of a blind guess. Cancelled only
+            # after the actual TLS listener is up and READY was printed.
+            faulthandler.dump_traceback_later(10, exit=True)
+            print(f"PHASE script-start cert={certfile} key={keyfile}", file=sys.stderr, flush=True)
+            server = LoopbackHTTPServer((host, int(port)), Handler)
+            print(f"PHASE bound {server.server_address[0]}:{server.server_address[1]}", file=sys.stderr, flush=True)
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(certfile, keyfile)
+            print("PHASE cert-loaded", file=sys.stderr, flush=True)
             server.socket = context.wrap_socket(server.socket, server_side=True)
+            print("PHASE tls-wrapped", file=sys.stderr, flush=True)
             print(f"READY {server.server_address[1]}", flush=True)
+            faulthandler.cancel_dump_traceback_later()
+            print("PHASE ready", file=sys.stderr, flush=True)
             server.serve_forever()
         """
         let url = FileManager.default.temporaryDirectory
