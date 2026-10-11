@@ -176,17 +176,64 @@ enum TLSTestHarness {
                 "-keyout", key.path, "-out", csr.path,
                 "-nodes", "-subj", subject,
             ])
-            var args = [
-                "x509", "-req", "-in", csr.path,
-                "-CA", caCrt, "-CAkey", caKey, "-CAcreateserial",
-                "-out", crt.path, "-extfile", extFile.path,
-            ]
             if let notBefore, let notAfter {
-                args += ["-not_before", notBefore, "-not_after", notAfter]
+                // Portable dated signing. `x509 -not_before/-not_after` is
+                // OpenSSL 3.5+ only; `ca -startdate/-enddate` is supported by
+                // older OpenSSL and LibreSSL. Owned per-cert CA database state
+                // under the unique fixture directory keeps serials from colliding.
+                let caConfig = directory.appendingPathComponent("\(name)-ca.cnf")
+                let index = directory.appendingPathComponent("\(name).index")
+                let serial = directory.appendingPathComponent("\(name).serial")
+                let newCerts = directory.appendingPathComponent("\(name).newcerts")
+                try FileManager.default.createDirectory(at: newCerts, withIntermediateDirectories: true)
+                try Data().write(to: index)
+                try Data("01\n".utf8).write(to: serial)
+                // `ca -extfile` needs a named extensions section.
+                let section = "dated_ext"
+                try "[\(section)]\n\(ext)\n".write(to: extFile, atomically: true, encoding: .utf8)
+                let config = """
+                [ ca ]
+                default_ca = CA_default
+
+                [ CA_default ]
+                dir               = \(directory.path)
+                database          = \(index.path)
+                serial            = \(serial.path)
+                new_certs_dir     = \(newCerts.path)
+                certificate       = \(caCrt)
+                private_key       = \(caKey)
+                default_md        = sha256
+                policy            = policy_anything
+                email_in_dn       = no
+                unique_subject    = no
+                copy_extensions   = none
+                preserve          = no
+
+                [ policy_anything ]
+                countryName             = optional
+                stateOrProvinceName     = optional
+                localityName            = optional
+                organizationName        = optional
+                organizationalUnitName  = optional
+                commonName              = supplied
+                emailAddress            = optional
+                """
+                try config.write(to: caConfig, atomically: true, encoding: .utf8)
+                try openssl([
+                    "ca", "-batch", "-config", caConfig.path,
+                    "-startdate", notBefore, "-enddate", notAfter,
+                    "-in", csr.path, "-out", crt.path,
+                    "-extfile", extFile.path, "-extensions", section,
+                    "-notext",
+                ])
             } else {
-                args += ["-days", "365"]
+                try openssl([
+                    "x509", "-req", "-in", csr.path,
+                    "-CA", caCrt, "-CAkey", caKey, "-CAcreateserial",
+                    "-out", crt.path, "-extfile", extFile.path,
+                    "-days", "365",
+                ])
             }
-            try openssl(args)
             return (crt, key)
         }
 
