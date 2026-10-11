@@ -260,8 +260,8 @@ struct TLSTestHarnessExtensionTests {
     }
 
     @Test("PKI roots and leaves carry each extension OID at most once")
-    func pkiExtensionsAreUnique() throws {
-        let pki = try TLSTestHarness.makePKI()
+    func pkiExtensionsAreUnique() async throws {
+        let pki = try await TLSTestHarness.makePKI()
         defer { pki.disposeFiles() }
 
         try expectUniqueExtensions(der: pki.caDER, label: "ca")
@@ -279,8 +279,8 @@ struct TLSTestHarnessExtensionTests {
     }
 
     @Test("Positive CA has exactly one basicConstraints and one keyUsage with CA:TRUE and keyCertSign")
-    func positiveCARootConstraints() throws {
-        let pki = try TLSTestHarness.makePKI()
+    func positiveCARootConstraints() async throws {
+        let pki = try await TLSTestHarness.makePKI()
         defer { pki.disposeFiles() }
 
         let counts = try FixtureDER.oidCounts(fromDER: pki.caDER)
@@ -291,8 +291,8 @@ struct TLSTestHarnessExtensionTests {
     }
 
     @Test("NoKeySign root keeps CA:TRUE without keyCertSign")
-    func noKeySignRootKeepsNegativeShape() throws {
-        let pki = try TLSTestHarness.makePKI()
+    func noKeySignRootKeepsNegativeShape() async throws {
+        let pki = try await TLSTestHarness.makePKI()
         defer { pki.disposeFiles() }
 
         let counts = try FixtureDER.oidCounts(fromDER: pki.noKeySignCADER)

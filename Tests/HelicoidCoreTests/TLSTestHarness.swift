@@ -35,9 +35,14 @@ enum TLSTestHarness {
 
     // MARK: - Fixture concurrency bound
 
-    /// Serializes `openssl` fixture generation across tests. Parallel RSA
-    /// keygen starves unrelated timing assertions in the full suite.
-    private static let generationLock = NSLock()
+    /// Dedicated serial worker for `openssl` fixture generation. Parallel RSA
+    /// keygen starves unrelated timing assertions in the full suite, and a
+    /// lock-held generation would block a Swift cooperative executor thread.
+    /// Waiting test tasks suspend on a continuation; concurrency stays at one.
+    private static let generationQueue = DispatchQueue(
+        label: "helicoid.tls-test-harness.pkigeneration",
+        qos: .userInitiated
+    )
 
     /// Material-only CA/leaf bytes generated once per process. Constructor
     /// tests never need live files or a server, so the on-disk PKI is deleted
@@ -49,32 +54,59 @@ enum TLSTestHarness {
         let noKeySignCADER: Data
     }
 
-    // Guarded by materialLock.
-    nonisolated(unsafe) private static var cachedMaterial: MaterialPKI?
-    private static let materialLock = NSLock()
+    /// Isolated owner for process-wide CA material. One generation flight;
+    /// concurrent waiters suspend on the same result instead of stacking
+    /// blocking waits on the cooperative pool.
+    private actor MaterialStore {
+        private var cached: MaterialPKI?
+        private var inFlight: Task<MaterialPKI, Error>?
+
+        func material() async throws -> MaterialPKI {
+            if let cached {
+                return cached
+            }
+            if let inFlight {
+                return try await inFlight.value
+            }
+            let task = Task.detached {
+                try await TLSTestHarness.buildSharedMaterial()
+            }
+            inFlight = task
+            do {
+                let material = try await task.value
+                cached = material
+                inFlight = nil
+                return material
+            } catch {
+                inFlight = nil
+                throw error
+            }
+        }
+    }
+
+    private static let materialStore = MaterialStore()
 
     /// Shared CA material for constructor/policy tests. Generates once.
-    static func sharedMaterial() throws -> MaterialPKI {
-        materialLock.lock()
-        defer { materialLock.unlock() }
-        if let cachedMaterial {
-            return cachedMaterial
-        }
-        let pki = try makePKI()
+    static func sharedMaterial() async throws -> MaterialPKI {
+        try await materialStore.material()
+    }
+
+    private static func buildSharedMaterial() async throws -> MaterialPKI {
+        let pki = try await makePKI()
         let material = MaterialPKI(
             caDER: pki.caDER,
             caFingerprint: pki.caFingerprint,
             leafDER: pki.goodLeafDER,
             noKeySignCADER: pki.noKeySignCADER
         )
-        try? FileManager.default.removeItem(at: pki.directory)
-        cachedMaterial = material
+        // Material is pure bytes; the on-disk PKI is never needed again.
+        pki.disposeFiles()
         return material
     }
 
     // MARK: - PKI
 
-    struct PKI {
+    struct PKI: Sendable {
         let directory: URL
         let caDER: Data
         let caFingerprint: String
@@ -106,12 +138,97 @@ enum TLSTestHarness {
         }
     }
 
+    /// Resume-once bridge between a suspended test task and the generation
+    /// worker. Cancellation and completion race; only one resumes, and a
+    /// cancelled waiter never leaks a generated fixture directory.
+    private final class GenerationBridge: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<PKI, Error>?
+        private var finished = false
+        private var cancelled = false
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+
+        func attach(_ continuation: CheckedContinuation<PKI, Error>) {
+            lock.lock()
+            if finished {
+                lock.unlock()
+                continuation.resume(throwing: CancellationError())
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            guard !finished else {
+                lock.unlock()
+                return
+            }
+            finished = true
+            let continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(throwing: CancellationError())
+        }
+
+        func complete(with result: Result<PKI, Error>) {
+            lock.lock()
+            if finished {
+                let wasCancelled = cancelled
+                lock.unlock()
+                if wasCancelled, case .success(let pki) = result {
+                    pki.disposeFiles()
+                }
+                return
+            }
+            finished = true
+            let continuation = self.continuation
+            self.continuation = nil
+            let wasCancelled = cancelled
+            lock.unlock()
+            if wasCancelled, case .success(let pki) = result {
+                pki.disposeFiles()
+                continuation?.resume(throwing: CancellationError())
+                return
+            }
+            continuation?.resume(with: result)
+        }
+    }
+
     /// Generate a disposable PKI under a unique temp directory.
-    /// Serialized: concurrent RSA keygen overloads the full suite.
-    static func makePKI() throws -> PKI {
-        generationLock.lock()
-        defer { generationLock.unlock() }
-        return try makePKIUnlocked()
+    /// Serialized on a dedicated worker: concurrent RSA keygen overloads the
+    /// full suite, and waiting tests must suspend rather than block the
+    /// Swift cooperative executor.
+    static func makePKI() async throws -> PKI {
+        let bridge = GenerationBridge()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<PKI, Error>) in
+                bridge.attach(continuation)
+                guard !bridge.isCancelled else {
+                    return
+                }
+                generationQueue.async {
+                    if bridge.isCancelled {
+                        bridge.complete(with: .failure(CancellationError()))
+                        return
+                    }
+                    do {
+                        bridge.complete(with: .success(try makePKIUnlocked()))
+                    } catch {
+                        bridge.complete(with: .failure(error))
+                    }
+                }
+            }
+        } onCancel: {
+            bridge.cancel()
+        }
     }
 
     private static func makePKIUnlocked() throws -> PKI {
@@ -934,7 +1051,7 @@ enum TLSTestHarness {
         key: (PKI) -> URL = { $0.goodKeyPEM },
         body: @Sendable (PKI, Server) async throws -> T
     ) async throws -> T {
-        let pki = try makePKI()
+        let pki = try await makePKI()
         let server: Server
         do {
             server = try startServer(cert: cert(pki), key: key(pki))
