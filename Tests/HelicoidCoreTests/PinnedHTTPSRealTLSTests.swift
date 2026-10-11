@@ -66,6 +66,10 @@ struct PinnedHTTPSRealTLSTests {
         #expect(!response.body.isEmpty)
         let json = try JSONSerialization.jsonObject(with: response.body) as? [String: Any]
         #expect(json?["status"] as? String == "ok")
+        // Successful pinned evaluation must be visible to tests as accepted.
+        let diagnostic = transport.lastTrustDiagnostic
+        #expect(diagnostic?.decision == .accepted)
+        #expect(diagnostic?.step == "evaluate")
     }
 
     @Test("Positive pinned CA completes a real TLS POST")
@@ -111,9 +115,261 @@ struct PinnedHTTPSRealTLSTests {
         do {
             _ = try await transport.request(method: "GET", path: "/ok")
             Issue.record("Foreign CA must be refused")
+        } catch let error as HelicoidError {
+            // Trust failure must never succeed, and must not collapse into a
+            // bare task-cancellation mask (that made negative checks vacuous
+            // while every positive request was cancelled).
+            if error == .cancelled {
+                Issue.record("Foreign CA refusal must not surface as task cancellation: \(error)")
+            }
+            if case .invalidInput(let field, _) = error, field != "server_trust" {
+                Issue.record("Foreign CA refusal should carry server_trust diagnostics, got field=\(field)")
+            }
         } catch {
-            // Trust failure must never succeed.
+            // Non-Helicoid errors are still refusals; never success.
         }
+    }
+
+    /// Trust refusals must carry a bounded native diagnostic, not a bare
+    /// `.cancelled` mask. This is the seam that makes a native first-positive
+    /// failure actionable (decision step + CFError codes, no PKI contents).
+    @Test("Foreign CA refusal exposes trust diagnostic instead of bare cancellation")
+    func foreignCATrustDiagnostic() async throws {
+        let pki = try TLSTestHarness.makePKI()
+        defer { try? FileManager.default.removeItem(at: pki.directory) }
+        let server = try TLSTestHarness.startServer(cert: pki.foreignCertPEM, key: pki.foreignKeyPEM)
+        defer {
+            do { try server.stop() }
+            catch { Issue.record("Unexpected TLS server teardown failure: \(error)") }
+        }
+
+        let identity = try makeIdentity(pki: pki, port: server.port)
+        let transport = try makeTransport(identity: identity)
+        defer { transport.dispose() }
+
+        do {
+            _ = try await transport.request(method: "GET", path: "/ok")
+            Issue.record("Foreign CA must be refused")
+        } catch let error as HelicoidError {
+            #expect(error != .cancelled)
+            if case .invalidInput(let field, let detail) = error {
+                #expect(field == "server_trust")
+                #expect(detail.contains("decision="))
+                #expect(detail.contains("step="))
+                #expect(detail.contains("certs="))
+                #expect(!detail.contains("BEGIN CERTIFICATE"))
+            }
+            let diagnostic = transport.lastTrustDiagnostic
+            #expect(diagnostic != nil)
+            #expect(diagnostic?.decision != .accepted)
+            #expect(diagnostic?.certificateCount ?? 0 > 0)
+        } catch {
+            Issue.record("Foreign CA refusal must throw HelicoidError, got \(error)")
+        }
+    }
+
+    /// Smoke only: two `PinnedHTTPSTransport`s also mean two delegates, so this
+    /// cannot prove shared-delegate sink ownership. Retained as a real-socket
+    /// concurrency smoke. See `sharedDelegateKeepsSinksIsolated` for the
+    /// single-delegate regression.
+    @Test("Concurrent trust refusal and user cancellation stay task-owned")
+    func concurrentTrustRefusalAndUserCancellationAreIsolated() async throws {
+        let pki = try TLSTestHarness.makePKI()
+        defer { try? FileManager.default.removeItem(at: pki.directory) }
+
+        let refusedServer = try TLSTestHarness.startServer(cert: pki.foreignCertPEM, key: pki.foreignKeyPEM)
+        defer {
+            do { try refusedServer.stop() }
+            catch { Issue.record("Unexpected refused-server teardown failure: \(error)") }
+        }
+        let goodServer = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
+        defer {
+            do { try goodServer.stop() }
+            catch { Issue.record("Unexpected good-server teardown failure: \(error)") }
+        }
+
+        // Owner A: foreign chain pinned to the good CA — trust refusal.
+        let refusedIdentity = try makeIdentity(pki: pki, port: refusedServer.port)
+        let refusedTransport = try makeTransport(identity: refusedIdentity, requestTimeout: 20, operationTimeout: 20)
+        defer { refusedTransport.dispose() }
+
+        // Owner B: valid chain, cancelled by the caller mid-flight.
+        let goodIdentity = try makeIdentity(pki: pki, port: goodServer.port)
+        let goodTransport = try makeTransport(identity: goodIdentity, requestTimeout: 20, operationTimeout: 20)
+        defer { goodTransport.dispose() }
+
+        async let refusedResult: Result<Void, any Error> = {
+            do {
+                _ = try await refusedTransport.request(method: "GET", path: "/ok")
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }()
+
+        async let cancelledResult: Result<Void, any Error> = {
+            let task = Task {
+                try await goodTransport.request(method: "GET", path: "/slow")
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+            task.cancel()
+            do {
+                _ = try await task.value
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }()
+
+        let (refused, cancelled) = try await (refusedResult, cancelledResult)
+
+        switch refused {
+        case .success:
+            Issue.record("Foreign CA owner must not succeed")
+        case .failure(let error):
+            guard let helicoid = error as? HelicoidError else {
+                Issue.record("Foreign CA owner must throw HelicoidError, got \(error)")
+                break
+            }
+            #expect(helicoid != .cancelled)
+            if case .invalidInput(let field, let detail) = helicoid {
+                #expect(field == "server_trust")
+                #expect(detail.contains("decision="))
+                #expect(!detail.contains("BEGIN CERTIFICATE"))
+            } else {
+                Issue.record("Foreign CA owner should get server_trust diagnostics, got \(error)")
+            }
+            #expect(refusedTransport.lastTrustDiagnostic?.decision != .accepted)
+        }
+
+        switch cancelled {
+        case .success:
+            Issue.record("Cancelled owner must not succeed")
+        case .failure(let error):
+            // User cancel may surface as Swift `CancellationError` (structured
+            // concurrency) or `HelicoidError.cancelled` (URLSession mapping).
+            // Anything else — including a leaked server_trust — is a failure.
+            if error is CancellationError {
+                break
+            }
+            guard let helicoid = error as? HelicoidError else {
+                Issue.record("Cancelled owner must throw HelicoidError/CancellationError, got \(error)")
+                break
+            }
+            #expect(helicoid == .cancelled)
+            if case .invalidInput(let field, _) = helicoid, field == "server_trust" {
+                Issue.record("Cancelled owner inherited another task's trust refusal: \(error)")
+            }
+        }
+    }
+
+    /// Shared-delegate regression: TWO BodySinks on ONE `PinnedTrustDelegate`.
+    /// Two transports would hide a per-delegate broadcast bug. Real generated
+    /// certs, real TLS, genuine native ServerTrust challenges (captured and
+    /// replayed for the late-challenge case). Owner A = foreign chain refusal;
+    /// owner B = user cancellation; late challenge for retired A must not
+    /// touch B. Each challenge's completion runs exactly once; both sinks drain.
+    @Test("Shared PinnedTrustDelegate keeps task sinks isolated")
+    func sharedDelegateKeepsSinksIsolated() async throws {
+        let pki = try TLSTestHarness.makePKI()
+        defer { try? FileManager.default.removeItem(at: pki.directory) }
+
+        let foreignServer = try TLSTestHarness.startServer(cert: pki.foreignCertPEM, key: pki.foreignKeyPEM)
+        defer {
+            do { try foreignServer.stop() }
+            catch { Issue.record("Unexpected foreign-server teardown failure: \(error)") }
+        }
+        let goodServer = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
+        defer {
+            do { try goodServer.stop() }
+            catch { Issue.record("Unexpected good-server teardown failure: \(error)") }
+        }
+
+        // One shared production trust delegate for both owners.
+        let pinned = PinnedTrustDelegate(
+            caDER: pki.caDER,
+            caFingerprintSHA256: pki.caFingerprint,
+            expectedHost: "127.0.0.1"
+        )
+        let forwarder = ChallengeCapturingForwarder(pinned: pinned)
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 15
+        config.httpShouldSetCookies = false
+        config.urlCache = nil
+        let session = URLSession(configuration: config, delegate: forwarder, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+
+        // Owner A — foreign chain on the shared delegate.
+        let sinkA = BodySink(maxBytes: 65_536)
+        let taskA = session.dataTask(with: URL(string: "https://127.0.0.1:\(foreignServer.port)/ok")!)
+        sinkA.bindDataTask(taskA)
+        pinned.registerSink(sinkA, taskID: taskA.taskIdentifier)
+
+        // Owner B — good chain, stalled response, still live during late challenge.
+        let sinkB = BodySink(maxBytes: 65_536)
+        let taskB = session.dataTask(with: URL(string: "https://127.0.0.1:\(goodServer.port)/slow")!)
+        sinkB.bindDataTask(taskB)
+        pinned.registerSink(sinkB, taskID: taskB.taskIdentifier)
+
+        taskA.resume()
+        taskB.resume()
+
+        // A: genuine ServerTrust refusal on the shared delegate.
+        do {
+            _ = try await sinkA.result()
+            Issue.record("Foreign owner A must not succeed")
+        } catch let error as HelicoidError {
+            guard case .invalidInput(let field, let detail) = error else {
+                Issue.record("Owner A should get server_trust diagnostics, got \(error)")
+                throw error
+            }
+            #expect(field == "server_trust")
+            #expect(detail.contains("decision="))
+            #expect(detail.contains("step="))
+            #expect(!detail.contains("BEGIN CERTIFICATE"))
+        } catch {
+            Issue.record("Owner A must throw HelicoidError, got \(error)")
+            throw error
+        }
+
+        // Production unregisters A on completion; make retirement explicit and
+        // deterministic before the late challenge.
+        pinned.unregisterSink(taskID: taskA.taskIdentifier)
+
+        // Late challenge for retired owner A using the genuine captured
+        // ServerTrust challenge and the actual task A object.
+        guard let lateChallenge = forwarder.takeServerTrustChallenge(taskID: taskA.taskIdentifier) else {
+            Issue.record("Expected a captured genuine ServerTrust challenge for owner A")
+            return
+        }
+        #expect(lateChallenge.protectionSpace.port == foreignServer.port)
+        let completions = ChallengeCompletionCounter()
+        pinned.urlSession(
+            session,
+            task: taskA,
+            didReceive: lateChallenge,
+            completionHandler: completions.wrap()
+        )
+        // Exactly once per challenge — never zero, never double-complete.
+        #expect(completions.count == 1)
+        #expect(pinned.lastTrustDiagnostic?.decision == .refusedEvaluate)
+
+        // Owner B is still registered and must be unaffected by the late write.
+        // User cancellation stays `.cancelled`, never A's server_trust refusal.
+        taskB.cancel()
+        do {
+            _ = try await sinkB.result()
+            Issue.record("Cancelled owner B must not succeed")
+        } catch let error as HelicoidError {
+            #expect(error == .cancelled)
+            if case .invalidInput(let field, _) = error, field == "server_trust" {
+                Issue.record("Late challenge for retired A contaminated B: \(error)")
+            }
+        } catch {
+            Issue.record("Owner B must throw HelicoidError, got \(error)")
+        }
+
     }
 
     @Test("Bad pin is refused before any successful request")
@@ -157,6 +413,10 @@ struct PinnedHTTPSRealTLSTests {
         do {
             _ = try await transport.request(method: "GET", path: "/ok")
             Issue.record("Wrong DNS name must be refused")
+        } catch let error as HelicoidError {
+            if error == .cancelled {
+                Issue.record("Wrong DNS name refusal must not surface as task cancellation: \(error)")
+            }
         } catch {
             // expected
         }
@@ -179,6 +439,10 @@ struct PinnedHTTPSRealTLSTests {
         do {
             _ = try await transport.request(method: "GET", path: "/ok")
             Issue.record("Expired cert must be refused")
+        } catch let error as HelicoidError {
+            if error == .cancelled {
+                Issue.record("Expired cert refusal must not surface as task cancellation: \(error)")
+            }
         } catch {
             // expected
         }
@@ -201,6 +465,10 @@ struct PinnedHTTPSRealTLSTests {
         do {
             _ = try await transport.request(method: "GET", path: "/ok")
             Issue.record("clientAuth-only cert must be refused")
+        } catch let error as HelicoidError {
+            if error == .cancelled {
+                Issue.record("clientAuth-only refusal must not surface as task cancellation: \(error)")
+            }
         } catch {
             // expected
         }
@@ -673,6 +941,91 @@ struct PinnedHTTPSRealTLSTests {
             Issue.record("Overflow must fail the sink")
         } catch let error as HelicoidError {
             #expect(error == .invalidInput(field: "response", detail: "Response body exceeded the bounded size limit."))
+        }
+    }
+}
+
+// MARK: - Shared-delegate test helpers (TEST-ONLY)
+
+/// Records genuine native ServerTrust challenges then forwards every
+/// URLSession callback to the production `PinnedTrustDelegate`. Used so a
+/// late challenge can be replayed against a retired owner without inventing
+/// a `SecTrust`-bearing `URLProtectionSpace` (no public initializer).
+private final class ChallengeCapturingForwarder: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    let pinned: PinnedTrustDelegate
+    private let lock = NSLock()
+    private var serverTrustChallenges: [Int: URLAuthenticationChallenge] = [:]
+
+    init(pinned: PinnedTrustDelegate) {
+        self.pinned = pinned
+        super.init()
+    }
+
+    func takeServerTrustChallenge(taskID: Int) -> URLAuthenticationChallenge? {
+        lock.lock()
+        defer { lock.unlock() }
+        return serverTrustChallenges.removeValue(forKey: taskID)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust {
+            lock.lock()
+            serverTrustChallenges[task.taskIdentifier] = challenge
+            lock.unlock()
+        }
+        pinned.urlSession(session, task: task, didReceive: challenge, completionHandler: completionHandler)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        pinned.urlSession(session, dataTask: dataTask, didReceive: response, completionHandler: completionHandler)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        pinned.urlSession(session, dataTask: dataTask, didReceive: data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        pinned.urlSession(session, task: task, didCompleteWithError: error)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @Sendable (URLRequest?) -> Void
+    ) {
+        pinned.urlSession(session, task: task, willPerformHTTPRedirection: response, newRequest: request, completionHandler: completionHandler)
+    }
+}
+
+/// Counts auth-challenge completion invocations (must be exactly once).
+private final class ChallengeCompletionCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var invocations = 0
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return invocations
+    }
+
+    func wrap() -> (URLSession.AuthChallengeDisposition, URLCredential?) -> Void {
+        { [weak self] _, _ in
+            guard let self else { return }
+            self.lock.lock()
+            self.invocations += 1
+            self.lock.unlock()
         }
     }
 }
