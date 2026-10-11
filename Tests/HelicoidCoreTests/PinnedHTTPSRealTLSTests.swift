@@ -49,7 +49,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Positive pinned CA completes a real TLS GET")
     func positivePinnedCA() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -74,7 +74,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Positive pinned CA completes a real TLS POST")
     func positivePost() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -99,7 +99,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Foreign CA is refused even though the socket is valid TLS")
     func foreignCARefused() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.foreignCertPEM, key: pki.foreignKeyPEM)
         defer {
@@ -135,7 +135,7 @@ struct PinnedHTTPSRealTLSTests {
     /// failure actionable (decision step + CFError codes, no PKI contents).
     @Test("Foreign CA refusal exposes trust diagnostic instead of bare cancellation")
     func foreignCATrustDiagnostic() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.foreignCertPEM, key: pki.foreignKeyPEM)
         defer {
@@ -174,7 +174,7 @@ struct PinnedHTTPSRealTLSTests {
     /// single-delegate regression.
     @Test("Concurrent trust refusal and user cancellation stay task-owned")
     func concurrentTrustRefusalAndUserCancellationAreIsolated() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
 
         let refusedServer = try TLSTestHarness.startServer(cert: pki.foreignCertPEM, key: pki.foreignKeyPEM)
@@ -271,7 +271,7 @@ struct PinnedHTTPSRealTLSTests {
     /// touch B. Each challenge's completion runs exactly once; both sinks drain.
     @Test("Shared PinnedTrustDelegate keeps task sinks isolated")
     func sharedDelegateKeepsSinksIsolated() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
 
         let foreignServer = try TLSTestHarness.startServer(cert: pki.foreignCertPEM, key: pki.foreignKeyPEM)
@@ -374,7 +374,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Bad pin is refused before any successful request")
     func badPinRefused() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -397,7 +397,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Wrong DNS name cert is refused")
     func wrongDNSNameRefused() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.wrongHostCertPEM, key: pki.wrongHostKeyPEM)
         defer {
@@ -424,7 +424,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Expired server cert is refused")
     func expiredCertRefused() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.expiredCertPEM, key: pki.expiredKeyPEM)
         defer {
@@ -450,7 +450,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Non-serverAuth EKU cert is refused")
     func nonServerAuthRefused() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.nonServerAuthCertPEM, key: pki.nonServerAuthKeyPEM)
         defer {
@@ -478,7 +478,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("HTTPS origin mismatch is refused before I/O")
     func originMismatchRefused() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -506,7 +506,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Redirects are never followed (absolute and same-origin)")
     func redirectsNotFollowed() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -533,7 +533,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Oversized declared Content-Length is refused")
     func oversizedDeclaredRefused() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -555,7 +555,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Oversized chunked/streamed body is refused")
     func oversizedChunkedRefused() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -584,7 +584,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Non-2xx responses are refused")
     func non2xxRefused() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -614,7 +614,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Per-operation deadline covers a hung response")
     func timeoutRefused() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -636,7 +636,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Task cancellation aborts an in-flight request")
     func cancellationAborts() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -663,7 +663,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Disposal makes subsequent requests fail closed")
     func disposalFailsClosed() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -691,7 +691,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("bytes() entry point refuses non-2xx and redirects before returning a body")
     func bytesEntryPointRefusesNon2xxAndRedirect() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -721,7 +721,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("bytes() enforces the configured body cap, not only request()")
     func bytesEnforcesConfiguredCap() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -748,7 +748,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Concurrent request startup and dispose never crashes the process")
     func concurrentDisposeStress() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -802,7 +802,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Task cancellation completes in under 3s despite 8s+ timeouts")
     func cancellationUnderThreeSeconds() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -833,7 +833,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Operation deadline 1s fires while request timeout is 15s on a slow body")
     func operationDeadlineBeatsRequestTimeout() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -859,7 +859,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Disposal of an in-flight request drains promptly and releases active count")
     func disposalDrainsPromptly() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { try? FileManager.default.removeItem(at: pki.directory) }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {
@@ -893,7 +893,7 @@ struct PinnedHTTPSRealTLSTests {
 
     @Test("Overflow then stall cancels the owned URLSessionTask promptly")
     func overflowThenStallStopsPromptly() async throws {
-        let pki = try TLSTestHarness.makePKI()
+        let pki = try await TLSTestHarness.makePKI()
         defer { pki.disposeFiles() }
         let server = try TLSTestHarness.startServer(cert: pki.goodCertPEM, key: pki.goodKeyPEM)
         defer {

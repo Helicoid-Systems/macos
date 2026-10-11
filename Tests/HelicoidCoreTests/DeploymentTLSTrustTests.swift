@@ -5,16 +5,16 @@ import Testing
 @Suite("Deployment TLS trust validation")
 struct DeploymentTLSTrustValidationTests {
 
-    private func sampleCA() throws -> (der: Data, fingerprint: String) {
+    private func sampleCA() async throws -> (der: Data, fingerprint: String) {
         // Material-only CA bytes, generated once per process. Constructor
         // tests never need live fixture files or a server.
-        let material = try TLSTestHarness.sharedMaterial()
+        let material = try await TLSTestHarness.sharedMaterial()
         return (material.caDER, material.caFingerprint)
     }
 
     @Test("Accepts valid identity and matching pin")
-    func acceptsValidIdentity() throws {
-        let (der, fingerprint) = try sampleCA()
+    func acceptsValidIdentity() async throws {
+        let (der, fingerprint) = try await sampleCA()
         let identity = try DeploymentTLSIdentity(
             deploymentID: "deploy-1",
             host: "server.test",
@@ -30,8 +30,8 @@ struct DeploymentTLSTrustValidationTests {
     }
 
     @Test("Rejects empty or oversized deployment id")
-    func rejectsDeploymentID() throws {
-        let (der, fingerprint) = try sampleCA()
+    func rejectsDeploymentID() async throws {
+        let (der, fingerprint) = try await sampleCA()
         #expect(throws: HelicoidError.self) {
             try DeploymentTLSIdentity(deploymentID: "", host: "h", port: 443, caDER: der, caFingerprintSHA256: fingerprint)
         }
@@ -45,8 +45,8 @@ struct DeploymentTLSTrustValidationTests {
     }
 
     @Test("Rejects host with scheme, path, credentials, or empty")
-    func rejectsHost() throws {
-        let (der, fingerprint) = try sampleCA()
+    func rejectsHost() async throws {
+        let (der, fingerprint) = try await sampleCA()
         for bad in ["", "https://evil", "evil/path", "evil?x", "evil#f", "user@evil", "  ", " evil", "evil "] {
             #expect(throws: HelicoidError.self) {
                 try DeploymentTLSIdentity(deploymentID: "d", host: bad, port: 443, caDER: der, caFingerprintSHA256: fingerprint)
@@ -55,8 +55,8 @@ struct DeploymentTLSTrustValidationTests {
     }
 
     @Test("Rejects malformed host: percent, brackets, controls, whitespace, oversized")
-    func rejectsMalformedHosts() throws {
-        let (der, fingerprint) = try sampleCA()
+    func rejectsMalformedHosts() async throws {
+        let (der, fingerprint) = try await sampleCA()
         let oversized = String(repeating: "a", count: 254)
         let longLabel = String(repeating: "a", count: 64) + ".test"
         let control = "ev\u{0000}il"
@@ -89,8 +89,8 @@ struct DeploymentTLSTrustValidationTests {
     }
 
     @Test("Accepts valid IPv4, IPv6, and DNS hosts with canonical roundtrip")
-    func acceptsValidHosts() throws {
-        let (der, fingerprint) = try sampleCA()
+    func acceptsValidHosts() async throws {
+        let (der, fingerprint) = try await sampleCA()
         let cases: [(String, String)] = [
             ("server.test", "server.test"),
             ("SERVER.Test", "server.test"),
@@ -124,8 +124,8 @@ struct DeploymentTLSTrustValidationTests {
     }
 
     @Test("Rejects port outside 1...65535")
-    func rejectsPort() throws {
-        let (der, fingerprint) = try sampleCA()
+    func rejectsPort() async throws {
+        let (der, fingerprint) = try await sampleCA()
         for bad in [0, -1, 65_536] {
             #expect(throws: HelicoidError.self) {
                 try DeploymentTLSIdentity(deploymentID: "d", host: "h", port: bad, caDER: der, caFingerprintSHA256: fingerprint)
@@ -134,8 +134,8 @@ struct DeploymentTLSTrustValidationTests {
     }
 
     @Test("Rejects empty, oversized, or non-certificate CA DER")
-    func rejectsCA() throws {
-        let (_, fingerprint) = try sampleCA()
+    func rejectsCA() async throws {
+        let (_, fingerprint) = try await sampleCA()
         #expect(throws: HelicoidError.self) {
             try DeploymentTLSIdentity(deploymentID: "d", host: "h", port: 443, caDER: Data(), caFingerprintSHA256: fingerprint)
         }
@@ -153,8 +153,8 @@ struct DeploymentTLSTrustValidationTests {
     }
 
     @Test("Rejects pin that does not match CA DER")
-    func rejectsBadPin() throws {
-        let (der, _) = try sampleCA()
+    func rejectsBadPin() async throws {
+        let (der, _) = try await sampleCA()
         let wrongPin = String(repeating: "0", count: 64)
         #expect(throws: HelicoidError.self) {
             try DeploymentTLSIdentity(deploymentID: "d", host: "h", port: 443, caDER: der, caFingerprintSHA256: wrongPin)
@@ -171,8 +171,8 @@ struct DeploymentTLSTrustValidationTests {
     }
 
     @Test("Fingerprint is lowercase SHA-256 hex of exact DER")
-    func fingerprintMatchesDer() throws {
-        let (der, fingerprint) = try sampleCA()
+    func fingerprintMatchesDer() async throws {
+        let (der, fingerprint) = try await sampleCA()
         #expect(fingerprint == DeploymentTLSIdentity.sha256Hex(der))
         #expect(fingerprint.count == 64)
         #expect(fingerprint == fingerprint.lowercased())
@@ -258,8 +258,8 @@ struct DeploymentOriginPolicyTests {
 @Suite("Deployment CA certificate requirements")
 struct DeploymentCARequirementsTests {
     @Test("Rejects a leaf certificate used as the deployment CA anchor")
-    func rejectsLeafAsAnchor() throws {
-        let material = try TLSTestHarness.sharedMaterial()
+    func rejectsLeafAsAnchor() async throws {
+        let material = try await TLSTestHarness.sharedMaterial()
         let leafDER = material.leafDER
         let leafPin = DeploymentTLSIdentity.sha256Hex(leafDER)
         #expect(throws: HelicoidError.self) {
@@ -274,8 +274,8 @@ struct DeploymentCARequirementsTests {
     }
 
     @Test("Rejects CA:TRUE certificate whose KeyUsage lacks keyCertSign")
-    func rejectsCAWithoutKeyCertSign() throws {
-        let material = try TLSTestHarness.sharedMaterial()
+    func rejectsCAWithoutKeyCertSign() async throws {
+        let material = try await TLSTestHarness.sharedMaterial()
         let badDER = material.noKeySignCADER
         let badPin = DeploymentTLSIdentity.sha256Hex(badDER)
         #expect(throws: HelicoidError.self) {
@@ -290,8 +290,8 @@ struct DeploymentCARequirementsTests {
     }
 
     @Test("Accepts only CA BasicConstraints certificates as anchors")
-    func acceptsRealCA() throws {
-        let material = try TLSTestHarness.sharedMaterial()
+    func acceptsRealCA() async throws {
+        let material = try await TLSTestHarness.sharedMaterial()
         // Real generated CA is accepted (covered by identity tests too).
         _ = try DeploymentTLSIdentity(
             deploymentID: "d",
@@ -306,8 +306,8 @@ struct DeploymentCARequirementsTests {
 @Suite("Pinned HTTPS configuration bounds")
 struct PinnedHTTPSConfigurationTests {
     @Test("Rejects invalid bounds instead of clamping or crashing")
-    func rejectsInvalidBounds() throws {
-        let material = try TLSTestHarness.sharedMaterial()
+    func rejectsInvalidBounds() async throws {
+        let material = try await TLSTestHarness.sharedMaterial()
         let identity = try DeploymentTLSIdentity(
             deploymentID: "d",
             host: "server.test",
@@ -356,8 +356,8 @@ struct PinnedHTTPSConfigurationTests {
     }
 
     @Test("Accepts valid bounds and maps huge-but-valid timeouts to safe nanoseconds")
-    func acceptsValidBounds() throws {
-        let material = try TLSTestHarness.sharedMaterial()
+    func acceptsValidBounds() async throws {
+        let material = try await TLSTestHarness.sharedMaterial()
         let identity = try DeploymentTLSIdentity(
             deploymentID: "d",
             host: "server.test",

@@ -102,7 +102,156 @@ struct SSHSetupTests {
             try await SystemSetupCommandRunner().run(SetupCommand(executable: "/bin/sleep", arguments: ["10"]))
         }
         operation.cancel()
-        await #expect(throws: (any Error).self) { try await operation.value }
+        do {
+            _ = try await operation.value
+            Issue.record("Cancelled command unexpectedly succeeded")
+        } catch {
+            #expect(error is CancellationError || error as? SetupCommandError == .cancelled)
+        }
+    }
+
+    @Test func successfulCommandRetainsTrailingOutputUntilEOF() async throws {
+        let result = try await SystemSetupCommandRunner().run(SetupCommand(
+            executable: "/bin/sh",
+            arguments: ["-c", "printf head; sleep 0.2; printf tail"],
+            timeoutSeconds: 5))
+        #expect(result.exitStatus == 0)
+        #expect(String(decoding: result.output, as: UTF8.self) == "headtail")
+    }
+
+    @Test func timeoutWithNonReadingStdinIsBounded() async {
+        let clock = ContinuousClock()
+        let start = clock.now
+        await #expect(throws: SetupCommandError.timedOut) {
+            try await SystemSetupCommandRunner().run(SetupCommand(
+                executable: "/bin/sh",
+                arguments: ["-c", "sleep 10"],
+                input: Data(repeating: 0x41, count: 65_536),
+                timeoutSeconds: 0.05))
+        }
+        #expect(start.duration(to: clock.now) < .seconds(1))
+    }
+
+    @Test func cancelledChildIsGoneWhenReturnIsObserved() async throws {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hs-ssh-owned-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: marker) }
+        let operation = Task {
+            try await SystemSetupCommandRunner().run(SetupCommand(
+                executable: "/bin/sh",
+                arguments: ["-c", "echo $$ > \"$1\"; sleep 10", "helicoid-test", marker.path],
+                timeoutSeconds: 30))
+        }
+        var ownedPID: pid_t = 0
+        for _ in 0..<200 {
+            if let text = try? String(contentsOf: marker, encoding: .utf8),
+               let value = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+               value > 0 {
+                ownedPID = value
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(ownedPID > 0)
+        operation.cancel()
+        do {
+            _ = try await operation.value
+            Issue.record("Cancelled command unexpectedly succeeded")
+        } catch {
+            #expect(error is CancellationError || error as? SetupCommandError == .cancelled)
+        }
+        // Reap owner must have recorded exit before the runner returned.
+        #expect(Darwin.kill(ownedPID, 0) == -1)
+        #expect(errno == ESRCH)
+    }
+
+    @Test func cancellationBeforeLaunchDoesNotLeaveChild() async {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hs-ssh-prestart-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: marker) }
+        let operation = Task {
+            try await SystemSetupCommandRunner().run(SetupCommand(
+                executable: "/bin/sh",
+                arguments: ["-c", "sleep 0.15; printf ran > \"$1\"", "helicoid-test", marker.path],
+                timeoutSeconds: 5))
+        }
+        operation.cancel()
+        do {
+            _ = try await operation.value
+            Issue.record("Cancelled command unexpectedly succeeded")
+        } catch {
+            #expect(error is CancellationError || error as? SetupCommandError == .cancelled)
+        }
+        // After return, a pre-start cancel never spawned; a launched child was
+        // reaped. A delayed marker would mean an unreaped child outlived us.
+        try? await Task.sleep(for: .milliseconds(250))
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @Test func closedStdinDoesNotGenerateSIGPIPEOrHideFailedInput() async throws {
+        do {
+            let result = try await SystemSetupCommandRunner().run(SetupCommand(
+                executable: "/bin/sh",
+                arguments: ["-c", "exec 0<&-; printf done"],
+                input: Data(repeating: 0x41, count: 65_536),
+                timeoutSeconds: 5))
+            // The kernel may accept all bounded input before the child closes
+            // stdin. Otherwise the runner must report inputFailed, never hide it.
+            #expect(result.exitStatus == 0)
+            #expect(String(decoding: result.output, as: UTF8.self) == "done")
+        } catch {
+            #expect(error as? SetupCommandError == .inputFailed)
+        }
+    }
+
+    @Test func exitedChildWithInheritedWriterStillTimesOut() async {
+        await #expect(throws: SetupCommandError.timedOut) {
+            try await SystemSetupCommandRunner().run(SetupCommand(
+                executable: "/bin/sh",
+                arguments: ["-c", "sleep 2 & printf partial; exit 0"],
+                timeoutSeconds: 0.05))
+        }
+    }
+
+    @Test func outputOverflowReapsOwnedChildBeforeReturning() async throws {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hs-ssh-overflow-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: marker) }
+        await #expect(throws: SetupCommandError.outputExceeded) {
+            try await SystemSetupCommandRunner().run(SetupCommand(
+                executable: "/bin/sh",
+                arguments: ["-c", "echo $$ > \"$1\"; exec /usr/bin/yes bounded",
+                            "helicoid-test", marker.path],
+                timeoutSeconds: 5, outputLimit: 32))
+        }
+        let text = try String(contentsOf: marker, encoding: .utf8)
+        let pid = try #require(Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)))
+        try #require(pid > 0)
+        #expect(Darwin.kill(pid, 0) == -1)
+        #expect(errno == ESRCH)
+    }
+
+    @Test func embeddedNULArgumentIsRefusedBeforeLaunch() async throws {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hs-ssh-nul-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: marker) }
+        await #expect(throws: SetupCommandError.launchFailed) {
+            try await SystemSetupCommandRunner().run(SetupCommand(
+                executable: "/bin/sh",
+                arguments: ["-c", "printf ran > \"$1\"", "helicoid-test", marker.path, "a\0b"]))
+        }
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @Test func secondInvocationIsUnaffectedByPriorTimeout() async throws {
+        await #expect(throws: SetupCommandError.timedOut) {
+            try await SystemSetupCommandRunner().run(SetupCommand(
+                executable: "/bin/sh", arguments: ["-c", "sleep 2 & wait"], timeoutSeconds: 0.05))
+        }
+        let result = try await SystemSetupCommandRunner().run(SetupCommand(
+            executable: "/bin/sh", arguments: ["-c", "printf second; exit 3"]))
+        #expect(result.exitStatus == 3)
+        #expect(String(decoding: result.output, as: UTF8.self) == "second")
     }
 
     @Test @MainActor func modelInvalidatesTrustWhenAddressChanges() async throws {
