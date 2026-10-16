@@ -10,7 +10,14 @@ now observes those changes through a weak, generation-fenced coordinator link.
 
 Exported session metadata confirms `xiaomi-token-plan-ams/mimo-v2.6-pro`, `high`.
 The receipt is `/tmp/hs-finish-20261013/coordinator-macos-final-package-receipt-20261016.json`.
-Native CI and the current real Rust HTTPS interop rerun are pending. Ad-hoc
+[Native CI38927581414](https://github.com/Helicoid-Systems/macos/actions/runs/38927581414)
+passes at code `d657e9762246f3a2b7814cecadd79ef61dacda95`, including Intel
+source compatibility. Actual current Rust HTTPS interop passes7 Swift and6 C#
+checks against the release server. The downloaded artifact12056404592 matches
+SHA256 `edaf1c3bbd540bd8792eb16aaa6148d9bc2522d1c1a2b3a4a8e9ca4a295a7b23`;
+both actual arm64 executables pass strict ad-hoc signature verification. A staged
+Manager cold start exposes the expected unavailable connection screen; Computer
+process startup alone does not prove its UI or capture worker. Ad-hoc
 signatures do not pass Developer ID/notarization, installed worker/hosting,
 Intel runtime, public routing, media/control or any complete release checkpoint.
 No production trust fixture or supplied artwork was changed.

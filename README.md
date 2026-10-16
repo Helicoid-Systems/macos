@@ -4,8 +4,11 @@ The native v2 sign-in and session-expiry candidate passes **231 coordinator
 tests** and both release app builds on Apple Silicon. Automatic expiry updates
 the actual Manager screen and clears inventory/windows; cancellation, replacement
 and client lifetime regressions pass. The staged bundles pass strict ad-hoc
-signature verification. Native CI and current Rust HTTPS interoperability remain
-pending for this revision. Independently enrolled trust is still required; normal
+signature verification. [Native CI38927581414](https://github.com/Helicoid-Systems/macos/actions/runs/38927581414)
+passes at `d657e9762246f3a2b7814cecadd79ef61dacda95`, including Intel source
+compatibility. The actual Rust HTTPS interop suite passes7 Swift and6 C# checks.
+The downloaded [Apple Silicon development apps](https://github.com/Helicoid-Systems/macos/actions/runs/38927581414/artifacts/12056404592)
+match the published archive digest and both strict ad-hoc signatures. Independently enrolled trust is still required; normal
 operation stays unavailable when no trusted configuration is supplied. Live
 capture/control and the worker/admission checkpoint remain incomplete. Earlier
 14 October billing and failed-candidate records are historical.
