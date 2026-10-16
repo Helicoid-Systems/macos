@@ -1,3 +1,20 @@
+## Coordinator native authentication and expiry candidate, 16 October 2026
+
+Coordinator packaging passed **229 core tests plus 2 actual ManagerSession tests**,
+then built and packaged both release applications. `codesign --verify --deep
+--strict` passed for both ad-hoc development bundles. Independent before/after
+regressions prove cancellation no longer spins, deadline tasks do not retain
+abandoned clients, subsecond continuous time is preserved, and actual automatic
+expiry clears UI state without another user action. The actual Manager facade
+now observes those changes through a weak, generation-fenced coordinator link.
+
+Exported session metadata confirms `xiaomi-token-plan-ams/mimo-v2.6-pro`, `high`.
+The receipt is `/tmp/hs-finish-20261013/coordinator-macos-final-package-receipt-20261016.json`.
+Native CI and the current real Rust HTTPS interop rerun are pending. Ad-hoc
+signatures do not pass Developer ID/notarization, installed worker/hosting,
+Intel runtime, public routing, media/control or any complete release checkpoint.
+No production trust fixture or supplied artwork was changed.
+
 # BUILD-REPORT — Helicoid macOS (apps/macos)
 
 ## Reviewed SSH lifecycle and asynchronous fixture generation, 11 October 2026
@@ -203,3 +220,102 @@ Repaired proof (this working tree, not yet a new CI run):
 - Live probe still runs full `validate()` on real OS/hostname/port facts (no bypass, no swallowed failure) and still refuses to claim complete listeners without elevation.
 
 Commands after the fix: `xcrun swift test` → **123 tests / 19 suites passed**; debug and release builds of `HelicoidManager` and `HelicoidComputer` succeeded; `xcrun swift build -c release --arch x86_64` succeeded (x86_64 deprecation warning only). A fresh native CI run is still required to close the failed job; this is local repaired proof.
+
+## Native v2 auth candidate — coordinator review fixes (15 October 2026)
+
+Owner path: `apps/macos/**` only. No commit/push. Model: MiMo-V2.6-Pro (Xiaomi Token Plan Europe).
+
+### Acceptance findings addressed
+
+| # | Finding | Fix |
+| --- | --- | --- |
+| 1 | `public_identity` compared as key | Completion-only top-level `manager_public_key` binds signer/challenge key; `public_identity` display-only (`key:<hex>`) |
+| 2 | MFA metadata unchecked | `validateMFAConsistency` requires the block and required/available to match the completed factor |
+| 3 | Int expiry overflow / Unicode digits | `remainingSeconds` uses `subtractingReportingOverflow`; TOTP accepts ASCII 0-9 only |
+| 4 | connect ignored address / empty fingerprint | Refuse non-origin addresses; probe pinned `GET /health`; identity from configured CA pin |
+| 5 | Stale cleanup / task slot / inventory races | `AuthSignInCoordinator` owns generations; stale branches cannot clear/cancel/install; inventory fenced |
+| 6 | Injection seam only | Documented in README: production v2 requires injected trusted configuration; default remains closed |
+
+### Commands (fresh this turn)
+
+```
+xcrun swift test
+# → 208 tests, 29 suites, all passed (19.688s)
+
+HELICOID_FORCE_ICON_FALLBACK=1 \
+  HELICOID_BUILD_DIR=/tmp/hs-finish-20261013/build-macos-auth \
+  HELICOID_DIST_DIR=/tmp/hs-finish-20261013/dist-macos-auth \
+  ./scripts/build.sh
+# → tests 208/29, release build complete, both apps packaged, ad-hoc signed
+```
+
+Deployment minimum remains macOS 15; Swift tools 6.2 / local Xcode Swift 6.4.
+No mock pixels. Media/control flags remain closed.
+
+### Remaining gates (not verified)
+
+- Actual built Rust server E2E login (coordinator)
+- Normal app wiring that loads persisted deployment trust (injection seam only)
+- Intel runtime, Developer ID/notarization, production trust adoption UI
+
+### Independent client regression fix (15 October 2026, follow-up)
+
+Coordinator snapshot test `coordinatorStaleCompletionPreservesReplacement` failed
+on the previous candidate: `completeChallenge` mismatch and post-await branches
+called `clearPendingChallenge()` and erased a replacement challenge. Root cause
+fixed in `NativeV2AuthClient`: obsolete completions never clear pending; cleanup
+is `clearPending(ifChallengeID:)`; `beginChallenge` refuses cancelled entry and
+does not mutate after a stale await. Optional completion now requires
+`!mfa.required && !mfa.available`.
+
+Added regressions through the actual client public API:
+`coordinatorStaleCompletionPreservesReplacement` (coordinator snapshot, unchanged),
+`lateResponseAfterReplacementPreservesPending`,
+`cancelledBeginDoesNotClearReplacement`,
+`optionalAvailableFactorContradiction`.
+
+```
+xcrun swift test --filter coordinatorStaleCompletionPreservesReplacement
+# 1 test passed
+
+xcrun swift test
+# 212 tests, 29 suites, all passed (46.659s)
+
+HELICOID_FORCE_ICON_FALLBACK=1 ./scripts/build.sh
+# tests + release + both apps packaged/signed
+```
+
+### Session expiry reception clock (15 October 2026, interop)
+
+Real Rust HTTPS login issued a bounded 7200s v2 session; the client captured
+`now` before the complete HTTP await and rejected a legitimate response as
+oversized (`remaining > 7200`). `completeChallenge` now validates with a
+**reception** timestamp taken after the await. Strict bounds are unchanged:
+reception-relative remaining lifetime > 7200s, expired sessions, overflow
+values, binding checks and generation fences still deny. No TTL padding and no
+fixture expiry mutation.
+
+Causal regressions (actual client + delayed test responder):
+- `slowCompletionAcceptsFresh7200` — delay 1.2s, issue `expires = issue+7200` → accepted
+- `oversizedAndExpiredStillDenied` — `issue+7201` and past expiry → denied
+
+```
+xcrun swift test
+# 214 tests, 29 suites, all passed (19.426s)
+
+HELICOID_FORCE_ICON_FALLBACK=1 ./scripts/build.sh
+# tests + release + both apps packaged/signed
+```
+
+### Session expiry / invalidation (15 October 2026)
+
+Live bearer uses a conservative monotonic deadline from reception-relative
+remaining lifetime (max 7200s, no padding). Expired bearers are never returned
+or sent; local clear needs no network. Authorized 401 for the exact
+token/generation is credential loss (`sessionExpired`); 403 is operation-only
+and keeps the session. Coordinator clears inventory and returns to sign-in on
+expiry; stale expiry/401 cannot clear a replacement.
+
+`xcrun swift test` → **224 tests / 30 suites passed**. Packaged build with
+`HELICOID_FORCE_ICON_FALLBACK=1` succeeded. Report:
+`/tmp/hs-finish-20261013/macos-session-expiry-report.md`.

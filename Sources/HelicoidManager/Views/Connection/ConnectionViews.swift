@@ -185,21 +185,43 @@ struct SignInView: View {
                 }
 
                 Form {
-                    Section {
-                        TextField("Username", text: Binding(
-                            get: { session.username },
-                            set: { session.username = $0 }
-                        ))
-                        .textContentType(.username)
-                        SecureField("Password", text: Binding(
-                            get: { session.password },
-                            set: { session.password = $0 }
-                        ))
-                        .textContentType(.password)
-                    } footer: {
-                        Text("Organization-managed local accounts. No external identity provider is required.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    if session.authCodeState != .required {
+                        Section {
+                            TextField("Username", text: Binding(
+                                get: { session.username },
+                                set: { session.username = $0 }
+                            ))
+                            .textContentType(.username)
+                            SecureField("Password", text: Binding(
+                                get: { session.password },
+                                set: { session.password = $0 }
+                            ))
+                            .textContentType(.password)
+                        } footer: {
+                            Text("Organization-managed local accounts. No external identity provider is required.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if session.authCodeState == .required {
+                        Section {
+                            SecureField("Verification code", text: Binding(
+                                get: { session.authCode },
+                                set: { session.authCode = $0 }
+                            ))
+                            .textContentType(.oneTimeCode)
+                            .accessibilityLabel("Six-digit verification code")
+                            Text("Enter the six-digit code from your authenticator. This step is required by the server.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if let error = session.authCodeError {
+                        Section {
+                            InlineErrorView(error: error)
+                        }
                     }
 
                     if let error = session.signInError {
@@ -225,31 +247,58 @@ struct SignInView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             HStack {
-                Button("Back") {
-                    withAnimation(.easeOut(duration: 0.22)) {
-                        session.screen = .verify
+                if session.authCodeState == .required {
+                    Button("Cancel") {
+                        Task { await session.cancelAuthCode() }
+                    }
+                } else {
+                    Button("Back") {
+                        withAnimation(.easeOut(duration: 0.22)) {
+                            session.screen = .verify
+                        }
                     }
                 }
                 Spacer()
-                Button {
-                    isSigningIn = true
-                    Task {
-                        await session.signIn()
-                        isSigningIn = false
+                if session.authCodeState == .required {
+                    Button {
+                        isSigningIn = true
+                        Task {
+                            await session.submitAuthCode()
+                            isSigningIn = false
+                        }
+                    } label: {
+                        if isSigningIn {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Verify")
+                        }
                     }
-                } label: {
-                    if isSigningIn {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Text("Sign In")
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        isSigningIn
+                            || !NativeV2AuthClient.isValidTOTPCode(session.authCode)
+                    )
+                } else {
+                    Button {
+                        isSigningIn = true
+                        Task {
+                            await session.signIn()
+                            isSigningIn = false
+                        }
+                    } label: {
+                        if isSigningIn {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Sign In")
+                        }
                     }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        isSigningIn
+                            || session.username.trimmingCharacters(in: .whitespaces).isEmpty
+                            || session.password.isEmpty
+                    )
                 }
-                .keyboardShortcut(.defaultAction)
-                .disabled(
-                    isSigningIn
-                        || session.username.trimmingCharacters(in: .whitespaces).isEmpty
-                        || session.password.isEmpty
-                )
             }
             .padding(.horizontal, 28)
             .padding(.bottom, 28)
