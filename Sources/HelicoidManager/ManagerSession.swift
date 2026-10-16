@@ -5,7 +5,7 @@ import HelicoidCore
 /// Connection, overview, and setup state stay separate objects.
 @MainActor
 @Observable
-public final class ManagerSession {
+public final class ManagerSession: AuthSignInObserving {
     public enum Screen: Hashable, Sendable {
         case connect
         case verify
@@ -32,18 +32,30 @@ public final class ManagerSession {
     public var managerPublicIdentity: String?
     public var showInclusionPanel: Bool
     public var showDevelopmentBanner: Bool
+    /// Cancellable required-code state for v2 device-key sign-in.
+    public var authCodeState: AuthCodeState {
+        authCoordinator?.authCodeState ?? .idle
+    }
+    /// UI buffer for the six-digit code. Submitted value is passed explicitly.
+    public var authCode: String = ""
+    /// Facade error field; synced from the coordinator after each step.
+    public var authCodeError: HelicoidError?
 
     /// True when a connection path is actually available.
     public var allowsConnect: Bool {
-        isFixturesMode || isDevelopmentServerMode
+        isFixturesMode || isDevelopmentServerMode || productionAuthClient != nil
     }
 
     private let client: any ConnectionClient
     private let developmentClient: LoopbackDevelopmentClient?
+    private let productionAuthClient: NativeV2AuthClient?
+    /// Actual v2 sign-in state owner (causal generation fencing lives here).
+    private var authCoordinator: AuthSignInCoordinator?
 
     public init(
         configuration: ManagerLaunchConfiguration = ManagerLaunchConfiguration(),
-        client: (any ConnectionClient)? = nil
+        client: (any ConnectionClient)? = nil,
+        productionAuthClient: NativeV2AuthClient? = nil
     ) {
         self.isFixturesMode = configuration.useSourceFixtures
         self.isDevelopmentServerMode = configuration.useDevelopmentServer
@@ -62,6 +74,11 @@ public final class ManagerSession {
         self.openRemoteWindows = []
         self.showInclusionPanel = false
         self.showDevelopmentBanner = configuration.useSourceFixtures
+        self.authCode = ""
+        self.productionAuthClient = configuration.useDevelopmentServer ? nil : productionAuthClient
+        self.authCoordinator = (configuration.useDevelopmentServer || configuration.useSourceFixtures)
+            ? nil
+            : productionAuthClient.map { AuthSignInCoordinator(client: $0) }
 
         if configuration.useSourceFixtures {
             self.overview = DevelopmentFixtures.overviewModel()
@@ -81,9 +98,16 @@ public final class ManagerSession {
             self.overview = OverviewModel()
         } else {
             self.developmentClient = nil
-            self.client = client ?? UnavailableConnectionClient()
+            if let productionAuthClient, !configuration.useDevelopmentServer {
+                self.client = client ?? productionAuthClient
+            } else {
+                self.client = client ?? UnavailableConnectionClient()
+            }
             self.overview = OverviewModel()
         }
+        // Automatic expiry/401 must reach this facade without a user action.
+        // Set after full initialization (weak observer, no retain cycle).
+        self.authCoordinator?.observer = self
     }
 
     /// Human-readable transport description. Never claims production trust.
@@ -93,6 +117,9 @@ public final class ManagerSession {
         }
         if isDevelopmentServerMode {
             return "Local development loopback server. No production server identity is verified."
+        }
+        if productionAuthClient != nil {
+            return "Pinned HTTPS with independently supplied deployment trust. No fallback to development login."
         }
         return "Production connection is closed until a trusted server identity is available."
     }
@@ -108,6 +135,24 @@ public final class ManagerSession {
         guard allowsConnect else {
             connectError = .serverContractUnavailable
             phase = .failed(.serverContractUnavailable)
+            return
+        }
+
+
+        if let auth = productionAuthClient, !isDevelopmentServerMode, !isFixturesMode {
+            // Trust configuration is already supplied. Discovery does not
+            // establish trust and is never used to mint a deployment identity.
+            phase = .connecting
+            let result = await auth.connect(address: serverAddress.trimmingCharacters(in: .whitespacesAndNewlines))
+            switch result {
+            case .success(let identity):
+                pendingIdentity = nil
+                verifiedIdentity = identity
+                phase = .needsSignIn
+                screen = .signIn
+            case .failure(let error):
+                applyConnectFailure(error)
+            }
             return
         }
 
@@ -201,8 +246,20 @@ public final class ManagerSession {
     public func signIn() async {
         connectError = nil
         signInError = nil
-        // Failed sign-in must never retain previous inventory.
+        authCodeError = nil
         overview.setInventory([])
+
+        if let coordinator = authCoordinator, !isDevelopmentServerMode, !isFixturesMode {
+            let username = self.username
+            let password = self.password
+            self.password = ""
+            await coordinator.signIn(username: username, password: password)
+            syncAuthUIFromCoordinator()
+            if case .signedIn = coordinator.phase {
+                overview.setInventory(coordinator.inventory)
+            }
+            return
+        }
 
         let result = await client.signIn(username: username, password: password)
         switch result {
@@ -213,6 +270,7 @@ public final class ManagerSession {
             await reloadInventory()
         case .failure(let error):
             signInError = error
+            password = ""
             overview.setInventory([])
             openRemoteWindows = []
             if case .permissionDenied(let detail) = error, detail.lowercased().contains("manager") {
@@ -223,8 +281,90 @@ public final class ManagerSession {
         }
     }
 
+    /// Submit the required six-digit code. Cancellable via `cancelAuthCode()`.
+    public func submitAuthCode() async {
+        guard let coordinator = authCoordinator else {
+            authCodeError = .authenticationFailed(detail: "Start sign-in again.")
+            authCode = ""
+            return
+        }
+        // Push the UI buffer into the coordinator before submit.
+        coordinator.setAuthCode(authCode)
+        await coordinator.submitAuthCode()
+        authCode = ""
+        syncAuthUIFromCoordinator()
+        if case .signedIn = coordinator.phase {
+            overview.setInventory(coordinator.inventory)
+        }
+    }
+
+    /// Cancel required-code collection and clear challenge secrets.
+    public func cancelAuthCode() async {
+        authCode = ""
+        password = ""
+        if let coordinator = authCoordinator {
+            await coordinator.cancelAuthCode()
+            syncAuthUIFromCoordinator()
+        } else {
+            phase = .needsSignIn
+            screen = .signIn
+        }
+    }
+
+    private func syncAuthUIFromCoordinator() {
+        guard let coordinator = authCoordinator else { return }
+        switch coordinator.phase {
+        case .idle:
+            break
+        case .awaitingCredentials:
+            phase = .needsSignIn
+            screen = .signIn
+        case .awaitingRequiredCode:
+            phase = .needsSignIn
+            screen = .signIn
+        case .signedIn:
+            phase = .signedIn
+            screen = .computers
+        case .pendingManagerApproval:
+            phase = .pendingManagerApproval
+            screen = .signIn
+        case .failed(let error):
+            signInError = error
+            phase = .needsSignIn
+            screen = .signIn
+        }
+        if let error = coordinator.signInError {
+            signInError = error
+        }
+        authCodeError = coordinator.authCodeError
+        // Mirror coordinator inventory into the actual overview facade.
+        if case .signedIn = coordinator.phase {
+            overview.setInventory(coordinator.inventory)
+        } else if coordinator.inventory.isEmpty {
+            overview.setInventory([])
+        } else {
+            overview.setInventory(coordinator.inventory)
+        }
+        // Expiry / credential loss must drop remote windows and selection.
+        if case .sessionExpired = coordinator.signInError {
+            openRemoteWindows = []
+            overview.setInventory([])
+        }
+    }
+
+    /// Automatic facade sync when the coordinator changes (expiry, 401, …).
+    public func authSignInCoordinatorDidUpdate(_ coordinator: AuthSignInCoordinator) {
+        syncAuthUIFromCoordinator()
+    }
+
     public func reloadInventory() async {
         if isFixturesMode { return }
+        if let coordinator = authCoordinator, productionAuthClient != nil, !isDevelopmentServerMode {
+            await coordinator.reloadInventory()
+            syncAuthUIFromCoordinator()
+            overview.setInventory(coordinator.inventory)
+            return
+        }
         let result = await client.authorizedInventory()
         switch result {
         case .success(let computers):
@@ -243,9 +383,15 @@ public final class ManagerSession {
     /// Clears token, identity, and inventory even if remote logout fails.
     public func signOut() async {
         signOutError = nil
+        authCode = ""
+        password = ""
+        if let coordinator = authCoordinator {
+            await coordinator.signOut()
+            syncAuthUIFromCoordinator()
+        }
         if let dev = developmentClient {
             signOutError = await dev.signOutReportingRemoteFailure()
-        } else {
+        } else if authCoordinator == nil {
             await client.signOut()
         }
         clearSessionMaterial()

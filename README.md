@@ -1,5 +1,15 @@
 # Helicoid macOS apps
 
+The native v2 sign-in and session-expiry candidate passes **231 coordinator
+tests** and both release app builds on Apple Silicon. Automatic expiry updates
+the actual Manager screen and clears inventory/windows; cancellation, replacement
+and client lifetime regressions pass. The staged bundles pass strict ad-hoc
+signature verification. Native CI and current Rust HTTPS interoperability remain
+pending for this revision. Independently enrolled trust is still required; normal
+operation stays unavailable when no trusted configuration is supplied. Live
+capture/control and the worker/admission checkpoint remain incomplete. Earlier
+14 October billing and failed-candidate records are historical.
+
 Independent native macOS 15 SwiftUI apps for Helicoid Systems computer monitoring.
 
 | App | Role |
@@ -143,6 +153,37 @@ Guided setup offers **This Mac** and **Existing Linux Server**. This Mac perform
 
 Fresh coordinator verification: 122 Swift tests in 19 suites, both release app bundles, the supplied layered icons, and deep strict ad-hoc signature checks passed. The packaged Manager was exercised through This Mac → Check This Mac and refused incomplete listener inspection. Intel runtime, privileged installation, live preview/control and production signing remain Not Verified.
 
+
+## Native v2 device-key sign-in (13–15 October 2026)
+
+`NativeV2AuthClient` implements the frozen two-step challenge login over
+independently pinned HTTPS: `POST /v2/auth/challenge` then
+`POST /v2/auth/challenge/complete`. It reuses `ManagerSigningIdentity`
+(CryptoKit Ed25519 + Keychain) and `PinnedHTTPSTransport` unchanged.
+
+- Canonical signature message: `hs-auth-v2|deployment:<id>|challenge:<id>|operation:session|manager:<key_hex>`
+- `mfa_required` missing → required; `false` → optional (omit TOTP). Required
+  code UI is cancellable; optional non-enrolled login does not ask for TOTP.
+  Optional completion must report `!required` and `!available` (an available
+  factor always requires TOTP).
+- Completion binds top-level `manager_public_key` to the actual signer/challenge
+  key. `manager.public_identity` is display-only (bootstrap uses `key:<hex>`).
+- MFA metadata must match the completed factor; weaker/malformed blocks fail closed.
+- Challenge expiry ≤ 120s and session expiry ≤ 2h use checked arithmetic.
+- Codes accept ASCII `0-9` only. Secrets stay in process memory.
+- Development loopback remains an explicit separate legacy option; the v2 client
+  never falls back to v1/password-only/dev labels.
+
+**Injection seam only:** normal `HelicoidManager` construction does not yet load
+persisted deployment trust. Production v2 sign-in is available only when a
+`NativeV2AuthClient` is injected into `ManagerSession` with a genuine
+`DeploymentTLSIdentity` + `PinnedHTTPSTransport`. Without that configuration,
+production Connect stays explicitly unavailable. Actual-server integration
+against the built Rust server remains a coordinator gate.
+
+`AuthSignInCoordinator` owns causal generation fencing for sign-in, required
+code, inventory, and sign-out so stale completions cannot clear a newer
+challenge or re-install inventory after sign-out.
 
 ## Pinned HTTPS prerequisite (11 October 2026)
 

@@ -16,6 +16,7 @@ public enum HelicoidError: Error, Hashable, Sendable {
     case unreachable
     case cancelled
     case offline
+    case sessionExpired(detail: String)
 
     public var title: String {
         switch self {
@@ -33,6 +34,7 @@ public enum HelicoidError: Error, Hashable, Sendable {
         case .unreachable: "Server unreachable"
         case .cancelled: "Cancelled"
         case .offline: "Offline"
+        case .sessionExpired: "Session expired"
         }
     }
 
@@ -66,6 +68,8 @@ public enum HelicoidError: Error, Hashable, Sendable {
             "The operation was cancelled before its stated boundary."
         case .offline:
             "The computer or server is offline."
+        case .sessionExpired(let detail):
+            detail
         }
     }
 }
