@@ -7,13 +7,22 @@ struct HelicoidComputerApp: App {
 
     init() {
         let fixtures = DevelopmentFixtures.isRequested()
-        _model = State(initialValue: fixtures ? ComputerDevelopmentFixtures.model() : ComputerStatusModel())
+        let model = fixtures ? ComputerDevelopmentFixtures.model() : ComputerStatusModel()
+        if !fixtures {
+            // Startup query without prompting.
+            model.refreshPermissions()
+        }
+        _model = State(initialValue: model)
     }
 
     var body: some Scene {
         MenuBarExtra {
             StatusMenuContent()
                 .environment(model)
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    // Reactivation query without prompting.
+                    model.refreshPermissions()
+                }
         } label: {
             Image(systemName: menuSymbol)
                 .accessibilityLabel("Helicoid Computer status: \(model.connection.label)")
@@ -23,12 +32,18 @@ struct HelicoidComputerApp: App {
         Window("Helicoid Computer", id: "status") {
             StatusWindowView()
                 .environment(model)
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    model.refreshPermissions()
+                }
         }
         .windowResizability(.contentSize)
 
         Settings {
             ComputerSettingsView()
                 .environment(model)
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    model.refreshPermissions()
+                }
         }
     }
 
@@ -152,8 +167,15 @@ struct StatusWindowView: View {
                 HelpRequestSection()
             }
 
+            GroupBox {
+                ComputerPermissionSection()
+            }
+
             if model.isFixturesMode {
                 Text(DevelopmentFixtures.banner)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                Text(ComputerFixturePermissionProbe.banner)
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
@@ -183,6 +205,8 @@ struct StatusWindowView: View {
 }
 
 struct ComputerSettingsView: View {
+    @Environment(ComputerStatusModel.self) private var model
+
     var body: some View {
         Form {
             LabeledContent("Product", value: "Helicoid")
@@ -191,8 +215,68 @@ struct ComputerSettingsView: View {
             Text("This app reports connection and screen-access status for a monitored computer. It does not grant operators access by itself.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            Section("Permissions") {
+                ComputerPermissionSection()
+            }
+
+            if model.isFixturesMode {
+                Text(ComputerFixturePermissionProbe.banner)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
         }
         .formStyle(.grouped)
-        .frame(width: 420, height: 220)
+        .frame(width: 420, height: 320)
+    }
+}
+
+/// Permission readiness UI. Separate from connection and screen access.
+/// Request buttons are the only path that may prompt.
+struct ComputerPermissionSection: View {
+    @Environment(ComputerStatusModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Permissions")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            ForEach(ComputerPermissionKind.allCases, id: \.self) { kind in
+                permissionRow(kind)
+            }
+
+            Text("Grants alone do not connect, share, or control this computer.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .task {
+            model.refreshPermissions()
+        }
+    }
+
+    @ViewBuilder
+    private func permissionRow(_ kind: ComputerPermissionKind) -> some View {
+        let status = model.permissionStatus(for: kind)
+        VStack(alignment: .leading, spacing: 4) {
+            LabeledContent(kind.title, value: status.label)
+                .accessibilityLabel("\(kind.title): \(status.label)")
+
+            Text(kind.purpose)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if !status.isAvailable {
+                HStack(spacing: 8) {
+                    Button("Request \(kind.title)…") {
+                        model.requestPermission(kind)
+                    }
+                    Button("Open Settings") {
+                        model.openPermissionSettings(kind)
+                    }
+                }
+                .controlSize(.small)
+            }
+        }
     }
 }

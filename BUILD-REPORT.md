@@ -1,3 +1,50 @@
+## P01 Computer permission readiness prerequisite, 17 October 2026
+
+Owner `apps/macos` only. Engine/signaling/authority contracts frozen: no
+wire, core/server, Manager, or worker-admission changes. Manager AboutView
+bytes preserved at SHA256
+`76fdcc3f5023f1f51e533a69ee129e78b2143ce080c000deed8619636239ea63`.
+
+Helicoid Computer now inspects actual current-process **Screen Recording** and
+**Accessibility** status with installed SDK APIs only
+(`CGPreflightScreenCaptureAccess` / `CGRequestScreenCaptureAccess`,
+`AXIsProcessTrusted` / `AXIsProcessTrustedWithOptions`). No shell, TCC database
+inspection/changes, or private APIs.
+
+| Check | Result |
+| --- | --- |
+| `xcrun swift test` | **239 tests / 33 suites passed** (229 Core + 2 Manager + 8 Computer permission) |
+| Named permission tests | granted/missing/unknown; stale granted→revoked; grants alone ≠ connected/observed/controlled; request-only prompt path; fixtures labeled synthetic |
+| `xcrun swift build -c release` | Both `HelicoidManager` and `HelicoidComputer` built |
+| `xcrun swift build -c release --arch x86_64` | Intel cross-build passed (x86_64 deprecation warning only) |
+| Native read-only preflight (separate labeled evidence) | `screenRecording: granted`, `accessibility: granted` at 2026-10-17T16:12:19Z via `CGPreflightScreenCaptureAccess` + `AXIsProcessTrusted` (no prompt) |
+| AboutView SHA256 | `76fdcc3f5023f1f51e533a69ee129e78b2143ce080c000deed8619636239ea63` preserved |
+
+Source paths: `Sources/HelicoidComputer/ComputerPermission.swift`,
+`Sources/HelicoidComputer/ComputerStatusModel.swift`,
+`Sources/HelicoidComputer/HelicoidComputerApp.swift`,
+`Tests/HelicoidComputerTests/ComputerPermissionTests.swift`, `Package.swift`
+(test target only).
+
+Runtime vs synthetic limits: the 8 lifecycle/policy tests use an injected
+scripted probe and do **not** prove live TCC. The separate native preflight
+proves this host's current-process read-only status only; it is not fixture
+runtime proof, does not exercise request prompts, and does not exercise UI
+buttons. No automatic capture, input, helper/launchd installation, or
+permission prompts ran in tests/CLI. No polling is installed (startup +
+reactivation refresh only). Full ScreenCaptureKit worker, authenticated
+supervisor, disclosure, and input remain unfinished and do not claim
+checkpoint1. No global install, reset/clean/delete, push, or commit.
+
+Coordinator independently reran239 tests and the actual packaging script,
+including both arm64 release products and strict ad-hoc signature validation.
+The permission section also refreshes when presented, so a hidden window that
+missed app activation does not retain an earlier display state. UI inspection
+timed out; request buttons, Settings navigation and installed permission
+revocation remain Not Verified. Local Manager packaging includes the preserved
+unrelated AboutView working-tree change and is not a clean-source release
+artifact. Native CI must build the committed tree before accepting its pin.
+
 ## Coordinator native authentication and expiry candidate, 16 October 2026
 
 Coordinator packaging passed **229 core tests plus 2 actual ManagerSession tests**,

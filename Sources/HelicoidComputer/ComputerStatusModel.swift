@@ -53,18 +53,59 @@ public final class ComputerStatusModel {
     public var helpRequestState: HelpRequestState
     public var isFixturesMode: Bool
 
+    // MARK: - Permission readiness
+    // Independent of connection, admission, and actual screen access.
+    // Grants alone never mark connected/observed/controlled or enable capture/media/input.
+    public private(set) var screenRecordingPermission: ComputerPermissionStatus = .unknown
+    public private(set) var accessibilityPermission: ComputerPermissionStatus = .unknown
+
+    private let permissionProbe: any ComputerPermissionProbing
+
     public init(
         connection: ConnectionState = .notConfigured,
         screenAccess: ScreenAccess = .none,
         helpRequestText: String = "",
         helpRequestState: HelpRequestState = .idle,
-        isFixturesMode: Bool = false
+        isFixturesMode: Bool = false,
+        permissionProbe: any ComputerPermissionProbing = NativeComputerPermissionProbe()
     ) {
         self.connection = connection
         self.screenAccess = screenAccess
         self.helpRequestText = helpRequestText
         self.helpRequestState = helpRequestState
         self.isFixturesMode = isFixturesMode
+        self.permissionProbe = permissionProbe
+    }
+
+    public func permissionStatus(for kind: ComputerPermissionKind) -> ComputerPermissionStatus {
+        switch kind {
+        case .screenRecording: screenRecordingPermission
+        case .accessibility: accessibilityPermission
+        }
+    }
+
+    /// Non-prompting refresh. Startup, status refresh, and app reactivation only.
+    /// A fresh native query replaces stale granted state after revoke.
+    public func refreshPermissions() {
+        screenRecordingPermission = permissionProbe.currentStatus(for: .screenRecording)
+        accessibilityPermission = permissionProbe.currentStatus(for: .accessibility)
+    }
+
+    /// Explicit user button only. May prompt.
+    /// Status stays unavailable until a fresh native query confirms.
+    public func requestPermission(_ kind: ComputerPermissionKind) {
+        permissionProbe.requestAccess(for: kind)
+        switch kind {
+        case .screenRecording:
+            screenRecordingPermission = permissionProbe.currentStatus(for: .screenRecording)
+        case .accessibility:
+            accessibilityPermission = permissionProbe.currentStatus(for: .accessibility)
+        }
+    }
+
+    /// Opens the exact System Settings privacy pane. Never prompts.
+    public func openPermissionSettings(_ kind: ComputerPermissionKind) {
+        permissionProbe.openSystemSettings(for: kind)
     }
 
     public var isHelpAvailable: Bool {
@@ -99,14 +140,18 @@ public enum HelpRequestState: String, Hashable, Sendable {
 }
 
 /// Development fixtures for the managed computer status UI.
+/// Permission facts here are synthetic and clearly labeled — never live TCC.
 public enum ComputerDevelopmentFixtures {
     public static func model() -> ComputerStatusModel {
-        ComputerStatusModel(
+        let model = ComputerStatusModel(
             connection: .connected,
             screenAccess: .observed(operators: ["Morgan"]),
             helpRequestText: "",
             helpRequestState: .idle,
-            isFixturesMode: true
+            isFixturesMode: true,
+            permissionProbe: ComputerFixturePermissionProbe()
         )
+        model.refreshPermissions()
+        return model
     }
 }

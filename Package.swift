@@ -46,5 +46,10 @@ let package = Package(
             dependencies: ["HelicoidManager", "HelicoidCore"],
             path: "Tests/HelicoidManagerTests"
         ),
+        .testTarget(
+            name: "HelicoidComputerTests",
+            dependencies: ["HelicoidComputer", "HelicoidCore"],
+            path: "Tests/HelicoidComputerTests"
+        ),
     ]
 )
