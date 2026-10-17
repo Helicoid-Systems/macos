@@ -1,4 +1,28 @@
+## M03 setup-style Computer Settings, 17 October 2026
+
+Computer Settings follows Manager setup's integrated transparent titlebar,
+without a separator, using the native window background and 600×400 layout.
+Two full-width cards use permission icons, actual status badges, Allow actions
+and gear shortcuts to the corresponding privacy pane. Explanations are in
+tooltips/accessibility hints; visible subtitles are limited to each permission's
+role. Permission checks, explicit requests, lifecycle refresh and admission are
+unchanged. The Computer-local chrome adapter saves/restores only its own window
+properties; SwiftUI owns sizing. Manager source and artwork are preserved.
+
+Coordinator checks passed all 239 tests/33 suites and the release Computer build
+using `/tmp/hs-finish-20261013/coordinator-macos-p01-build`. Strict ad-hoc bundle
+verification and ZIP CRC checks passed. Local Computer ZIP SHA256:
+`6125e1a9cda9432a39ec0e1dea9ca05a4fc8334498cf036d2c55494e2820ef56`.
+MiMo session `ses_ffe5eb431ab45ffebfsjjHYpca` exports 18 assistant records, all
+`xiaomi-token-plan-ams/mimo-v2.6-pro`, `high`, final `stop`. Coordinator review
+simplified size ownership, completed chrome restoration and refined controls.
+CLI checks do not establish onscreen appearance or permission-prompt acceptance.
+
 ## M02 compact Computer Settings, 17 October 2026
+
+Superseded visually by M03 after user feedback. Native CI39071731401 passed at
+`52c65d4183e473e438619c07403750ee77dca074`; build success did not establish visual
+acceptance.
 
 Settings now uses one content-sized permissions view, removing static product
 metadata, duplicate headings and the fixed 320-point height that put controls
