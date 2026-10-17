@@ -1,3 +1,25 @@
+## M01 native Computer menu, 17 October 2026
+
+Replaced the custom menu-bar window with a standard macOS menu. Connection
+and screen-access status remain visible; Open Status Window, Settings… (⌘,)
+and Quit (⌘Q) use native menu items. Help and disconnection reasons remain in
+the status window. Permission and admission behavior are unchanged.
+
+Coordinator verification: `xcrun swift test --scratch-path
+/tmp/hs-finish-20261013/coordinator-macos-p01-build` passed all 239 tests;
+`xcrun swift build -c release --product HelicoidComputer` with the same scratch
+path passed. The packaged arm64 Computer app passes strict ad-hoc signature
+verification. MiMo session `ses_ffe5eb48bd45bffeDY1Qeq5AIf` exports 21 assistant
+messages, all `xiaomi-token-plan-ams/mimo-v2.6-pro`, `high`, with final `stop`.
+
+The local Computer ZIP is
+`/tmp/hs-finish-20261013/coordinator-macos-menu-m01-dist/Helicoid Computer.zip`,
+SHA256 `107e79cc110c787d2ba17fd20e076b6d8c6923e2f9461e855ca1fc420f1e0b12`.
+Onscreen appearance and menu actions remain **Not Verified**: native UI
+inspection timed out for the running app and a separately identified review
+bundle. Developer ID signing/notarization and Intel runtime remain outstanding.
+The unrelated Manager AboutView change and supplied artwork were preserved.
+
 ## P01 Computer permission readiness prerequisite, 17 October 2026
 
 Owner `apps/macos` only. Engine/signaling/authority contracts frozen: no
