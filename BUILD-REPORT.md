@@ -1,3 +1,18 @@
+## M04 button contrast and gear removal, 17 October 2026
+
+Allow uses the standard bordered style with explicit `Color.primary` text,
+replacing the prominent style that showed poor inactive-window contrast in the
+user's screenshot. Removed both per-permission gear buttons. Permission request
+actions, cards, status labels and setup chrome are unchanged.
+
+Coordinator verification: all 239 tests/33 suites and the release Computer build
+passed after the final colour qualification. Strict ad-hoc signature and ZIP CRC
+checks passed; ZIP SHA256
+`bc5e47ec5bd63b3bb015d32d0a63dcc8bd913df19448fc1fc8785641c0e11908`.
+MiMo session `ses_ffe5eb422ea9cffeDWd1rOvFaQ`: 8 assistant records, all
+`xiaomi-token-plan-ams/mimo-v2.6-pro`, `high`, final `stop`. Inactive-window
+contrast after replacement remains subject to onscreen acceptance.
+
 ## M03 setup-style Computer Settings, 17 October 2026
 
 Computer Settings follows Manager setup's integrated transparent titlebar,

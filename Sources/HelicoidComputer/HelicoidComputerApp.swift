@@ -283,20 +283,15 @@ struct ComputerPermissionSection: View {
                 .accessibilityLabel("\(kind.title) status: \(status.label)")
 
             if !status.isAvailable {
-                Button("Allow…") {
+                Button {
                     model.requestPermission(kind)
+                } label: {
+                    Text("Allow…")
+                        .foregroundStyle(Color.primary)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.bordered)
                 .accessibilityLabel("Allow \(kind.title) permission")
             }
-
-            Button {
-                model.openPermissionSettings(kind)
-            } label: {
-                Image(systemName: "gearshape")
-            }
-            .help("Open System Settings for \(kind.title)")
-            .accessibilityLabel("Open System Settings for \(kind.title)")
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
