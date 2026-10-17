@@ -18,7 +18,7 @@ Independent native macOS 15 SwiftUI apps for Helicoid Systems computer monitorin
 | App | Role |
 | --- | --- |
 | **Helicoid Manager** | Operator console: connect, Computers inventory, inclusion/filter/selection, view-only remote window |
-| **Helicoid Computer** | Managed computer status: menu bar connection/observer identity, help requests, and Screen Recording / Accessibility permission readiness |
+| **Helicoid Computer** | Native menu with connection/screen-access status, Open Status Window, Settings and Quit. The status window contains help requests, connection details and permission readiness. |
 
 This tree builds without sibling path dependencies. The server HTTP contract is
 vendored under `Resources/Contracts/`. Brand assets are bundled copies under

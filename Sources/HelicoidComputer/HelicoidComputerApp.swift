@@ -27,7 +27,7 @@ struct HelicoidComputerApp: App {
             Image(systemName: menuSymbol)
                 .accessibilityLabel("Helicoid Computer status: \(model.connection.label)")
         }
-        .menuBarExtraStyle(.window)
+        .menuBarExtraStyle(.menu)
 
         Window("Helicoid Computer", id: "status") {
             StatusWindowView()
@@ -65,37 +65,39 @@ struct HelicoidComputerApp: App {
 struct StatusMenuContent: View {
     @Environment(ComputerStatusModel.self) private var model
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            LabeledContent("Connection", value: model.connection.label)
+        Section {
+            Text("Connection: \(model.connection.label)")
             Text(model.screenAccess.headline)
-                .font(.callout.weight(.medium))
+        }
 
-            if case .disconnected(let reason) = model.connection {
-                Text(reason)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        if model.isFixturesMode {
+            Section {
+                Text(DevelopmentFixtures.banner)
             }
+        }
 
-            Divider()
-
-            HelpRequestSection()
-
-            Divider()
-
+        Section {
             Button("Open Status Window") {
                 NSApp.activate(ignoringOtherApps: true)
                 openWindow(id: "status")
             }
 
+            Button("Settings…") {
+                NSApp.activate(ignoringOtherApps: true)
+                openSettings()
+            }
+            .keyboardShortcut(",", modifiers: .command)
+        }
+
+        Section {
             Button("Quit Helicoid Computer") {
                 NSApplication.shared.terminate(nil)
             }
+            .keyboardShortcut("q", modifiers: .command)
         }
-        .padding(12)
-        .frame(minWidth: 260)
-        .accessibilityElement(children: .contain)
     }
 }
 
@@ -150,6 +152,13 @@ struct StatusWindowView: View {
                 .font(.title2.weight(.semibold))
 
             LabeledContent("Connection", value: model.connection.label)
+
+            if case .disconnected(let reason) = model.connection {
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(reason)
+            }
 
             GroupBox {
                 VStack(alignment: .leading, spacing: 6) {
