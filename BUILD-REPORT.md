@@ -1,3 +1,25 @@
+## M02 compact Computer Settings, 17 October 2026
+
+Settings now uses one content-sized permissions view, removing static product
+metadata, duplicate headings and the fixed 320-point height that put controls
+below the fold. Rows retain actual statuses, explicit permission requests and
+System Settings navigation, with shorter copy/actions and specific accessible
+button labels. Permission probing, admission and the M01 menu are unchanged.
+
+Coordinator checks: all 239 tests/33 suites passed with
+`xcrun swift test --scratch-path /tmp/hs-finish-20261013/coordinator-macos-p01-build`;
+the release `HelicoidComputer` product built using the same cache. The normal
+`Helicoid Computer` arm64 bundle passes strict ad-hoc signature verification.
+ZIP SHA256 `e145a2db281734649201248af28985f6df7f011f2193233dc2187e77c42ac441`:
+`/tmp/hs-finish-20261013/coordinator-macos-settings-m02-dist/Helicoid Computer.zip`.
+The package uses the normal product identity, with no Menu Review title.
+
+MiMo session `ses_ffe5eb438d481ffezt6lm3oUcI` exports 11 assistant records, all
+`xiaomi-token-plan-ams/mimo-v2.6-pro`, `high`, final `stop`. Coordinator review
+added the vertical content-size constraint and simplified the shared copy.
+Onscreen sizing/actions remain **Not Verified**: CUA inspection timed out.
+No permission prompts or capture/input ran. AboutView and artwork are preserved.
+
 ## M01 native Computer menu, 17 October 2026
 
 Replaced the custom menu-bar window with a standard macOS menu. Connection

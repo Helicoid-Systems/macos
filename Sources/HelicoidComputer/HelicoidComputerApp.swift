@@ -217,17 +217,8 @@ struct ComputerSettingsView: View {
     @Environment(ComputerStatusModel.self) private var model
 
     var body: some View {
-        Form {
-            LabeledContent("Product", value: "Helicoid")
-            LabeledContent("Company", value: "Helicoid Systems")
-            LabeledContent("Role", value: "Helicoid Computer")
-            Text("This app reports connection and screen-access status for a monitored computer. It does not grant operators access by itself.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Section("Permissions") {
-                ComputerPermissionSection()
-            }
+        VStack(alignment: .leading, spacing: 12) {
+            ComputerPermissionSection()
 
             if model.isFixturesMode {
                 Text(ComputerFixturePermissionProbe.banner)
@@ -235,8 +226,9 @@ struct ComputerSettingsView: View {
                     .foregroundStyle(.orange)
             }
         }
-        .formStyle(.grouped)
-        .frame(width: 420, height: 320)
+        .padding(20)
+        .frame(width: 480)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -246,16 +238,15 @@ struct ComputerPermissionSection: View {
     @Environment(ComputerStatusModel.self) private var model
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 16) {
             Text("Permissions")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .font(.headline)
 
             ForEach(ComputerPermissionKind.allCases, id: \.self) { kind in
                 permissionRow(kind)
             }
 
-            Text("Grants alone do not connect, share, or control this computer.")
+            Text("Permissions alone do not start sharing or control.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -271,18 +262,28 @@ struct ComputerPermissionSection: View {
             LabeledContent(kind.title, value: status.label)
                 .accessibilityLabel("\(kind.title): \(status.label)")
 
-            Text(kind.purpose)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Group {
+                switch kind {
+                case .screenRecording:
+                    Text("Allows authorized operators to view this screen.")
+                case .accessibility:
+                    Text("Allows authorized keyboard and mouse control.")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
 
             if !status.isAvailable {
                 HStack(spacing: 8) {
-                    Button("Request \(kind.title)…") {
+                    Button("Allow…") {
                         model.requestPermission(kind)
                     }
-                    Button("Open Settings") {
+                    .accessibilityLabel("Allow \(kind.title) permission")
+
+                    Button("System Settings…") {
                         model.openPermissionSettings(kind)
                     }
+                    .accessibilityLabel("Open System Settings for \(kind.title)")
                 }
                 .controlSize(.small)
             }
