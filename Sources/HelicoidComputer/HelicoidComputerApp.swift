@@ -226,9 +226,11 @@ struct ComputerSettingsView: View {
                     .foregroundStyle(.orange)
             }
         }
-        .padding(20)
-        .frame(width: 480)
-        .fixedSize(horizontal: false, vertical: true)
+        .padding(.horizontal, 24)
+        .padding(.top, 36)
+        .padding(.bottom, 20)
+        .frame(width: 600, height: 400)
+        .background(ComputerSettingsWindowChrome())
     }
 }
 
@@ -238,17 +240,14 @@ struct ComputerPermissionSection: View {
     @Environment(ComputerStatusModel.self) private var model
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Permissions")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Permissions", systemImage: "lock.shield")
+                .font(.title2.weight(.semibold))
+                .help("Permissions alone do not connect, share, or control this computer.")
 
             ForEach(ComputerPermissionKind.allCases, id: \.self) { kind in
                 permissionRow(kind)
             }
-
-            Text("Permissions alone do not start sharing or control.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
         .task {
             model.refreshPermissions()
@@ -258,35 +257,74 @@ struct ComputerPermissionSection: View {
     @ViewBuilder
     private func permissionRow(_ kind: ComputerPermissionKind) -> some View {
         let status = model.permissionStatus(for: kind)
-        VStack(alignment: .leading, spacing: 4) {
-            LabeledContent(kind.title, value: status.label)
-                .accessibilityLabel("\(kind.title): \(status.label)")
+        HStack(spacing: 12) {
+            Image(systemName: symbolName(for: kind))
+                .font(.title2)
+                .foregroundStyle(.secondary)
+                .frame(width: 28)
+                .accessibilityHidden(true)
 
-            Group {
-                switch kind {
-                case .screenRecording:
-                    Text("Allows authorized operators to view this screen.")
-                case .accessibility:
-                    Text("Allows authorized keyboard and mouse control.")
-                }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(kind.title)
+                    .fontWeight(.medium)
+                Text(roleSubtitle(for: kind))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+
+            Spacer(minLength: 8)
+
+            Label(status.label, systemImage: statusSymbol(status))
+                .font(.caption.weight(.medium))
+                .foregroundStyle(status == .granted ? Color.green : Color.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.quaternary, in: Capsule())
+                .accessibilityLabel("\(kind.title) status: \(status.label)")
 
             if !status.isAvailable {
-                HStack(spacing: 8) {
-                    Button("Allow…") {
-                        model.requestPermission(kind)
-                    }
-                    .accessibilityLabel("Allow \(kind.title) permission")
-
-                    Button("System Settings…") {
-                        model.openPermissionSettings(kind)
-                    }
-                    .accessibilityLabel("Open System Settings for \(kind.title)")
+                Button("Allow…") {
+                    model.requestPermission(kind)
                 }
-                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+                .accessibilityLabel("Allow \(kind.title) permission")
             }
+
+            Button {
+                model.openPermissionSettings(kind)
+            } label: {
+                Image(systemName: "gearshape")
+            }
+            .help("Open System Settings for \(kind.title)")
+            .accessibilityLabel("Open System Settings for \(kind.title)")
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
+        .help(kind.purpose)
+        .accessibilityHint(kind.purpose)
+    }
+
+    private func symbolName(for kind: ComputerPermissionKind) -> String {
+        switch kind {
+        case .screenRecording: "rectangle.on.rectangle"
+        case .accessibility: "cursorarrow"
         }
     }
+
+    private func roleSubtitle(for kind: ComputerPermissionKind) -> String {
+        switch kind {
+        case .screenRecording: "View screen"
+        case .accessibility: "Keyboard and mouse"
+        }
+    }
+
+    private func statusSymbol(_ status: ComputerPermissionStatus) -> String {
+        switch status {
+        case .granted: "checkmark.circle.fill"
+        case .missing: "xmark.circle"
+        case .unknown: "questionmark.circle"
+        }
+    }
+
 }
