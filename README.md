@@ -191,6 +191,12 @@ challenge or re-install inventory after sign-out.
 
 ## Computer permission readiness (P01, 17 October 2026)
 
+[CI39063635258](https://github.com/Helicoid-Systems/macos/actions/runs/39063635258)
+passes239 tests, both release packages and Intel cross-build. The downloaded
+[Apple Silicon development apps](https://github.com/Helicoid-Systems/macos/actions/runs/39063635258/artifacts/12112082811)
+are archive-hash, architecture and ad-hoc signature verified. Installed
+permission behavior and full worker/capture/input acceptance remain Not Verified.
+
 Helicoid Computer reports **current-process** Screen Recording and
 Accessibility permission status using installed SDK APIs only
 (`CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted`). No shell, TCC

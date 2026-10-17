@@ -43,7 +43,15 @@ missed app activation does not retain an earlier display state. UI inspection
 timed out; request buttons, Settings navigation and installed permission
 revocation remain Not Verified. Local Manager packaging includes the preserved
 unrelated AboutView working-tree change and is not a clean-source release
-artifact. Native CI must build the committed tree before accepting its pin.
+artifact. Clean-source [CI39063635258](https://github.com/Helicoid-Systems/macos/actions/runs/39063635258)
+passes239 tests, both release packages and Intel source compatibility at
+`d9941eb44db11fbd5e3f0ed275df522cee88df3e`. The coordinator downloaded
+[artifact12112082811](https://github.com/Helicoid-Systems/macos/actions/runs/39063635258/artifacts/12112082811):
+outer SHA256 `a7b40f723488b9d97bfaf315f638be825c2db354ac3c97d0caf7520b944f9aa9`
+matches GitHub; both inner ZIP CRC checks, arm64 architectures and strict
+ad-hoc signatures pass. These clean-source binaries exclude the unrelated
+AboutView edit. Installed UI/permission revocation, Intel runtime and the
+complete worker/admission checkpoint remain Not Verified.
 
 ## Coordinator native authentication and expiry candidate, 16 October 2026
 
