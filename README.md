@@ -18,7 +18,7 @@ Independent native macOS 15 SwiftUI apps for Helicoid Systems computer monitorin
 | App | Role |
 | --- | --- |
 | **Helicoid Manager** | Operator console: connect, Computers inventory, inclusion/filter/selection, view-only remote window |
-| **Helicoid Computer** | Managed computer status: menu bar connection/observer identity and help requests |
+| **Helicoid Computer** | Managed computer status: menu bar connection/observer identity, help requests, and Screen Recording / Accessibility permission readiness |
 
 This tree builds without sibling path dependencies. The server HTTP contract is
 vendored under `Resources/Contracts/`. Brand assets are bundled copies under
@@ -78,8 +78,9 @@ Fixture mode and development-server mode are independent and must not be conflat
 
 - `Sources/HelicoidCore` — models, monitoring state, connection boundary, loopback development client, DTOs
 - `Sources/HelicoidManager` — SwiftUI manager app
-- `Sources/HelicoidComputer` — SwiftUI menu-bar status app
+- `Sources/HelicoidComputer` — SwiftUI menu-bar status app with permission readiness
 - `Tests/HelicoidCoreTests` — pure Swift and HTTP parsing/denial tests
+- `Tests/HelicoidComputerTests` — permission lifecycle/policy tests via injected probe seam
 
 ### Connection boundary
 
@@ -187,6 +188,32 @@ against the built Rust server remains a coordinator gate.
 `AuthSignInCoordinator` owns causal generation fencing for sign-in, required
 code, inventory, and sign-out so stale completions cannot clear a newer
 challenge or re-install inventory after sign-out.
+
+## Computer permission readiness (P01, 17 October 2026)
+
+Helicoid Computer reports **current-process** Screen Recording and
+Accessibility permission status using installed SDK APIs only
+(`CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted`). No shell, TCC
+database inspection, private APIs, or capture/input.
+
+- Query without prompting on startup, when permission status is presented,
+  and on app reactivation.
+- `unknown` is treated as unavailable; a fresh query replaces stale granted
+  after revoke.
+- Permission readiness stays separate from connection, admission, and actual
+  screen access. Grants alone never mark connected/observed/controlled or
+  enable capture/media/input.
+- Explicit **Request…** buttons may prompt; **Open Settings** opens the exact
+  System Settings privacy pane. Status stays unavailable until a fresh native
+  query confirms.
+- Development fixtures use a clearly labeled synthetic probe and never supply
+  live permission facts.
+
+Lifecycle/policy tests inject a scripted probe seam. An actual read-only
+native preflight is separate labeled evidence, not fixture runtime proof.
+
+Full ScreenCaptureKit worker, authenticated supervisor, disclosure, and input
+remain unfinished and do not claim checkpoint1.
 
 ## Pinned HTTPS prerequisite (11 October 2026)
 
