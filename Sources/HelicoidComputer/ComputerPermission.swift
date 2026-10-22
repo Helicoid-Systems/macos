@@ -34,7 +34,7 @@ public enum ComputerPermissionStatus: String, Hashable, Sendable {
     case unknown
 
     /// Only a confirmed grant is available. Unknown is unavailable.
-    public var isAvailable: Bool {
+    public nonisolated var isAvailable: Bool {
         self == .granted
     }
 
@@ -53,7 +53,7 @@ public enum ComputerPermissionStatus: String, Hashable, Sendable {
 /// `requestAccess` may prompt and must only run from an explicit user button.
 /// `openSystemSettings` opens the exact privacy pane without prompting.
 public protocol ComputerPermissionProbing: Sendable {
-    func currentStatus(for kind: ComputerPermissionKind) -> ComputerPermissionStatus
+    nonisolated func currentStatus(for kind: ComputerPermissionKind) -> ComputerPermissionStatus
     func requestAccess(for kind: ComputerPermissionKind)
     func openSystemSettings(for kind: ComputerPermissionKind)
 }
@@ -63,7 +63,7 @@ public protocol ComputerPermissionProbing: Sendable {
 public struct NativeComputerPermissionProbe: ComputerPermissionProbing {
     public init() {}
 
-    public func currentStatus(for kind: ComputerPermissionKind) -> ComputerPermissionStatus {
+    public nonisolated func currentStatus(for kind: ComputerPermissionKind) -> ComputerPermissionStatus {
         switch kind {
         case .screenRecording:
             // CGPreflightScreenCaptureAccess does not prompt.
@@ -110,7 +110,7 @@ public struct ComputerFixturePermissionProbe: ComputerPermissionProbing {
 
     public init() {}
 
-    public func currentStatus(for kind: ComputerPermissionKind) -> ComputerPermissionStatus {
+    public nonisolated func currentStatus(for kind: ComputerPermissionKind) -> ComputerPermissionStatus {
         // Synthetic fixture values only; UI must show the fixtures banner.
         .missing
     }
