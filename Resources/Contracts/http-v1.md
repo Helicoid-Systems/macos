@@ -72,14 +72,14 @@ Unauthenticated liveness + authority readiness.
   "status": "ok",
   "accepting_authorized_operations": true,
   "schema_version": 1,
-  "storage_schema_version": 2,
+  "storage_schema_version": 15,
   "bootstrap_completed": true,
   "features": {
     "local_accounts": true,
     "manager_enrollment": true,
     "scoped_inventory": true,
     "mfa": true,
-    "file_jobs": false,
+    "file_jobs": true,
     "security_recovery": false,
     "remote_control": false,
     "screen_observation": false
@@ -92,7 +92,7 @@ Unauthenticated liveness + authority readiness.
 | Field | Meaning | Value |
 | --- | --- | --- |
 | `schema_version` | **v1 HTTP wire contract version** | frozen at **1** — existing native clients assert `== 1`; do not change |
-| `storage_schema_version` | database storage schema version | tracks `db::SCHEMA_VERSION` (currently **2**) |
+| `storage_schema_version` | database storage schema version | tracks `db::SCHEMA_VERSION` (currently **15**) |
 
 Wire compatibility is explicit: v1 clients keep validating `schema_version == 1`.
 Storage upgrades are independent and never alter the wire contract version.
