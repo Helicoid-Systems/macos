@@ -72,12 +72,34 @@ struct SSHSetupTests {
         #expect(parsed.checks()["Product ports"] != .passed)
     }
 
+    @Test func hostChecksMatchSupportedUbuntuInstallerReleases() throws {
+        for release in ["24.04", "26.04"] {
+            let json = String(decoding: facts, as: UTF8.self)
+                .replacingOccurrences(of: "\"os_version\":\"26.04\"", with: "\"os_version\":\"\(release)\"")
+            let parsed = try JSONDecoder().decode(SSHHostPreflight.self, from: Data(json.utf8))
+            #expect(parsed.checks()["Operating system"] == .passed)
+        }
+        let unsupported = String(decoding: facts, as: UTF8.self)
+            .replacingOccurrences(of: "\"os_version\":\"26.04\"", with: "\"os_version\":\"22.04\"")
+        let parsed = try JSONDecoder().decode(SSHHostPreflight.self, from: Data(unsupported.utf8))
+        #expect(parsed.checks()["Operating system"] != .passed)
+    }
+
     @Test func realProcessCapturesExitAndBothPipes() async throws {
         let result = try await SystemSetupCommandRunner().run(SetupCommand(
             executable: "/bin/sh", arguments: ["-c", "printf actual; printf diagnostic >&2; exit 7"]))
         #expect(result.exitStatus == 7)
         #expect(String(decoding: result.output, as: UTF8.self) == "actual")
         #expect(String(decoding: result.errorOutput, as: UTF8.self) == "diagnostic")
+    }
+
+    @Test func unrelatedLegacyListenersDoNotBlockAuthorityHosting() throws {
+        let occupied = String(decoding: facts, as: UTF8.self)
+            .replacingOccurrences(of: "[22,80,443]", with: "[22,80,443,21115,21116,21117]")
+            .replacingOccurrences(of: "[53]", with: "[53,21116]")
+        let parsed = try JSONDecoder().decode(SSHHostPreflight.self, from: Data(occupied.utf8))
+        #expect(parsed.checks()["Product ports"] == .passed)
+        #expect(parsed.checks(authorityPort: 21115)["Product ports"] != .passed)
     }
 
     @Test func realOutputFloodIsBounded() async {

@@ -151,7 +151,15 @@ public struct OverviewScope: Hashable, Sendable {
     ) {
         let includedSet = inclusion.includedIDs(from: authorizedInventory.map(\.id))
         self.includedIDs = authorizedInventory.map(\.id).filter { includedSet.contains($0) }
-        self.computers = authorizedInventory.filter { includedSet.contains($0.id) && filter.matches($0) }
+        // Stable natural name order with ID tie-break so range selection matches the grid/list.
+        let matched = authorizedInventory.filter { includedSet.contains($0.id) && filter.matches($0) }
+        self.computers = matched.sorted { lhs, rhs in
+            let nameOrder = lhs.name.localizedStandardCompare(rhs.name)
+            if nameOrder != .orderedSame {
+                return nameOrder == .orderedAscending
+            }
+            return lhs.id.rawValue < rhs.id.rawValue
+        }
         self.displayedIDs = computers.map(\.id)
     }
 

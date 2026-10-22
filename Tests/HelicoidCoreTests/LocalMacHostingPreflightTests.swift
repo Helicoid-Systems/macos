@@ -93,6 +93,13 @@ private func facts(
 
 @Suite("Local Mac hosting preflight")
 struct LocalMacHostingPreflightTests {
+    @Test("Unrelated listeners do not reserve the retired engine ports")
+    func unrelatedLegacyListenersDoNotBlockAuthorityHosting() {
+        let host = facts(listeners: .complete(tcpPorts: [80, 443, 21115, 21116, 21117], udpPorts: [21116]))
+        #expect(host.checks()["Product ports"] == .passed)
+        #expect(host.checks(authorityPort: 21115)["Product ports"] != .passed)
+    }
+
     @Test("Healthy facts pass every required local check")
     func healthyChecksPass() throws {
         try healthyFacts.validate()
@@ -467,21 +474,14 @@ struct LocalMacHostingPreflightTests {
         for name in GuidedServerSetupModel.requiredLocalChecks {
             #expect(model.hostChecks[name] == .passed)
         }
-        model.setNetworkAddress("192.168.1.20")
-        model.advance()
-        model.setDeploymentName("HQ Lab")
-        model.advance()
-        model.setAdministratorUsername("admin")
-        model.advance()
-        model.setStoragePath(LocalHostingOwnershipPlan.current.dataPath)
-        model.advance()
-        #expect(model.phase == .storage)
-        model.advance()
-        #expect(model.phase == .review)
-        let review = model.reviewChanges()
-        #expect(review.contains { $0.contains("not applied") })
+        // Accepted gate: without a verified package there is no network/admin/storage/review walk.
         model.advance()
         #expect(model.phase == .install)
+        #expect(model.phase != .network)
+        #expect(model.phase != .administrator)
+        #expect(model.phase != .storage)
+        #expect(model.phase != .review)
+        #expect(model.administratorUsername.isEmpty)
         if case .refused(let reason) = model.installProgress {
             #expect(reason.contains("not performed"))
         } else {

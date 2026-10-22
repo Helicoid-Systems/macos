@@ -27,7 +27,7 @@ public struct ManagerLaunchConfiguration: Sendable, Equatable {
     /// Parse argv. Development server is enabled only with the explicit flag.
     public static func parse(arguments: [String]) -> ManagerLaunchConfiguration {
         var config = ManagerLaunchConfiguration()
-        config.useSourceFixtures = DevelopmentFixtures.isRequested(arguments: arguments)
+        config.useSourceFixtures = arguments.contains("--development-fixtures")
 
         var index = 0
         while index < arguments.count {

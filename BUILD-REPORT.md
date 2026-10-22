@@ -464,3 +464,22 @@ expiry; stale expiry/401 cannot clear a replacement.
 `xcrun swift test` → **224 tests / 30 suites passed**. Packaged build with
 `HELICOID_FORCE_ICON_FALLBACK=1` succeeded. Report:
 `/tmp/hs-finish-20261013/macos-session-expiry-report.md`.
+
+### Retained Computer macOS 13 compile (22 October 2026)
+
+The separate `Sources/Package.swift` Computer target compiled and linked for
+`arm64-apple-macosx13.0` with the installed Swift 6.4 toolchain:
+
+```
+xcrun swift build --disable-sandbox --configuration debug \
+  --scratch-path /private/tmp/helicoid-macos13-debug-build \
+  --package-path Sources --triple arm64-apple-macosx13.0 \
+  --product HelicoidComputer
+# Build complete! (11.14 secs)
+```
+
+No tests or app packaging were run. A release build compiled and linked the
+product but failed at `dsymutil` because the sandbox denied `.dSYM` creation;
+that release result is not counted as a pass. This compile establishes source
+and link compatibility for the declared arm64 macOS 13 target only, not
+installed behavior, capture permission, or preview/control acceptance.

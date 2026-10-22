@@ -37,6 +37,13 @@ jobs:
         run: |
           xcrun swift build -c release --package-path .
 
+      - name: Build Computer for macOS 13
+        run: |
+          xcrun swift build -c release --package-path Sources \
+            --scratch-path .build/computer-macos13 \
+            --triple "$(uname -m)-apple-macosx13.0" \
+            --product HelicoidComputer
+
       - name: Package apps
         run: |
           ./scripts/build.sh
@@ -78,3 +85,7 @@ jobs:
       - name: Build for x86_64 (source compatibility)
         run: |
           xcrun swift build -c release --arch x86_64 --package-path .
+          xcrun swift build -c release --package-path Sources \
+            --scratch-path .build/computer-intel-macos13 \
+            --triple x86_64-apple-macosx13.0 \
+            --product HelicoidComputer

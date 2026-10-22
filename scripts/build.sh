@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build and package Helicoid Manager and Helicoid Computer.
+# Build and package the legacy Helicoid Manager and retained Computer app.
 # Independent of sibling repositories: only reads under apps/macos.
 set -euo pipefail
 
@@ -25,7 +25,28 @@ xcrun swift build \
   --scratch-path "$BUILD_DIR" \
   --package-path "$ROOT"
 
-BIN="$BUILD_DIR/release"
+MANAGER_BIN="$(xcrun swift build \
+  --configuration release \
+  --show-bin-path \
+  --scratch-path "$BUILD_DIR" \
+  --package-path "$ROOT")"
+COMPUTER_BUILD_DIR="$BUILD_DIR/computer-macos13"
+HOST_ARCH="$(uname -m)"
+echo "== swift build (Computer, macOS 13 deployment target) =="
+xcrun swift build \
+  -c release \
+  --scratch-path "$COMPUTER_BUILD_DIR" \
+  --package-path "$ROOT/Sources" \
+  --triple "$HOST_ARCH-apple-macosx13.0" \
+  --product HelicoidComputer
+
+COMPUTER_BIN="$(xcrun swift build \
+  --configuration release \
+  --show-bin-path \
+  --scratch-path "$COMPUTER_BUILD_DIR" \
+  --package-path "$ROOT/Sources" \
+  --triple "$HOST_ARCH-apple-macosx13.0" \
+  --product HelicoidComputer)"
 mkdir -p "$DIST_DIR"
 
 package_app() {
@@ -33,11 +54,13 @@ package_app() {
   local binary="$2"
   local bundle_id="$3"
   local icon_source="$4"
+  local binary_dir="$5"
+  local minimum_system_version="$6"
   local app="$DIST_DIR/$name.app"
 
   echo "== Packaging $name =="
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-  cp "$BIN/$binary" "$app/Contents/MacOS/$binary"
+  cp "$binary_dir/$binary" "$app/Contents/MacOS/$binary"
   chmod +x "$app/Contents/MacOS/$binary"
 
   cat > "$app/Contents/Info.plist" <<PLIST
@@ -60,7 +83,7 @@ package_app() {
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
-  <string>15.0</string>
+  <string>$minimum_system_version</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
   <key>LSApplicationCategoryType</key>
@@ -72,7 +95,7 @@ package_app() {
 PLIST
 
   # Keep the independent SwiftPM resource bundle available inside the app.
-  local resource_bundle="$BIN/HelicoidMac_${binary}.bundle"
+  local resource_bundle="$binary_dir/HelicoidMac_${binary}.bundle"
   if [ -d "$resource_bundle" ]; then
     cp -R "$resource_bundle" "$app/Contents/Resources/"
   fi
@@ -87,7 +110,7 @@ PLIST
     if xcrun actool "$icon_dir" \
         --compile "$icon_out" \
         --platform macosx \
-        --minimum-deployment-target 15.0 \
+        --minimum-deployment-target "$minimum_system_version" \
         --target-device mac \
         --app-icon "$icon_name" \
         --output-partial-info-plist "$icon_out/Info.plist" \
@@ -130,10 +153,12 @@ PLIST
 # Working identifiers only — durable release package IDs await B01.
 package_app "Helicoid Manager" "HelicoidManager" \
   "systems.helicoid.manager.dev" \
-  "HS Manager App icon.icon"
+  "HS Manager App icon.icon" \
+  "$MANAGER_BIN" "15.0"
 
 package_app "Helicoid Computer" "HelicoidComputer" \
   "systems.helicoid.computer.dev" \
-  "HS App icon.icon"
+  "HS App icon.icon" \
+  "$COMPUTER_BIN" "13.0"
 
 echo "== Done. Apps in $DIST_DIR =="

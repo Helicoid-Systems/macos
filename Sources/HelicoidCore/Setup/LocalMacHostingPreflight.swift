@@ -146,7 +146,7 @@ public struct LocalHostPreflight: Equatable, Sendable {
 
     public func checks(authorityPort: UInt16 = 8920,
                        plan: LocalHostingOwnershipPlan = .current) -> [String: HostCheckStatus] {
-        let tcpRequired: Set<UInt16> = [authorityPort, 21115, 21116, 21117]
+        let tcpRequired: Set<UInt16> = [authorityPort]
         return [
             "Operating system": Self.isSupported(osVersion: osVersion, architecture: architecture)
                 ? .passed : .needsAttention(detail: "This build supports macOS 15 or newer on Apple silicon or Intel."),
@@ -192,8 +192,8 @@ public struct LocalHostPreflight: Equatable, Sendable {
 
     private func productPortsCheck(tcpRequired: Set<UInt16>) -> HostCheckStatus {
         switch listeners {
-        case .complete(let tcp, let udp):
-            let conflict = !tcpRequired.isDisjoint(with: tcp) || udp.contains(21116)
+        case .complete(let tcp, _):
+            let conflict = !tcpRequired.isDisjoint(with: tcp)
             return conflict
                 ? .needsAttention(detail: "A selected Helicoid port is occupied.")
                 : .passed

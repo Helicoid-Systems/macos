@@ -13,12 +13,14 @@ operation stays unavailable when no trusted configuration is supplied. Live
 capture/control and the worker/admission checkpoint remain incomplete. Earlier
 14 October billing and failed-candidate records are historical.
 
-Independent native macOS 15 SwiftUI apps for Helicoid Systems computer monitoring.
+Native SwiftUI apps for Helicoid Systems computer monitoring. The retained
+Computer status app targets macOS 13 and newer; the legacy Manager remains at
+macOS 15 while the shared Qt Manager replacement is built.
 
 | App | Role |
 | --- | --- |
 | **Helicoid Manager** | Operator console: connect, Computers inventory, inclusion/filter/selection, view-only remote window |
-| **Helicoid Computer** | Native menu with connection/screen-access status, Open Status Window, Settings and Quit. The status window contains help requests, connection details and permission readiness. |
+| **Helicoid Computer** | Native menu with connection/screen-access status, Open Status Window, Settings and Quit. The status window shows connection, screen-access identity, and real permission details. Help stays hidden in normal builds until a real transport exists. |
 
 This tree builds without sibling path dependencies. The server HTTP contract is
 vendored under `Resources/Contracts/`. Brand assets are bundled copies under
@@ -26,7 +28,8 @@ vendored under `Resources/Contracts/`. Brand assets are bundled copies under
 
 ## Requirements
 
-- macOS 15 or newer
+- Helicoid Computer: macOS 13 or newer
+- Legacy Helicoid Manager: macOS 15 or newer
 - Xcode 27 / Swift 6.4 toolchain (`xcrun swift`)
 - Intel and Apple Silicon source compatibility
 
@@ -41,8 +44,11 @@ Optional environment:
 - `HELICOID_BUILD_DIR` — scratch build directory (default `apps/macos/.build`)
 - `HELICOID_DIST_DIR` — packaged `.app` output (default `apps/macos/dist`)
 
-The script runs `swift test`, `swift build -c release`, packages both apps, and
-compiles bundled `.icon` sources with `actool` into `Assets.car` / `.icns`.
+The script runs the existing Swift tests and macOS 15 package build, builds
+Helicoid Computer from `Sources/Package.swift` with a macOS 13 deployment
+target, packages both apps, and compiles bundled `.icon` sources with `actool`
+into `Assets.car` / `.icns`. The macOS 13 package excludes the three legacy
+Manager-only core files that use newer Observation APIs.
 
 ## Launch modes
 
@@ -209,9 +215,11 @@ database inspection, private APIs, or capture/input.
 - Permission readiness stays separate from connection, admission, and actual
   screen access. Grants alone never mark connected/observed/controlled or
   enable capture/media/input.
-- Explicit **Request…** buttons may prompt; **Open Settings** opens the exact
-  System Settings privacy pane. Status stays unavailable until a fresh native
-  query confirms.
+- A single **Allow** action may prompt once per permission kind. After an
+  explicit unsuccessful request the row offers **Open Settings** for the exact
+  System Settings privacy pane and never prompts again. Status stays
+  unavailable until a fresh native query confirms; a grant is never inferred
+  from requesting.
 - Development fixtures use a clearly labeled synthetic probe and never supply
   live permission facts.
 
@@ -221,6 +229,52 @@ native preflight is separate labeled evidence, not fixture runtime proof.
 Full ScreenCaptureKit worker, authenticated supervisor, disclosure, and input
 remain unfinished and do not claim checkpoint1.
 
+## Endpoint invitation redemption
+
+Helicoid Computer Settings includes a user-driven Server Enrollment form. It
+accepts the HTTPS origin plus the deployment ID, invitation ID, and one-time
+code shown by an enrollment Manager. It creates an Ed25519 endpoint identity,
+keeps the signing key in the macOS Keychain, signs the server contract's
+deployment/invitation/code-hash-bound proof, and clears the code after the
+server confirms enrollment. The code is never persisted by this client.
+
+A successful response is shown as **Waiting for administrator approval** with
+the returned computer ID. This API call does not establish a persistent server
+connection or enable capture, observation, input, or media. The receiver checks
+`/health` and stops before endpoint authentication unless the deployment
+advertises `features.file_jobs=true`. The current server source advertises
+`true` and mounts the authenticated v2 delivery routes; installed delivery
+remains unbuilt and unverified. The source path verifies
+chunk hashes and the whole-file size and digest, then atomically saves without
+overwriting into `~/Library/Application Support/Helicoid/Computer/Received Files`.
+The server origin is retained with the Keychain identity. The origin must
+present a certificate trusted by macOS; for a private CA, install the approved
+CA before enrollment. D29's verified local-user binding and same-user commit
+check now use the signed-in console user's stable macOS UID. The server binds
+new targets to that identity, and the client rechecks it during transfer and
+before publishing into that user's private folder. When the process no longer
+matches an eligible console user, it replaces the prior endpoint session with
+an unbound session when the Keychain is available; that session cannot access
+file jobs. Endpoint sessions sign the OS account display label along with the
+stable UID; the Manager uses a fresh session preflight to show the account and
+computer in the confirmation, and creation is bound to that exact session ID.
+
+The Computer Settings window now lets the signed-in user refresh requests for
+this enrolled computer, review each request's instructions and limits, and
+choose files through the native file importer. Selected files are opened
+without following a final symbolic link, size-checked and hashed in bounded
+chunks, then uploaded only after explicit user selection. The client checks the
+signed local UID before each chunk, resumes a matching partial submission, and
+requires an explicit confirmation naming the prior submission ID before
+replacement. The server verifies the complete manifest and SHA-256 before
+marking a submission Received. These request APIs use authenticated v2 routes
+independently of the `file_jobs` delivery feature. The server now advertises
+`file_jobs=true` and mounts the recipient-bound delivery routes; this source
+path is not an accepted workflow until platform builds and runtime evidence
+confirm it. The Swift package builds, but
+request interaction, real-server transfer, and installed-device acceptance
+remain unverified. Screen viewing and control are not enabled.
+
 ## Pinned HTTPS prerequisite (11 October 2026)
 
 `DeploymentTLSIdentity` accepts an independently supplied deployment CA and SHA-256 pin. `PinnedHTTPSTransport` uses native Security hostname, chain, validity and server-authentication checks with that sole anchor, TLS1.2 minimum, no redirects or online CA fetch, and bounded streaming/cancellation. Invalid trust, body bounds and operation deadlines fail closed. Deployment trust adoption and production sign-in remain unavailable.
@@ -228,3 +282,9 @@ remain unfinished and do not claim checkpoint1.
 The coordinator passed **186 Swift tests in 27 suites**, including genuine TLS sockets and actual local command cleanup. The POSIX runner owns one child and one reaper; timeout, cancellation, input failure and output overflow confirm child cleanup before returning. Successful output is retained through EOF, and inherited writers remain subject to the original deadline. Certificate generation runs on one dedicated test worker; awaiting test tasks suspend instead of blocking on generation locks. Real certificates, strict trust rules, concurrent tests and the original one-second SSH assertions remain intact.
 
 Native [CI 38167550626](https://github.com/Helicoid-Systems/macos/actions/runs/38167550626) passes at `7bf00ac9ce6b03f47f66539a913136451abe55fd`: all 186 tests pass in both Test and Package apps, release packaging and Intel cross-build pass. The coordinator verified both downloaded ZIP archives and strict ad-hoc bundle signatures from the [Apple Silicon development apps](https://github.com/Helicoid-Systems/macos/actions/runs/38167550626/artifacts/11711859570), including arm64 architecture and minimum macOS 15.0. Developer ID/notarization, Intel runtime, production trust adoption, installed worker capture/input and preview/control remain **Not Verified**.
+
+## Native UI checkpoint — 20 October 2026
+
+The current source adds compact permission/status windows, four overview density presets, session-owned Grid/List preferences, native mixed inclusion checkboxes, and independent generation-scoped view-only windows. Connection, sign-in, setup and About use compact native composition. Unsupported tools remain hidden, installation stops before administrator collection, and normal connection still requires the missing verified-profile adoption flow.
+
+Coordinator verification passed 233 Core, 18 Manager and 14 Computer tests, release packaging with the verified supplied-artwork fallback, and strict ad-hoc bundle signature checks. Both apps also cross-compile for x86_64 with a macOS 15 minimum. Packaged normal Connect/setup/About and permission accessibility were inspected; full visual/keyboard/accessibility acceptance, permission prompting/revocation, populated inventory, Intel runtime, real media/input, installation and production signing remain Not Verified.

@@ -19,9 +19,9 @@ public enum HostingRoute: String, Hashable, Sendable, CaseIterable {
     public var detail: String {
         switch self {
         case .thisMac:
-            "Host Helicoid on this Mac. Preflight is read-only; installation stays unavailable until a verified server package is integrated. Windows hosting is installed by opening the Helicoid Windows app on the Windows host."
+            "Check this Mac for local hosting."
         case .existingLinuxSSH:
-            "Connect to an existing Linux server over SSH. Windows hosting is installed by opening the Helicoid Windows app on the Windows host."
+            "Check an existing Linux server over SSH."
         }
     }
 
@@ -73,13 +73,6 @@ public enum HostIdentityResult: Hashable, Sendable {
             return "SSH host identity could not be established: \(detail). No writes were performed."
         }
     }
-}
-
-public enum HostCheckStatus: Hashable, Sendable {
-    case pending
-    case checking
-    case passed
-    case needsAttention(detail: String)
 }
 
 public enum SetupPhase: String, Hashable, Sendable, CaseIterable {
@@ -164,6 +157,15 @@ public final class GuidedServerSetupModel {
         }
     }
 
+    /// Verified server packages are not integrated in this build (H05).
+    /// While unavailable, guided setup is read-only host inspection only:
+    /// no key creation, admin collection, or install phases.
+    public nonisolated static let isServerPackageAvailable = false
+
+    /// Concise H01/H05 blocker shown before any administrator or recovery detail.
+    public nonisolated static let packageUnavailableNotice =
+        "Server installation is unavailable in this build."
+
     private let sshClient: SSHSetupClient
     private let localClient: LocalMacSetupClient
     private let managerIdentityStore: ManagerIdentityStore
@@ -180,6 +182,9 @@ public final class GuidedServerSetupModel {
     }
 
     public func prepareManagerIdentity() async {
+        // No verified package means no installer will consume a manager key.
+        // Skip secret creation entirely (H05).
+        guard Self.isServerPackageAvailable else { return }
         guard managerIdentity == nil, !isPreparingManagerIdentity else { return }
         isPreparingManagerIdentity = true
         defer { isPreparingManagerIdentity = false }
@@ -215,7 +220,7 @@ public final class GuidedServerSetupModel {
             }
         case .network:
             return !networkAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                && UInt16(productPort).map { $0 > 0 && ![21115, 21116, 21117].contains($0) } == true
+                && UInt16(productPort).map { $0 > 0 } == true
                 && hostChecks["Product ports"] == .passed
         case .deploymentIdentity:
             return !deploymentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -234,12 +239,17 @@ public final class GuidedServerSetupModel {
     }
 
     /// SSH-only phases are skipped on This Mac. Both routes join at Check Host.
+    /// Without a verified server package the walk ends at the install blocker:
+    /// network/administrator/storage/review are never entered (H05).
     private var phaseOrder: [SetupPhase] {
+        let installTail: [SetupPhase] = Self.isServerPackageAvailable
+            ? [.network, .deploymentIdentity, .administrator, .storage, .review, .install, .ready]
+            : [.install]
         switch route {
         case .thisMac:
-            return [.chooseHosting, .checkHost, .network, .deploymentIdentity, .administrator, .storage, .review, .install, .ready]
+            return [.chooseHosting, .checkHost] + installTail
         case .existingLinuxSSH:
-            return SetupPhase.allCases
+            return [.chooseHosting, .connect, .hostIdentity, .checkHost] + installTail
         }
     }
 
@@ -335,7 +345,7 @@ public final class GuidedServerSetupModel {
     }
 
     public func verifyAndInspectHost() async {
-        guard !isCheckingHost else { return }
+        guard !Task.isCancelled, !isCheckingHost else { return }
         let generation = UUID()
         verificationGeneration = generation
         isCheckingHost = true
@@ -426,6 +436,10 @@ public final class GuidedServerSetupModel {
         }
         if next == .install {
             installProgress = .refused(reason: HelicoidError.installNotAvailable.explanation)
+        }
+        if next == .deploymentIdentity {
+            // Manager key is only created once a verified package can consume it.
+            Task { await prepareManagerIdentity() }
         }
         phase = next
     }
