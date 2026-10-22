@@ -59,12 +59,13 @@ public struct SSHHostPreflight: Decodable, Equatable, Sendable {
     }
 
     public func checks(authorityPort: UInt16 = 8920) -> [String: HostCheckStatus] {
-        let tcpRequired: Set<UInt16> = [authorityPort, 21115, 21116, 21117]
-        let conflict = !tcpRequired.isDisjoint(with: tcpPorts) || udpPorts.contains(21116)
+        let conflict = tcpPorts.contains(authorityPort)
+        let supportedUbuntu = osID == "ubuntu" && ["24.04", "26.04"].contains(osVersion)
+            && architecture == "x86_64"
         return [
             "SSH reachability": .passed,
-            "Operating system": osID == "ubuntu" && osVersion == "26.04" && architecture == "x86_64"
-                ? .passed : .needsAttention(detail: "This test installer supports Ubuntu 26.04 on x86-64."),
+            "Operating system": supportedUbuntu
+                ? .passed : .needsAttention(detail: "The Linux installer supports Ubuntu 24.04 or 26.04 on x86-64."),
             "Service manager": systemdAvailable ? .passed : .needsAttention(detail: "systemd is required."),
             "Administrator access": sudoAvailable ? .passed : .needsAttention(detail: "SSH key setup requires noninteractive sudo."),
             "Disk space": freeBytes >= 2_147_483_648 ? .passed : .needsAttention(detail: "At least 2 GiB of free space is required."),

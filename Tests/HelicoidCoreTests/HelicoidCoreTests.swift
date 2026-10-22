@@ -250,8 +250,6 @@ struct GuidedServerSetupTests {
         #expect(HostingRoute.allCases == [.thisMac, .existingLinuxSSH])
         #expect(model.route == .thisMac)
         #expect(model.phase == .chooseHosting)
-        #expect(HostingRoute.thisMac.detail.contains("Windows app"))
-        #expect(HostingRoute.existingLinuxSSH.detail.contains("Windows app"))
     }
 
     @Test("Host identity gate blocks continue")
@@ -282,19 +280,7 @@ struct GuidedServerSetupTests {
         model.advance()
         model.setHostIdentity(.verified(fingerprint: "SHA256:test"))
         model.advance()
-        model.setHostCheck("SSH reachability", status: .passed)
-        model.setHostCheck("Disk space", status: .passed)
         for name in GuidedServerSetupModel.requiredHostChecks(for: .existingLinuxSSH) { model.setHostCheck(name, status: .passed) }
-        model.advance()
-        model.setNetworkAddress("192.168.1.10")
-        model.advance()
-        model.setDeploymentName("HQ Lab")
-        model.advance()
-        model.setAdministratorUsername("admin")
-        model.advance()
-        model.setStoragePath("/var/lib/helicoid")
-        model.advance()
-        #expect(model.phase == .review)
         model.advance()
         #expect(model.phase == .install)
         if case .refused(let reason) = model.installProgress {
@@ -303,6 +289,61 @@ struct GuidedServerSetupTests {
             Issue.record("Install progress should be refused, not started/succeeded")
         }
         #expect(!model.isServerReadyForEnrollment)
+        model.advance()
+        #expect(model.phase == .install)
+        #expect(!model.isServerReadyForEnrollment)
+    }
+
+    @Test("Installation unavailable prevents secret collection and later phases")
+    @MainActor
+    func installUnavailableBlocksSecretCollection() async {
+        #expect(!GuidedServerSetupModel.isServerPackageAvailable)
+        let model = GuidedServerSetupModel()
+        model.setRoute(.existingLinuxSSH)
+        model.setSSHAddress("server.lan")
+        model.advance()
+        model.advance()
+        model.setHostIdentity(.verified(fingerprint: "SHA256:test"))
+        model.advance()
+        for name in GuidedServerSetupModel.requiredHostChecks(for: .existingLinuxSSH) { model.setHostCheck(name, status: .passed) }
+        model.advance()
+        // No network/admin/storage/review walk-through without a verified package.
+        #expect(model.phase != .network)
+        #expect(model.phase != .deploymentIdentity)
+        #expect(model.phase != .administrator)
+        #expect(model.phase != .storage)
+        #expect(model.phase != .review)
+        #expect(model.phase == .install)
+        #expect(model.administratorUsername.isEmpty)
+        #expect(model.initiatingManagerPublicKey == nil)
+        #expect(model.generatedTrustIdentityNote.isEmpty)
+        await model.prepareManagerIdentity()
+        #expect(model.initiatingManagerPublicKey == nil)
+        #expect(model.generatedTrustIdentityNote.isEmpty)
+    }
+
+    @Test("Read-only host checks remain possible while install is unavailable")
+    @MainActor
+    func readOnlyChecksRemainPossible() {
+        let model = GuidedServerSetupModel()
+        #expect(model.phase == .chooseHosting)
+        model.setRoute(.thisMac)
+        model.advance()
+        #expect(model.phase == .checkHost)
+        model.setHostCheck("Operating system", status: .passed)
+        model.setHostCheck("Administrator access", status: .passed)
+        model.setHostCheck("Disk space", status: .passed)
+        model.setHostCheck("Product path", status: .passed)
+        model.setHostCheck("Service manager", status: .passed)
+        model.setHostCheck("Product ports", status: .passed)
+        #expect(model.canContinueFromCurrentPhase)
+        model.advance()
+        #expect(model.phase == .install)
+        if case .refused = model.installProgress {
+            // Honest blocker after the read-only checks.
+        } else {
+            Issue.record("Read-only checks must not become a fake install")
+        }
     }
 
     @Test("Check host requires all passed")

@@ -30,8 +30,13 @@ public final class ManagerSession: AuthSignInObserving {
     public var isFixturesMode: Bool
     public var isDevelopmentServerMode: Bool
     public var managerPublicIdentity: String?
-    public var showInclusionPanel: Bool
     public var showDevelopmentBanner: Bool
+    /// Session-owned inventory presentation (layout, size, panel). Survives view identity resets.
+    public var presentation: ManagerPresentationPreferences
+    /// Real account+deployment scope for preference persistence. Never invented from URL/name.
+    public private(set) var presentationPreferenceScope: PresentationPreferenceScope?
+    /// True when a new session generation is live. Stale view-window content must invalidate.
+    public private(set) var sessionGeneration: UInt64 = 0
     /// Cancellable required-code state for v2 device-key sign-in.
     public var authCodeState: AuthCodeState {
         authCoordinator?.authCodeState ?? .idle
@@ -62,7 +67,8 @@ public final class ManagerSession: AuthSignInObserving {
         self.managerPublicIdentity = configuration.managerPublicIdentity
         self.screen = configuration.useSourceFixtures ? .computers : .connect
         self.phase = configuration.useSourceFixtures ? .signedIn : .notConfigured
-        self.serverAddress = configuration.developmentServerAddress
+        self.serverAddress = configuration.useDevelopmentServer || productionAuthClient != nil
+            ? configuration.developmentServerAddress : ""
         self.trustedProfiles = []
         self.pendingIdentity = nil
         self.verifiedIdentity = nil
@@ -72,7 +78,8 @@ public final class ManagerSession: AuthSignInObserving {
         self.connectError = nil
         self.signOutError = nil
         self.openRemoteWindows = []
-        self.showInclusionPanel = false
+        self.presentation = ManagerPresentationPreferences()
+        self.presentationPreferenceScope = nil
         self.showDevelopmentBanner = configuration.useSourceFixtures
         self.authCode = ""
         self.productionAuthClient = configuration.useDevelopmentServer ? nil : productionAuthClient
@@ -131,6 +138,7 @@ public final class ManagerSession: AuthSignInObserving {
         signInError = nil
         signOutError = nil
         clearSessionMaterial()
+        bumpSessionGeneration()
 
         guard allowsConnect else {
             connectError = .serverContractUnavailable
@@ -256,6 +264,7 @@ public final class ManagerSession: AuthSignInObserving {
             await coordinator.signIn(username: username, password: password)
             syncAuthUIFromCoordinator()
             if case .signedIn = coordinator.phase {
+                await refreshPresentationPreferenceScope()
                 overview.setInventory(coordinator.inventory)
             }
             return
@@ -264,6 +273,8 @@ public final class ManagerSession: AuthSignInObserving {
         let result = await client.signIn(username: username, password: password)
         switch result {
         case .success:
+            bumpSessionGeneration()
+            await refreshPresentationPreferenceScope()
             phase = .signedIn
             screen = .computers
             password = ""
@@ -294,6 +305,7 @@ public final class ManagerSession: AuthSignInObserving {
         authCode = ""
         syncAuthUIFromCoordinator()
         if case .signedIn = coordinator.phase {
+            await refreshPresentationPreferenceScope()
             overview.setInventory(coordinator.inventory)
         }
     }
@@ -323,6 +335,9 @@ public final class ManagerSession: AuthSignInObserving {
             phase = .needsSignIn
             screen = .signIn
         case .signedIn:
+            if phase != .signedIn {
+                bumpSessionGeneration()
+            }
             phase = .signedIn
             screen = .computers
         case .pendingManagerApproval:
@@ -347,7 +362,7 @@ public final class ManagerSession: AuthSignInObserving {
         }
         // Expiry / credential loss must drop remote windows and selection.
         if case .sessionExpired = coordinator.signInError {
-            openRemoteWindows = []
+            bumpSessionGeneration()
             overview.setInventory([])
         }
     }
@@ -395,6 +410,8 @@ public final class ManagerSession: AuthSignInObserving {
             await client.signOut()
         }
         clearSessionMaterial()
+        bumpSessionGeneration()
+        presentationPreferenceScope = nil
         if isFixturesMode {
             isFixturesMode = false
             showDevelopmentBanner = false
@@ -414,17 +431,146 @@ public final class ManagerSession: AuthSignInObserving {
 
     // MARK: - Remote windows (view-only; engine honestly unavailable)
 
-    public func openRemoteView(for id: ComputerID) {
+    /// Opens or focuses the native view-only window for `id`.
+    /// Unauthorized / unknown IDs refuse to open. Re-open dedupes demand.
+    /// Returns the generation-scoped window key for this demand.
+    @discardableResult
+    public func openRemoteView(for id: ComputerID) -> ComputerViewWindowKey? {
+        guard isFixturesMode || phase == .signedIn else { return nil }
+        guard computer(with: id) != nil else { return nil }
         if !openRemoteWindows.contains(id) {
             openRemoteWindows.append(id)
         }
+        return ComputerViewWindowKey(computerID: id, sessionGeneration: sessionGeneration)
     }
 
+    /// Closing one window removes only its own demand.
+    /// Generation-scoped: an old window cannot drop a newer same-computer demand.
+    public func closeRemoteView(for key: ComputerViewWindowKey) {
+        guard key.sessionGeneration == sessionGeneration else { return }
+        openRemoteWindows.removeAll { $0 == key.computerID }
+    }
+
+    /// Convenience for tests and call sites that already hold the live generation.
     public func closeRemoteView(for id: ComputerID) {
-        openRemoteWindows.removeAll { $0 == id }
+        closeRemoteView(for: ComputerViewWindowKey(computerID: id, sessionGeneration: sessionGeneration))
     }
 
     public func computer(with id: ComputerID) -> Computer? {
         overview.authorizedInventory.first(where: { $0.id == id })
+    }
+
+    // MARK: - Presentation preferences
+
+    public var preferenceStore: PresentationPreferenceStore {
+        PresentationPreferenceStore(scope: presentationPreferenceScope)
+    }
+
+    /// Session-only presentation updates. Persistence runs only with a real scope.
+    public func setPresentationLayout(_ layout: ManagerLayoutKind) {
+        presentation.layout = layout
+        preferenceStore.save(presentation)
+    }
+
+    public func setPresentationPreviewSize(_ size: ManagerPreviewSize) {
+        presentation.previewSize = size
+        preferenceStore.save(presentation)
+    }
+
+    public func setComputersPanelShown(_ shown: Bool) {
+        presentation.isComputersPanelShown = shown
+        preferenceStore.save(presentation)
+    }
+
+    public func toggleComputersPanel() {
+        setComputersPanelShown(!presentation.isComputersPanelShown)
+    }
+
+    /// Reset search and status filters. Filter changes clear temporary selection.
+    /// Open action snapshots are not modified.
+    public func clearInventoryFilters() {
+        overview.setSearchText("")
+        overview.setStatusFilter(.all)
+    }
+
+    public var inventoryEmptyReason: InventoryEmptyReason {
+        InventoryEmptyReason.reason(
+            authorizedCount: overview.authorizedInventory.count,
+            includedCount: overview.inclusion.includedIDs(from: overview.authorizedInventory.map(\.id)).count,
+            displayedCount: overview.scope.displayedIDs.count,
+            filterActive: overview.filter.isActive
+        )
+    }
+
+    /// Tri-state for the All Computers checkbox against current authorized IDs.
+    public var allComputersCheckState: CheckState {
+        overview.inclusion.allComputersCheckState(authorized: overview.authorizedInventory.map(\.id))
+    }
+
+    /// Tri-state for a group checkbox against current inclusion and authorized membership.
+    public func groupCheckState(groupID: String) -> CheckState {
+        let authorizedIDs = Set(overview.authorizedInventory.map(\.id))
+        let members = Set(overview.groups.computerIDs(inGroup: groupID)).intersection(authorizedIDs)
+        guard !members.isEmpty else { return .off }
+        let included = overview.inclusion.includedIDs(from: authorizedIDs)
+        let includedMembers = members.intersection(included)
+        if includedMembers.count == members.count { return .on }
+        if includedMembers.isEmpty { return .off }
+        return .mixed
+    }
+
+    /// Applies a tri-state click for All Computers.
+    public func applyAllComputersCheckState(_ state: CheckState) {
+        switch state {
+        case .off:
+            overview.clearAllComputersMode()
+        case .on, .mixed:
+            overview.selectAllComputersMode()
+        }
+    }
+
+    /// Applies a tri-state click for a group.
+    public func applyGroupCheckState(groupID: String, state: CheckState) {
+        overview.setGroupIncluded(groupID, included: state != .off)
+    }
+
+    // MARK: - Session identity for presentation scope
+
+    private func refreshPresentationPreferenceScope() async {
+        // Fence against sign-out/replacement while deploymentID is awaited.
+        let installGeneration = sessionGeneration
+        let expectedAccountID = authCoordinator?.session?.account.id
+        let next = await makePresentationPreferenceScope()
+        guard sessionGeneration == installGeneration,
+              authCoordinator?.session?.account.id == expectedAccountID else {
+            return
+        }
+        guard next != presentationPreferenceScope else { return }
+        presentationPreferenceScope = next
+        if let loaded = preferenceStore.load() {
+            presentation = loaded
+        } else {
+            // New scope with no stored prefs must not inherit the previous account.
+            presentation = ManagerPresentationPreferences()
+        }
+    }
+
+    private func makePresentationPreferenceScope() async -> PresentationPreferenceScope? {
+        guard let accountID = authCoordinator?.session?.account.id,
+              !accountID.isEmpty,
+              let client = productionAuthClient else {
+            return nil
+        }
+        let deploymentID = await client.deploymentID
+        guard !deploymentID.isEmpty else {
+            return nil
+        }
+        return PresentationPreferenceScope(deploymentID: deploymentID, accountID: accountID)
+    }
+
+    private func bumpSessionGeneration() {
+        sessionGeneration &+= 1
+        // Session change invalidates every view-only demand immediately.
+        openRemoteWindows = []
     }
 }

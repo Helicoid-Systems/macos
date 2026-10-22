@@ -2,32 +2,16 @@ import SwiftUI
 import HelicoidCore
 
 /// M01–M04 Computers main view.
+/// Layout, preview size, and panel visibility live on ManagerSession.
 struct ComputersView: View {
     @Environment(ManagerSession.self) private var session
-    @State private var layout: LayoutKind = .grid
-    @State private var previewSize: PreviewSize = .medium
     @State private var selectionAnchor: ComputerID?
-
-    enum LayoutKind: String, CaseIterable, Identifiable {
-        case grid
-        case list
-        var id: String { rawValue }
-        var label: String { rawValue == "grid" ? "Grid" : "List" }
-    }
-
-    enum PreviewSize: String, CaseIterable, Identifiable {
-        case small
-        case medium
-        case large
-        var id: String { rawValue }
-        var label: String { rawValue.capitalized }
-    }
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        @Bindable var session = session
         NavigationSplitView {
-            if session.showInclusionPanel {
-                InclusionPanel()
+            if session.presentation.isComputersPanelShown {
+                ComputersPanel()
                     .navigationSplitViewColumnWidth(min: 220, ideal: 260)
             }
         } detail: {
@@ -43,7 +27,7 @@ struct ComputersView: View {
                 if session.overview.scope.displayedIDs.isEmpty {
                     emptyState
                 } else {
-                    switch layout {
+                    switch session.presentation.layout {
                     case .grid:
                         computerGrid
                     case .list:
@@ -64,10 +48,10 @@ struct ComputersView: View {
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Picker("Layout", selection: Binding(
-                    get: { layout },
-                    set: { layout = $0 }
+                    get: { session.presentation.layout },
+                    set: { session.setPresentationLayout($0) }
                 )) {
-                    ForEach(LayoutKind.allCases) { kind in
+                    ForEach(ManagerLayoutKind.allCases) { kind in
                         Image(systemName: kind == .grid ? "square.grid.2x2" : "list.bullet")
                             .tag(kind)
                             .accessibilityLabel(kind.label)
@@ -76,14 +60,7 @@ struct ComputersView: View {
                 .pickerStyle(.segmented)
                 .frame(width: 88)
 
-                Picker("Preview size", selection: Binding(
-                    get: { previewSize },
-                    set: { previewSize = $0 }
-                )) {
-                    ForEach(PreviewSize.allCases) { size in
-                        Text(size.label).tag(size)
-                    }
-                }
+                previewSizeControl
 
                 Picker("Status", selection: Binding(
                     get: { session.overview.filter.status },
@@ -95,17 +72,13 @@ struct ComputersView: View {
                 }
                 .frame(width: 140)
 
-                Toggle("Inclusion", isOn: Binding(
-                    get: { session.showInclusionPanel },
-                    set: { session.showInclusionPanel = $0 }
+                Toggle("Computers Panel", isOn: Binding(
+                    get: { session.presentation.isComputersPanelShown },
+                    set: { session.setComputersPanelShown($0) }
                 ))
                 .toggleStyle(.button)
 
-                Menu("Actions") {
-                    Button("Share Screen") { openComposer("Share Screen") }
-                    Button("Message") { openComposer("Message") }
-                    Button("Actions") { openComposer("Actions") }
-                    Divider()
+                Menu("Monitoring") {
                     Button("Pause Monitoring") {
                         session.overview.pauseMonitoring()
                     }
@@ -117,22 +90,27 @@ struct ComputersView: View {
                 }
             }
         }
-        .sheet(isPresented: Binding(
-            get: { !session.overview.openSnapshots.isEmpty },
-            set: { presented in
-                if !presented, let snap = session.overview.openSnapshots.first {
-                    session.overview.closeSnapshot(snap.id)
-                }
-            }
-        )) {
-            if let snapshot = session.overview.openSnapshots.first {
-                ActionComposerView(snapshot: snapshot)
-            }
-        }
     }
 
-    private func openComposer(_ kind: String) {
-        _ = session.overview.openSnapshot(actionKind: kind)
+    private var previewSizeControl: some View {
+        Menu {
+            Picker("Preview Size", selection: Binding(
+                get: { session.presentation.previewSize },
+                set: { session.setPresentationPreviewSize($0) }
+            )) {
+                ForEach(ManagerPreviewSize.allCases) { size in
+                    Text("\(size.label) (\(Int(size.tileWidth)))").tag(size)
+                }
+            }
+        } label: {
+            Label(session.presentation.previewSize.label, systemImage: "rectangle.resize")
+        }
+        .accessibilityLabel("Preview size")
+    }
+
+    private func openComputerWindow(_ id: ComputerID) {
+        guard let key = session.openRemoteView(for: id) else { return }
+        openWindow(id: ManagerWindowID.computerView, value: key)
     }
 
     private var scopeLine: some View {
@@ -147,6 +125,12 @@ struct ComputersView: View {
                 }
                 .buttonStyle(.link)
             }
+            if session.overview.filter.isActive {
+                Button("Clear Filters") {
+                    session.clearInventoryFilters()
+                }
+                .buttonStyle(.link)
+            }
             Spacer()
             if session.overview.isMonitoringPaused {
                 Label("Monitoring Paused", systemImage: "pause.circle")
@@ -157,42 +141,31 @@ struct ComputersView: View {
     }
 
     private var emptyState: some View {
-        ContentUnavailableView {
-            Label("No Computers", systemImage: "desktopcomputer")
+        let reason = session.inventoryEmptyReason
+        return ContentUnavailableView {
+            Label(reason.title, systemImage: "desktopcomputer")
         } description: {
-            Text(emptyDescription)
+            Text(reason.message)
         } actions: {
-            if session.overview.inclusion.includedIDs(from: session.overview.authorizedInventory.map(\.id)).isEmpty
-                && !session.overview.authorizedInventory.isEmpty {
+            switch reason {
+            case .noAuthorizedInventory:
+                EmptyView()
+            case .noneIncluded:
                 Button("Choose Computers") {
-                    session.showInclusionPanel = true
-                    session.overview.selectAllComputersMode()
+                    session.setComputersPanelShown(true)
                 }
-            }
-            if session.overview.authorizedInventory.isEmpty {
-                Button("Guided Server Setup") {
-                    withAnimation(.easeOut(duration: 0.22)) {
-                        session.screen = .guidedSetup
-                    }
+            case .noResults:
+                Button("Clear Filters") {
+                    session.clearInventoryFilters()
                 }
             }
         }
-    }
-
-    private var emptyDescription: String {
-        if session.overview.authorizedInventory.isEmpty {
-            return "No enrolled computers are authorized for this account yet. Connect to a Helicoid server, then enroll computers from administration. Nothing is invented here."
-        }
-        if session.overview.filter.isActive {
-            return "No computers match the current search or status filter. Clear Search to see the underlying inventory."
-        }
-        return "No computers are included. Use the inclusion panel to choose All Computers or individual computers."
     }
 
     private var computerGrid: some View {
         ScrollView {
             LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: previewSize.minTile), spacing: 12)],
+                columns: [GridItem(.adaptive(minimum: session.presentation.previewSize.tileWidth), spacing: 12)],
                 spacing: 12
             ) {
                 ForEach(session.overview.scope.computers) { computer in
@@ -201,6 +174,16 @@ struct ComputersView: View {
                         admission: session.overview.admittedStreams[computer.id] ?? .idle,
                         isSelected: session.overview.selection.selectedIDs.contains(computer.id)
                     )
+                    .focusable()
+                    .onKeyPress(.return) {
+                        openComputerWindow(computer.id)
+                        return .handled
+                    }
+                    .onKeyPress(.space) {
+                        session.overview.toggleSelection(computer.id)
+                        selectionAnchor = computer.id
+                        return .handled
+                    }
                     .gesture(
                         TapGesture()
                             .onEnded {
@@ -217,32 +200,25 @@ struct ComputersView: View {
                     .simultaneousGesture(
                         TapGesture(count: 2)
                             .onEnded {
-                                session.openRemoteView(for: computer.id)
+                                openComputerWindow(computer.id)
                             }
                     )
                     .contextMenu {
-                        Button("Open View Screen") {
-                            session.openRemoteView(for: computer.id)
+                        Button("View Screen") {
+                            openComputerWindow(computer.id)
                         }
                         Button("Select") {
                             session.overview.selectOnly(computer.id)
+                        }
+                        if session.overview.filter.isActive {
+                            Button("Clear Filters") {
+                                session.clearInventoryFilters()
+                            }
                         }
                     }
                 }
             }
             .padding(12)
-        }
-        .sheet(isPresented: Binding(
-            get: { !session.openRemoteWindows.isEmpty },
-            set: { presented in
-                if !presented {
-                    session.openRemoteWindows.removeAll()
-                }
-            }
-        )) {
-            if let id = session.openRemoteWindows.first {
-                RemoteViewWindow(computerID: id)
-            }
         }
     }
 
@@ -257,23 +233,24 @@ struct ComputersView: View {
                     admission: session.overview.admittedStreams[computer.id] ?? .idle
                 )
                 .tag(computer.id)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) {
+                    openComputerWindow(computer.id)
+                }
                 .contextMenu {
-                    Button("Open View Screen") {
-                        session.openRemoteView(for: computer.id)
+                    Button("View Screen") {
+                        openComputerWindow(computer.id)
                     }
                 }
             }
         }
         .listStyle(.inset)
-    }
-}
-
-private extension ComputersView.PreviewSize {
-    var minTile: CGFloat {
-        switch self {
-        case .small: 140
-        case .medium: 200
-        case .large: 280
+        .onKeyPress(.return) {
+            if let id = session.overview.selection.selectedIDs.first {
+                openComputerWindow(id)
+                return .handled
+            }
+            return .ignored
         }
     }
 }
@@ -292,6 +269,7 @@ struct DevelopmentBanner: View {
     }
 }
 
+/// Quiet tile: name, trusted user, and relevant exceptions only. No presence dots.
 struct ComputerTile: View {
     let computer: Computer
     let admission: ObservationAdmission
@@ -308,24 +286,16 @@ struct ComputerTile: View {
             Text(computer.name)
                 .font(.callout.weight(.medium))
                 .lineLimit(1)
-            HStack(spacing: 4) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 7, height: 7)
-                Text(statusText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if computer.needsAttention {
-                    Label(computer.statusLabel ?? "Needs Attention", systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
-            }
             if let user = computer.trustedUserName {
                 Text(user)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+            }
+            if computer.needsAttention {
+                Label(computer.statusLabel ?? "Needs Attention", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
         }
         .padding(8)
@@ -345,7 +315,7 @@ struct ComputerTile: View {
         switch admission {
         case .idle:
             return AnyView(
-                Text("Ready")
+                Text("Screen Unavailable")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             )
@@ -353,7 +323,7 @@ struct ComputerTile: View {
             return AnyView(
                 VStack(spacing: 6) {
                     ProgressView().controlSize(.small)
-                    Text("Admitting…")
+                    Text("Connecting")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -364,7 +334,7 @@ struct ComputerTile: View {
                     Image(systemName: "desktopcomputer")
                         .font(.title3)
                         .foregroundStyle(.secondary)
-                    Text("Preview requires engine")
+                    Text("Screen Unavailable")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -386,164 +356,151 @@ struct ComputerTile: View {
         }
     }
 
-    private var statusText: String {
-        if let label = computer.statusLabel {
-            return label
-        }
-        return computer.isOnline ? "Online" : "Offline"
-    }
-
-    private var statusColor: Color {
-        if computer.needsAttention { return .orange }
-        return computer.isOnline ? Color.green : Color.secondary.opacity(0.4)
-    }
-
     private var accessibilityLabel: String {
         var parts = [computer.name]
-        parts.append(statusText)
         if let user = computer.trustedUserName { parts.append("User \(user)") }
+        if computer.needsAttention { parts.append(computer.statusLabel ?? "Needs Attention") }
         if isSelected { parts.append("Selected") }
         return parts.joined(separator: ", ")
     }
 }
 
+/// Compact list row. Activation opens the same view window as the grid.
 struct ComputerRow: View {
     let computer: Computer
     let admission: ObservationAdmission
 
     var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(computer.name)
-                    .font(.body.weight(.medium))
-                if let user = computer.trustedUserName {
-                    Text(user)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+        HStack(spacing: 8) {
+            Text(computer.name)
+                .font(.body)
+                .lineLimit(1)
+            if let user = computer.trustedUserName {
+                Text(user)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
             Spacer()
             if computer.needsAttention {
-                Label("Needs Attention", systemImage: "exclamationmark.triangle.fill")
+                Label(computer.statusLabel ?? "Needs Attention", systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
                     .font(.caption)
             }
-            Text(computer.isOnline ? "Online" : "Offline")
-                .foregroundStyle(.secondary)
-                .font(.caption)
         }
+        .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var accessibilityLabel: String {
+        var parts = [computer.name]
+        if let user = computer.trustedUserName { parts.append("User \(user)") }
+        if computer.needsAttention { parts.append(computer.statusLabel ?? "Needs Attention") }
+        return parts.joined(separator: ", ")
     }
 }
 
-struct InclusionPanel: View {
+/// Optional Computers panel. Tri-state All/group checkboxes from real inclusion state.
+struct ComputersPanel: View {
     @Environment(ManagerSession.self) private var session
 
     var body: some View {
-        @Bindable var session = session
         List {
-            Section("Monitoring Inclusion") {
-                Toggle("All Computers", isOn: Binding(
-                    get: {
-                        session.overview.inclusion.allComputersCheckState(
-                            authorized: session.overview.authorizedInventory.map(\.id)
-                        ) != .off
-                    },
-                    set: { on in
-                        if on {
-                            session.overview.selectAllComputersMode()
-                        } else {
-                            session.overview.clearAllComputersMode()
-                        }
-                    }
-                ))
-                .accessibilityLabel("All Computers inclusion")
+            Section("Computers") {
+                InclusionCheckbox(title: "All Computers", state: session.allComputersCheckState) {
+                    session.applyAllComputersCheckState(session.allComputersCheckState == .on ? .off : .on)
+                }
 
                 ForEach(session.overview.groups.groups) { group in
-                    DisclosureGroup(group.name) {
-                        ForEach(group.computerIDs, id: \.self) { id in
-                            if let computer = session.computer(with: id) {
-                                Toggle(computer.name, isOn: Binding(
-                                    get: { session.overview.inclusion.includes(id) },
-                                    set: { on in
-                                        if on {
-                                            session.overview.includeComputer(id)
-                                        } else {
-                                            session.overview.excludeComputer(id)
-                                        }
-                                    }
-                                ))
-                            }
-                        }
+                    InclusionCheckbox(title: group.name, state: session.groupCheckState(groupID: group.id)) {
+                        let state = session.groupCheckState(groupID: group.id)
+                        session.applyGroupCheckState(groupID: group.id, state: state == .on ? .off : .on)
+                    }
+
+                    ForEach(ungroupedMembers(of: group), id: \.id) { computer in
+                        computerToggle(computer)
+                            .padding(.leading, 12)
                     }
                 }
 
-                let ungrouped = session.overview.authorizedInventory.filter { $0.groupIDs.isEmpty }
+                let ungrouped = ungroupedComputers()
                 if !ungrouped.isEmpty {
-                    DisclosureGroup("Ungrouped Computers") {
+                    DisclosureGroup("Ungrouped") {
                         ForEach(ungrouped) { computer in
-                            Toggle(computer.name, isOn: Binding(
-                                get: { session.overview.inclusion.includes(computer.id) },
-                                set: { on in
-                                    if on {
-                                        session.overview.includeComputer(computer.id)
-                                    } else {
-                                        session.overview.excludeComputer(computer.id)
-                                    }
-                                }
-                            ))
+                            computerToggle(computer)
                         }
                     }
                 }
-            }
-
-            Section {
-                Text("Inclusion is separate from temporary selection and from authorization. Explicit inclusion never expands silently.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
         }
         .listStyle(.sidebar)
     }
-}
 
-/// Frozen-scope action composer. Shows exact target names and count before dispatch.
-struct ActionComposerView: View {
-    @Environment(ManagerSession.self) private var session
-    let snapshot: ActionSnapshot
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(snapshot.actionKind)
-                .font(.title3.weight(.semibold))
-            Text(snapshot.targetCount == 1
-                 ? "1 Computer Selected"
-                 : "\(snapshot.targetCount) Computers Selected")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-
-            List(snapshot.computerIDs, id: \.self) { id in
-                Text(session.computer(with: id)?.name ?? id.rawValue)
-            }
-            .frame(minHeight: 160)
-
-            Text("Targets are frozen when this action opened. Inventory changes cannot expand this snapshot.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            HStack {
-                Spacer()
-                Button("Cancel") { dismiss() }
-                Button("Dispatch") {
-                    // Dispatch is not integrated with a server route; do not pretend success.
-                    dismiss()
+    private func computerToggle(_ computer: Computer) -> some View {
+        Toggle(computer.name, isOn: Binding(
+            get: { session.overview.inclusion.includes(computer.id) },
+            set: { on in
+                if on {
+                    session.overview.includeComputer(computer.id)
+                } else {
+                    session.overview.excludeComputer(computer.id)
                 }
-                .keyboardShortcut(.defaultAction)
-                .disabled(snapshot.targetCount == 0)
             }
+        ))
+        .toggleStyle(.checkbox)
+    }
+
+    /// First group wins so a computer never appears twice in the panel.
+    private func ungroupedMembers(of group: ComputerGroup) -> [Computer] {
+        let seenEarlier = Set(
+            session.overview.groups.groups
+                .prefix(while: { $0.id != group.id })
+                .flatMap(\.computerIDs)
+        )
+        return group.computerIDs.compactMap { id in
+            guard !seenEarlier.contains(id), let computer = session.computer(with: id) else { return nil }
+            return computer
         }
-        .padding(20)
-        .frame(minWidth: 420, minHeight: 320)
+    }
+
+    private func ungroupedComputers() -> [Computer] {
+        let claimed = Set(session.overview.groups.groups.flatMap(\.computerIDs))
+        return session.overview.authorizedInventory.filter { computer in
+            !claimed.contains(computer.id) && computer.groupIDs.isEmpty
+        }
+    }
+
+ }
+
+/// AppKit supplies the actual mixed checkbox state and native keyboard semantics.
+struct InclusionCheckbox: NSViewRepresentable {
+    let title: String
+    let state: CheckState
+    let action: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(action: action) }
+
+    func makeNSView(context: Context) -> NSButton {
+        let button = NSButton(checkboxWithTitle: title, target: context.coordinator, action: #selector(Coordinator.toggle))
+        button.allowsMixedState = true
+        return button
+    }
+
+    func updateNSView(_ button: NSButton, context: Context) {
+        context.coordinator.action = action
+        button.title = title
+        button.state = switch state {
+        case .on: .on
+        case .off: .off
+        case .mixed: .mixed
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var action: () -> Void
+        init(action: @escaping () -> Void) { self.action = action }
+        @objc func toggle() { action() }
     }
 }

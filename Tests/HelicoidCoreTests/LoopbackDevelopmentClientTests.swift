@@ -768,7 +768,9 @@ struct SetupModelRegressionTests {
         model.setHostCheck("Operating system", status: .passed)
         for name in GuidedServerSetupModel.requiredHostChecks(for: .existingLinuxSSH) { model.setHostCheck(name, status: .passed) }
         model.advance()
-        #expect(model.phase == .network)
+        // Accepted gate: no verified package, so read-only checks stop at the install blocker.
+        #expect(model.phase == .install)
+        #expect(!GuidedServerSetupModel.isServerPackageAvailable)
     }
 
     @Test("Cannot continue from host identity without verification")

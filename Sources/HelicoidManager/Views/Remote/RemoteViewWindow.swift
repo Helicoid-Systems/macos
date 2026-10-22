@@ -1,91 +1,131 @@
 import SwiftUI
 import HelicoidCore
 
-/// M06 View Screen — separate view-only remote window.
-/// Pixels are honest: Engine Unavailable. No fictional remote bridge.
-struct RemoteViewWindow: View {
+/// Root for one native per-computer view-only window.
+/// Demand is owned by ManagerSession; closing here removes only this computer
+/// and only for the generation that opened the window.
+struct ComputerViewWindowRoot: View {
     @Environment(ManagerSession.self) private var session
-    let computerID: ComputerID
+    let windowKey: ComputerViewWindowKey?
     @Environment(\.dismiss) private var dismiss
 
-    private var computer: Computer? {
-        session.computer(with: computerID)
-    }
+    private var computerID: ComputerID? { windowKey?.computerID }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(computer.map { "Viewing \($0.name)" } ?? "Viewing Computer")
-                    .font(.headline)
-                Spacer()
-                Button("Close") {
-                    session.closeRemoteView(for: computerID)
-                    dismiss()
-                }
-                .keyboardShortcut(.cancelAction)
+        Group {
+            if let windowKey,
+               windowKey.sessionGeneration == session.sessionGeneration,
+               session.openRemoteWindows.contains(windowKey.computerID),
+               let computer = session.computer(with: windowKey.computerID) {
+                RemoteViewWindow(windowKey: windowKey, computer: computer)
+            } else {
+                invalidDemand
             }
-            .padding(12)
-
-            Divider()
-
-            EngineUnavailableCanvas(computerName: computer?.name ?? computerID.rawValue)
-
-            Divider()
-
-            HStack {
-                Text("View-only. Take Control is not available while the engine is unavailable.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Take Control") {
-                    // Explicit unavailable control. No fictional bridge.
-                }
-                .disabled(true)
-                .help(HelicoidError.engineUnavailable.explanation)
-            }
-            .padding(12)
         }
+        .onDisappear {
+            // Close only the demand opened under this window's generation.
+            if let windowKey {
+                session.closeRemoteView(for: windowKey)
+            }
+        }
+        .onChange(of: session.openRemoteWindows) { _, windows in
+            if let computerID, !windows.contains(computerID) {
+                dismiss()
+            }
+        }
+        .onChange(of: session.sessionGeneration) { _, generation in
+            // New session cannot expose previous context in a lingering window.
+            if let windowKey, windowKey.sessionGeneration != generation {
+                dismiss()
+            }
+        }
+    }
+
+    private var invalidDemand: some View {
+        ContentUnavailableView(
+            "Screen Unavailable",
+            systemImage: "display.slash",
+            description: Text("No authorized computer is attached to this window.")
+        )
         .frame(minWidth: 560, minHeight: 360)
     }
 }
 
-/// Honest remote surface. Never renders mock computer pixels as production frames.
-struct EngineUnavailableCanvas: View {
-    let computerName: String
+/// M06 View Screen — native view-only remote window content.
+/// Pixels are honest: Screen Unavailable. No fictional remote bridge.
+struct RemoteViewWindow: View {
+    let windowKey: ComputerViewWindowKey
+    let computer: Computer
+    @State private var showsDetails = false
 
+    private var computerID: ComputerID { windowKey.computerID }
+
+    var body: some View {
+        RemoteCanvasPlaceholder()
+            .frame(minWidth: 560, minHeight: 360)
+            .navigationTitle("Viewing \(computer.name)")
+            .toolbar {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    // Fit / Actual Size wait for real frame geometry from the engine.
+                    // Take Control stays hidden until an engine control path exists.
+                    Button {
+                        showsDetails.toggle()
+                    } label: {
+                        Label("Details", systemImage: "info.circle")
+                    }
+                    .accessibilityLabel("Computer details")
+                    .help("Show computer identity and session details")
+                }
+            }
+            .popover(isPresented: $showsDetails) {
+                RemoteDetailsPopover(computer: computer, computerID: computerID)
+            }
+    }
+}
+
+/// Honest remote surface. Short title and one relevant reason only.
+struct RemoteCanvasPlaceholder: View {
     var body: some View {
         VStack(spacing: 12) {
             Image(systemName: "display.trianglebadge.exclamationmark")
-                .font(.system(size: 40, weight: .light))
+                .font(.system(size: 36, weight: .light))
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
-            Text("Engine Unavailable")
+            Text("Screen Unavailable")
                 .font(.title3.weight(.semibold))
-            Text(HelicoidError.engineUnavailable.explanation)
+            Text("The remote-view engine is not available in this build.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-                .frame(maxWidth: 360)
-            Text("No screen pixels are produced for \(computerName).")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .frame(maxWidth: 320)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.quaternary.opacity(0.25))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Engine Unavailable. \(HelicoidError.engineUnavailable.explanation)")
+        .accessibilityLabel("Screen Unavailable. The remote-view engine is not available in this build.")
     }
 }
 
-/// Presents remote view-only windows for computers the operator opened.
-struct RemoteWindowPresenter: View {
-    @Environment(ManagerSession.self) private var session
+struct RemoteDetailsPopover: View {
+    let computer: Computer
     let computerID: ComputerID
 
     var body: some View {
-        RemoteViewWindow(computerID: computerID)
-            .onDisappear {
-                session.closeRemoteView(for: computerID)
+        Form {
+            LabeledContent("Name", value: computer.name)
+            LabeledContent("ID", value: computerID.rawValue)
+            if let user = computer.trustedUserName {
+                LabeledContent("Trusted user", value: user)
             }
+            LabeledContent("Enrollment", value: computer.enrollmentState ?? "unknown")
+            if let status = computer.statusLabel {
+                LabeledContent("Status", value: status)
+            }
+            if computer.needsAttention {
+                LabeledContent("Attention", value: computer.statusLabel ?? "Needs attention")
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 320)
     }
 }
