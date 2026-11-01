@@ -14,6 +14,7 @@ struct HelicoidManagerApp: App {
         WindowGroup("Helicoid Manager") {
             RootView()
                 .environment(session)
+                .disclosureGroupStyle(FullWidthDisclosureGroupStyle())
         }
         .defaultSize(width: 520, height: 220)
         .commands {

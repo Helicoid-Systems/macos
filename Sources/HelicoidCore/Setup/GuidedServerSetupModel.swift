@@ -303,6 +303,22 @@ public final class GuidedServerSetupModel {
         }
     }
 
+    /// Suggestions are based on the last inspection, not a reservation.
+    public var suggestedProductPorts: [UInt16] {
+        let observedPorts: [UInt16]
+        switch route {
+        case .thisMac:
+            observedPorts = localPreflight?.listeners.tcpPorts ?? []
+        case .existingLinuxSSH:
+            observedPorts = hostPreflight?.tcpPorts ?? []
+        }
+        let selected = UInt16(productPort)
+        return [UInt16(8920), 8921, 8922, 8923, 8924, 8925]
+            .filter { $0 != selected && !observedPorts.contains($0) }
+            .prefix(3)
+            .map { $0 }
+    }
+
     public func setLanScope(_ value: String) {
         lanScope = value
     }
@@ -389,6 +405,8 @@ public final class GuidedServerSetupModel {
                 hostChecks = result.host.checks(authorityPort: UInt16(productPort) ?? 8920)
                 if networkAddress.isEmpty { networkAddress = try SSHSetupAddress(sshAddress).host }
             }
+            // Reapply validation so an invalid edited port cannot fall back to 8920 as a pass.
+            setProductPort(productPort)
         } catch {
             guard generation == verificationGeneration else { return }
             if error is CancellationError || error as? SetupCommandError == .cancelled {

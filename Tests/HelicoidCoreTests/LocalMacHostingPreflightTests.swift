@@ -176,6 +176,38 @@ struct LocalMacHostingPreflightTests {
         #expect(state.checks()["Product ports"] != .passed)
     }
 
+    @Test("Port suggestions exclude observed listeners and never clear an incomplete check")
+    @MainActor
+    func suggestedPortsKeepIncompleteInspectionBlocked() async {
+        let incomplete = facts(listeners: .incomplete(tcpPorts: [8920, 8921], udpPorts: [], detail: "incomplete"))
+        let model = GuidedServerSetupModel(localClient: LocalMacSetupClient(
+            inspector: StubLocalInspector(.facts(incomplete))))
+        model.advance()
+        await model.verifyAndInspectHost()
+        #expect(model.suggestedProductPorts == [8922, 8923, 8924])
+        model.setProductPort("8922")
+        #expect(model.hostChecks["Product ports"] != .passed)
+        #expect(!model.canContinueFromCurrentPhase)
+        model.setProductPort("invalid")
+        await model.verifyAndInspectHost()
+        #expect(model.hostChecks["Product ports"] == .needsAttention(detail: "Enter a valid port."))
+    }
+
+    @Test("A selected alternate port is checked against complete host facts")
+    @MainActor
+    func alternatePortUsesCompleteInspection() async {
+        let occupied = facts(listeners: .complete(tcpPorts: [8920, 8921], udpPorts: []))
+        let model = GuidedServerSetupModel(localClient: LocalMacSetupClient(
+            inspector: StubLocalInspector(.facts(occupied))))
+        model.advance()
+        await model.verifyAndInspectHost()
+        #expect(model.hostChecks["Product ports"] != .passed)
+        #expect(model.suggestedProductPorts == [8922, 8923, 8924])
+        model.setProductPort("8922")
+        #expect(model.hostChecks["Product ports"] == .passed)
+        #expect(model.canContinueFromCurrentPhase)
+    }
+
     @Test("lsof parser extracts TCP and UDP ports")
     func lsofParser() throws {
         let sample = Data("""

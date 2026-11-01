@@ -239,6 +239,33 @@ struct GuidedSetupView: View {
                     }
                 }
 
+                if model.localPreflight != nil || model.hostPreflight != nil {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Connection port")
+                            TextField("Port", text: Binding(
+                                get: { model.productPort },
+                                set: { model.setProductPort($0) }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 90)
+                            .accessibilityLabel("Connection port")
+                        }
+                        if !model.suggestedProductPorts.isEmpty {
+                            HStack {
+                                Text("Alternatives:")
+                                ForEach(model.suggestedProductPorts, id: \.self) { port in
+                                    Button(String(port)) { model.setProductPort(String(port)) }
+                                }
+                            }
+                            .font(.caption)
+                            Text("Suggestions are not reserved; an incomplete check cannot verify availability.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
                 DisclosureGroup("Details") {
                     VStack(alignment: .leading, spacing: 12) {
                         if model.route == .thisMac {

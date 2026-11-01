@@ -45,6 +45,7 @@ struct HelicoidComputerApp: App {
         Window("Helicoid Computer", id: "status") {
             StatusWindowView()
                 .environmentObject(model)
+                .disclosureGroupStyle(FullWidthDisclosureGroupStyle())
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                     model.refreshPermissions()
                 }
