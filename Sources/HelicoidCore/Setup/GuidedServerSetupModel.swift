@@ -347,9 +347,11 @@ public final class GuidedServerSetupModel {
         hostChecks[name] = status
     }
 
-    public func startHostCheck() {
+    public func startHostCheck(usingAdministratorAccess: Bool = false) {
         guard !isCheckingHost else { return }
-        verificationTask = Task { [weak self] in await self?.verifyAndInspectHost() }
+        verificationTask = Task { [weak self] in
+            await self?.verifyAndInspectHost(usingAdministratorAccess: usingAdministratorAccess)
+        }
     }
 
     public func cancelHostCheck() {
@@ -360,7 +362,7 @@ public final class GuidedServerSetupModel {
         if case .checking = hostIdentity { hostIdentity = .notChecked }
     }
 
-    public func verifyAndInspectHost() async {
+    public func verifyAndInspectHost(usingAdministratorAccess: Bool = false) async {
         guard !Task.isCancelled, !isCheckingHost else { return }
         let generation = UUID()
         verificationGeneration = generation
@@ -378,7 +380,7 @@ public final class GuidedServerSetupModel {
             case .thisMac:
                 localPreflight = nil
                 localPreflightFailure = nil
-                let result = try await localClient.preflight()
+                let result = try await localClient.preflight(usingAdministratorAccess: usingAdministratorAccess)
                 try Task.checkCancellation()
                 guard generation == verificationGeneration else { return }
                 localPreflight = result

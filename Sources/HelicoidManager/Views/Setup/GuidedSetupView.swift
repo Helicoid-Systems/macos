@@ -73,10 +73,10 @@ struct GuidedSetupView: View {
 
     private var contentSize: NSSize {
         switch model.phase {
-        case .chooseHosting: NSSize(width: 520, height: 280)
-        case .connect: NSSize(width: 520, height: 260)
-        case .hostIdentity, .checkHost: NSSize(width: 520, height: 420)
-        default: NSSize(width: 520, height: 400)
+        case .chooseHosting: NSSize(width: 680, height: 340)
+        case .connect: NSSize(width: 680, height: 320)
+        case .hostIdentity, .checkHost: NSSize(width: 680, height: 620)
+        default: NSSize(width: 680, height: 500)
         }
     }
 
@@ -236,6 +236,18 @@ struct GuidedSetupView: View {
                 VStack(spacing: 12) {
                     ForEach(requiredChecks, id: \.self) { name in
                         summaryCheckRow(name)
+                    }
+                }
+
+                if model.route == .thisMac, model.localPreflight?.listeners.isComplete == false {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Button("Check Ports with Administrator Access") {
+                            model.startHostCheck(usingAdministratorAccess: true)
+                        }
+                        .disabled(model.isCheckingHost)
+                        Text("macOS will ask for administrator authorization to inspect system-owned listeners.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
 

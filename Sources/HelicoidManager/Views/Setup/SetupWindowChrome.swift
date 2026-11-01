@@ -82,10 +82,10 @@ final class WindowChromeView: NSView {
 
         let size: NSSize
         switch screen {
-        case .connect: window.title = "Connect"; size = NSSize(width: 520, height: 220)
-        case .signIn: window.title = "Sign In"; size = NSSize(width: 520, height: 360)
-        case .verify: window.title = "Verify Server"; size = NSSize(width: 600, height: 440)
-        case .guidedSetup: window.title = "Server Setup"; size = NSSize(width: 520, height: setupHeight)
+        case .connect: window.title = "Connect"; size = NSSize(width: 620, height: 300)
+        case .signIn: window.title = "Sign In"; size = NSSize(width: 620, height: 440)
+        case .verify: window.title = "Verify Server"; size = NSSize(width: 680, height: 520)
+        case .guidedSetup: window.title = "Server Setup"; size = NSSize(width: 680, height: setupHeight)
         case .computers: window.title = "Computers"; size = NSSize(width: 1120, height: 760)
         }
         let expectedScreen = screen

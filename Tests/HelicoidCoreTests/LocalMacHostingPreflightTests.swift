@@ -433,6 +433,38 @@ struct LocalMacHostingPreflightTests {
         }
     }
 
+    @Test("Explicit administrator inspection reports system listeners and blocks occupied ports")
+    func administratorInspectionUsesPrivilegedResults() async throws {
+        let empty = SetupCommandResult(exitStatus: 1, output: Data())
+        let tcp = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nrootd 1 root 3u IPv4 0x1 0t0 TCP *:8920 (LISTEN)\n"
+        let runner = FixtureCommandRunner([
+            lsofKey("TCP"): empty, lsofKey("UDP"): empty,
+            launchdKey: SetupCommandResult(exitStatus: 1, output: Data(), errorOutput: Data("Could not find service\n".utf8)),
+            .init(executable: "/usr/bin/osascript", arguments: ["-e", SystemLocalHostingInspector.administratorInspectionScript]):
+                SetupCommandResult(exitStatus: 0, output: Data((tcp + "__HELICOID_UDP__\n").utf8)),
+        ])
+        let result = try await LocalMacSetupClient(inspector: SystemLocalHostingInspector(runner: runner))
+            .preflight(usingAdministratorAccess: true)
+        #expect(result.listeners.isComplete)
+        #expect(result.checks()["Product ports"] != .passed)
+        #expect(result.checks(authorityPort: 8921)["Product ports"] == .passed)
+    }
+
+    @Test("Cancelled administrator inspection does not report ports as free")
+    func administratorInspectionFailureBlocks() async {
+        let empty = SetupCommandResult(exitStatus: 1, output: Data())
+        let runner = FixtureCommandRunner([
+            lsofKey("TCP"): empty, lsofKey("UDP"): empty,
+            launchdKey: SetupCommandResult(exitStatus: 1, output: Data(), errorOutput: Data("Could not find service\n".utf8)),
+            .init(executable: "/usr/bin/osascript", arguments: ["-e", SystemLocalHostingInspector.administratorInspectionScript]):
+                SetupCommandResult(exitStatus: 1, output: Data(), errorOutput: Data("User canceled\n".utf8)),
+        ])
+        await #expect(throws: HelicoidError.self) {
+            try await LocalMacSetupClient(inspector: SystemLocalHostingInspector(runner: runner))
+                .preflight(usingAdministratorAccess: true)
+        }
+    }
+
     @Test("Cancellation stops an in-flight local preflight")
     func cancellationStopsPreflight() async {
         let inspector = StubLocalInspector(.slow(healthyFacts, delayNanoseconds: 2_000_000_000))

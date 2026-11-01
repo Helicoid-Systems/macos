@@ -16,7 +16,7 @@ struct HelicoidManagerApp: App {
                 .environment(session)
                 .disclosureGroupStyle(FullWidthDisclosureGroupStyle())
         }
-        .defaultSize(width: 520, height: 220)
+        .defaultSize(width: 620, height: 300)
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About Helicoid Manager") {
@@ -121,13 +121,13 @@ struct RootView: View {
     private var rootSize: (minWidth: CGFloat, idealWidth: CGFloat, minHeight: CGFloat, idealHeight: CGFloat) {
         switch session.screen {
         case .connect:
-            (520, 520, 220, 220)
+            (620, 620, 300, 300)
         case .signIn:
-            (520, 520, 360, 360)
+            (620, 620, 440, 440)
         case .verify:
-            (600, 600, 440, 440)
+            (680, 680, 520, 520)
         case .guidedSetup:
-            (520, 520, 200, setupWindowHeight)
+            (680, 680, 200, setupWindowHeight)
         case .computers:
             (720, 1120, 480, 760)
         }

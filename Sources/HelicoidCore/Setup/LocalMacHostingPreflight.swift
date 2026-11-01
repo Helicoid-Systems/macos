@@ -234,6 +234,13 @@ public struct LocalHostPreflight: Equatable, Sendable {
 
 public protocol LocalHostingInspecting: Sendable {
     func inspect() async throws -> LocalHostPreflight
+    func inspectWithAdministratorAccess() async throws -> LocalHostPreflight
+}
+
+public extension LocalHostingInspecting {
+    func inspectWithAdministratorAccess() async throws -> LocalHostPreflight {
+        throw HelicoidError.setupBlocked(reason: "Administrator port inspection is unavailable.")
+    }
 }
 
 /// Gathers local facts read-only and within bounded command output/time limits.
@@ -266,6 +273,45 @@ public struct SystemLocalHostingInspector: LocalHostingInspecting {
             launchdService: launchdService,
             listeners: listeners
         )
+    }
+
+    // Fixed command only: no user-supplied values are passed to the privileged shell.
+    static let administratorInspectionScript: String = {
+        let command = #"""
+        tcp=$(/usr/sbin/lsof -nP -iTCP -sTCP:LISTEN 2>&1); status=$?; if [ "$status" -ne 0 ]; then [ "$status" -eq 1 ] && [ -z "$tcp" ] || exit 1; fi;
+        udp=$(/usr/sbin/lsof -nP -iUDP 2>&1); status=$?; if [ "$status" -ne 0 ]; then [ "$status" -eq 1 ] && [ -z "$udp" ] || exit 1; fi;
+        printf '%s\n' "$tcp" '__HELICOID_UDP__' "$udp"
+        """#
+        let escaped = command.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+        return "do shell script \"\(escaped)\" with administrator privileges"
+    }()
+
+    public func inspectWithAdministratorAccess() async throws -> LocalHostPreflight {
+        let facts = try await inspect()
+        try Task.checkCancellation()
+        let result = try await runner.run(SetupCommand(
+            executable: "/usr/bin/osascript",
+            arguments: ["-e", Self.administratorInspectionScript],
+            timeoutSeconds: 120,
+            outputLimit: 131_072))
+        try Task.checkCancellation()
+        guard result.exitStatus == 0, result.errorOutput.isEmpty,
+              let output = String(data: result.output, encoding: .utf8) else {
+            throw HelicoidError.setupBlocked(reason: "Administrator port inspection was cancelled or failed.")
+        }
+        let sections = output.components(separatedBy: "__HELICOID_UDP__")
+        guard sections.count == 2 else {
+            throw HelicoidError.setupBlocked(reason: "Administrator port inspection returned an invalid result.")
+        }
+        let tcp = try LocalHostPreflight.ports(fromLsof: Data(sections[0].utf8))
+        let udp = try LocalHostPreflight.ports(fromLsof: Data(sections[1].utf8))
+        return LocalHostPreflight(
+            computerName: facts.computerName, osVersion: facts.osVersion, architecture: facts.architecture,
+            launchdAvailable: facts.launchdAvailable, administratorAccess: facts.administratorAccess,
+            freeBytes: facts.freeBytes, productPath: facts.productPath, launchdService: facts.launchdService,
+            listeners: .complete(tcpPorts: tcp, udpPorts: udp))
     }
 
     private func inspectListeners() async throws -> ListenerInspection {
@@ -409,9 +455,11 @@ public struct LocalMacSetupClient: Sendable {
         self.inspector = inspector
     }
 
-    public func preflight() async throws -> LocalHostPreflight {
+    public func preflight(usingAdministratorAccess: Bool = false) async throws -> LocalHostPreflight {
         try Task.checkCancellation()
-        let result = try await inspector.inspect()
+        let result = try await usingAdministratorAccess
+            ? inspector.inspectWithAdministratorAccess()
+            : inspector.inspect()
         try Task.checkCancellation()
         try result.validate()
         return result
