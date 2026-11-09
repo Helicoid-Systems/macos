@@ -595,6 +595,14 @@ public actor NativeV2AuthClient {
         clearPendingChallenge()
     }
 
+    /// Clear local session material only when the live bearer still belongs to
+    /// `token`. A replacement session installed while the caller was awaiting
+    /// is left untouched.
+    func signOutLocal(ifToken token: String) {
+        guard liveSession?.token == token else { return }
+        signOutLocal()
+    }
+
     public func dispose() {
         signOutLocal()
     }

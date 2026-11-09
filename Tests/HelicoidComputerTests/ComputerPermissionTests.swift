@@ -76,6 +76,31 @@ struct ComputerPermissionPolicyTests {
         #expect(state.headline == "Control Status Unavailable")
     }
 
+    @Test("Menu access summary is absent before connection and present once connected")
+    func menuAccessSummaryDoesNotClaimAccessBeforeConnection() {
+        let probe = ScriptedPermissionProbe(statuses: [:])
+
+        let notConfigured = ComputerStatusModel(permissionProbe: probe)
+        #expect(notConfigured.menuAccessSummary == nil)
+
+        let connected = ComputerStatusModel(connection: .connected, permissionProbe: probe)
+        #expect(connected.menuAccessSummary == "No Active Screen Access")
+
+        let observed = ComputerStatusModel(
+            connection: .connected,
+            screenAccess: .observed(operators: ["Morgan"]),
+            permissionProbe: probe
+        )
+        #expect(observed.menuAccessSummary == "Morgan Is Viewing Your Screen")
+
+        let observedAfterDisconnect = ComputerStatusModel(
+            connection: .disconnected(reason: "Server unavailable"),
+            screenAccess: .observed(operators: ["Morgan"]),
+            permissionProbe: probe
+        )
+        #expect(observedAfterDisconnect.menuAccessSummary == "Morgan Is Viewing Your Screen")
+    }
+
     @Test("Granted is available; missing and unknown are unavailable")
     func statusAvailabilityDistinguishesGrantedMissingUnknown() {
         #expect(ComputerPermissionStatus.granted.isAvailable)

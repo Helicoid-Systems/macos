@@ -83,7 +83,9 @@ struct StatusMenuContent: View {
     var body: some View {
         Section {
             Text("Connection: \(model.connection.label)")
-            Text(model.screenAccess.headline)
+            if let accessSummary = model.menuAccessSummary {
+                Text(accessSummary)
+            }
         }
 
         if model.isFixturesMode {
@@ -98,7 +100,7 @@ struct StatusMenuContent: View {
                 openWindow(id: "status")
             }
 
-            Button("Settings…") {
+            Button(model.settingsMenuTitle) {
                 NSApp.activate(ignoringOtherApps: true)
                 openWindow(id: "settings")
             }
@@ -178,8 +180,10 @@ struct StatusWindowView: View {
                     .accessibilityLabel(reason)
             }
 
-            Text(model.screenAccess.headline)
-                .font(.headline)
+            if let accessSummary = model.menuAccessSummary {
+                Text(accessSummary)
+                    .font(.headline)
+            }
 
             if let names = observedNames, names.count > 1 {
                 VStack(alignment: .leading, spacing: 2) {
@@ -423,22 +427,14 @@ struct FileRequestSubmissionSheet: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    List(model.availableFileRequests) { request in
-                        Button {
-                            selectedRequestID = request.id
-                        } label: {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(request.title)
-                                    .font(.headline)
-                                Text("Allowed: \(request.allowedExtensionSummary) · \(ByteCountFormatter.string(fromByteCount: Int64(request.maxTotalSizeBytes), countStyle: .file)) maximum")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
+                    List(selection: $selectedRequestID) {
+                        ForEach(model.availableFileRequests) { request in
+                            Text(request.title)
+                                .font(.headline)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                                .tag(request.id)
                         }
-                        .buttonStyle(.plain)
-                        .listRowBackground(selectedRequestID == request.id ? Color.accentColor.opacity(0.12) : Color.clear)
                     }
                     .frame(minHeight: 180, maxHeight: 250)
                 }

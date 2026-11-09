@@ -39,8 +39,12 @@ public final class AuthSignInCoordinator {
     private let client: NativeV2AuthClient
     /// Install fence for session UI installation.
     private var installGate = AuthInstallGate()
-    /// Inventory fence: bumped on sign-out/cancel so late inventory cannot re-install.
+    /// Inventory lifecycle fence: bumped on sign-out/cancel/session replacement so
+    /// late inventory cannot re-install after the session it belongs to ends.
     private var inventoryGeneration: UInt64 = 0
+    /// Per-refresh fence: every reload gets a new token. Automatic and manual
+    /// loads share it, so only the newest request may publish a result.
+    private var inventoryRefreshGeneration: UInt64 = 0
     private var signInTask: Task<Void, Never>?
     private var ownedSignInToken: UInt64?
     /// Owned session-expiry sleeper. Cancelled on replacement/sign-out.
@@ -68,7 +72,16 @@ public final class AuthSignInCoordinator {
             signInTask = nil
         }
         cancelSessionExpiryTask()
+        invalidateInventoryRefreshes()
         return token
+    }
+
+    /// Fence every inventory request belonging to the previous session/refresh.
+    /// Both the lifecycle stamp and the newest-request stamp move together so
+    /// an in-flight response can never publish across a session boundary.
+    private func invalidateInventoryRefreshes() {
+        inventoryGeneration &+= 1
+        inventoryRefreshGeneration &+= 1
     }
 
     private func cancelSessionExpiryTask() {
@@ -154,6 +167,8 @@ public final class AuthSignInCoordinator {
             // operation's client challenge/session material.
             return
         }
+        // Session replacement invalidates every load started by a prior session.
+        invalidateInventoryRefreshes()
         self.session = session
         pendingChallenge = nil
         authCode = ""
@@ -163,7 +178,9 @@ public final class AuthSignInCoordinator {
         phase = .signedIn
         startSessionExpiryWatch(installToken: installToken)
         await reloadInventory(installToken: installToken)
-        noteStateChanged()
+        if ownsOperation(installToken) {
+            noteStateChanged()
+        }
     }
 
     /// Publish UI-relevant state to the weak facade observer.
@@ -196,16 +213,26 @@ public final class AuthSignInCoordinator {
     /// UI expiry: clear session + inventory and return to sign-in.
     /// Not a public mutation knob — tests advance a wakeable clock instead.
     func applySessionExpired(installToken: UInt64) {
+        endSession(
+            with: .sessionExpired(detail: "Your session expired. Sign in again."),
+            installToken: installToken
+        )
+    }
+
+    /// Fail-closed teardown shared by expiry and credential/permission loss.
+    /// Clears secrets, inventory, and the session stamp so stale observers and
+    /// window keys cannot keep presenting the previous session.
+    private func endSession(with error: HelicoidError, installToken: UInt64) {
         guard ownsOperation(installToken) else { return }
         cancelSessionExpiryTask()
-        inventoryGeneration &+= 1
+        invalidateInventoryRefreshes()
         session = nil
         inventory = []
         pendingChallenge = nil
         authCode = ""
         authCodeError = nil
         authCodeState = .idle
-        signInError = .sessionExpired(detail: "Your session expired. Sign in again.")
+        signInError = error
         phase = .awaitingCredentials
         noteStateChanged()
     }
@@ -273,8 +300,6 @@ public final class AuthSignInCoordinator {
     /// Explicit sign-out. Invalidates inventory and session install.
     public func signOut() async {
         beginOperation()
-        cancelSessionExpiryTask()
-        inventoryGeneration &+= 1
         pendingChallenge = nil
         authCode = ""
         authCodeError = nil
@@ -287,41 +312,61 @@ public final class AuthSignInCoordinator {
         noteStateChanged()
     }
 
-    /// Inventory reload fenced against sign-out and newer operations.
+    /// Inventory reload fenced against sign-out, session replacement, and every
+    /// other overlapping automatic/manual reload.
     public func reloadInventory() async {
         await reloadInventory(installToken: installGate.generation)
     }
 
     private func reloadInventory(installToken: UInt64) async {
-        let inventoryToken = inventoryGeneration
-        guard ownsOperation(installToken) else { return }
+        // No session means there is nothing whose inventory we may publish.
+        guard ownsOperation(installToken), session != nil else { return }
+
+        // Newest request wins. Older in-flight responses are discarded even if
+        // they arrive last, before any observer or facade can install them.
+        inventoryRefreshGeneration &+= 1
+        let refreshToken = inventoryRefreshGeneration
+        let lifecycleToken = inventoryGeneration
+
         let result = await client.authorizedInventory()
         // A late inventory response must not restore prior inventory after
-        // sign-out, cancel, or a newer sign-in.
-        guard ownsOperation(installToken), inventoryToken == inventoryGeneration else {
+        // sign-out, cancel, session replacement, or a newer refresh.
+        guard ownsOperation(installToken),
+              refreshToken == inventoryRefreshGeneration,
+              lifecycleToken == inventoryGeneration else {
             return
         }
         switch result {
         case .success(let computers):
             inventory = computers
+            // A successful reload supersedes any stale refresh failure.
+            signInError = nil
+            noteStateChanged()
         case .failure(let error):
             switch error {
             case .sessionExpired, .authenticationFailed:
                 // Confirmed credential loss for this request. Clear auth state.
-                guard ownsOperation(installToken) else { return }
-                applySessionExpired(installToken: installToken)
-                signInError = error
+                endSession(with: error, installToken: installToken)
             case .permissionDenied:
-                // Operation denial only — keep the permitted session.
-                inventory = []
-                signInError = error
-                noteStateChanged()
+                // Inventory denial is not safe to keep presenting: fail closed
+                // exactly like expiry, including the client's live bearer.
+                // Token-scoped so a concurrent replacement cannot be cleared.
+                if let token = session?.token {
+                    await client.signOutLocal(ifToken: token)
+                }
+                // The low-level 403 text says the session remains active, which
+                // is no longer true after this teardown. Publish honest copy.
+                endSession(
+                    with: .permissionDenied(
+                        detail: "Access to management inventory was denied. Sign in again or ask an administrator."
+                    ),
+                    installToken: installToken
+                )
             default:
                 signInError = error
                 noteStateChanged()
             }
         }
-        noteStateChanged()
     }
 
     // MARK: - Test/inspection seams for causal gates

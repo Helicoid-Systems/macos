@@ -73,6 +73,12 @@ public enum InventoryEmptyReason: Hashable, Sendable {
         }
     }
 
+    /// The empty state offers this action itself, so the scope line must not
+    /// repeat it on the same screen.
+    public var offersClearFiltersAction: Bool {
+        self == .noResults
+    }
+
     public static func reason(
         authorizedCount: Int,
         includedCount: Int,

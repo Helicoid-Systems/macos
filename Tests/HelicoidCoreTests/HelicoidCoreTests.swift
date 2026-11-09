@@ -243,6 +243,26 @@ struct OverviewModelTests {
 
 @Suite("Guided server setup")
 struct GuidedServerSetupTests {
+    @Test("Demo simulates local setup without enabling real enrollment")
+    @MainActor
+    func localSetupDemo() async {
+        let model = GuidedServerSetupModel(demoMode: true)
+        model.setRoute(.existingLinuxSSH)
+        #expect(model.route == .thisMac)
+        model.setStoragePath(model.route.defaultStoragePath)
+        model.advance()
+        await model.verifyAndInspectHost(usingAdministratorAccess: true)
+        #expect(model.localPreflight == nil)
+        #expect(model.canContinueFromCurrentPhase)
+        for phase in [SetupPhase.network, .deploymentIdentity, .administrator, .storage, .review, .install, .ready] {
+            model.advance()
+            #expect(model.phase == phase)
+        }
+        await model.prepareManagerIdentity()
+        #expect(model.initiatingManagerPublicKey == nil)
+        #expect(!model.isServerReadyForEnrollment)
+    }
+
     @Test("Mac manager exposes This Mac and Linux SSH routes")
     @MainActor
     func hostingRoutes() {

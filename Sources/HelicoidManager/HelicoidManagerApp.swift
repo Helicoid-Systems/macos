@@ -6,7 +6,10 @@ struct HelicoidManagerApp: App {
     @State private var session: ManagerSession
 
     init() {
-        let config = ManagerLaunchConfiguration.parse(arguments: CommandLine.arguments)
+        var config = ManagerLaunchConfiguration.parse(arguments: CommandLine.arguments)
+        if Bundle.main.bundleIdentifier == "systems.helicoid.manager.main-demo" {
+            config = ManagerLaunchConfiguration(useSourceFixtures: true)
+        }
         _session = State(initialValue: ManagerSession(configuration: config))
     }
 
@@ -54,6 +57,17 @@ struct HelicoidManagerApp: App {
                 .disabled(session.screen != .computers)
 
                 Divider()
+
+                Button("Refresh Inventory") {
+                    Task { await session.reloadInventory() }
+                }
+                .keyboardShortcut("r")
+                .disabled(
+                    session.screen != .computers
+                        || session.isFixturesMode
+                        || session.phase != .signedIn
+                        || session.isReloadingInventory
+                )
 
                 Button("Pause Monitoring") {
                     session.overview.pauseMonitoring()

@@ -16,6 +16,23 @@ struct ManagerPresentationTests {
         return session
     }
 
+    @Test("Example edits stay in fixture sessions")
+    func exampleEdits() {
+        let example = Computer(id: ComputerID("example-test"), name: "Example", isOnline: true)
+        let demo = makeFixtureSession()
+        #expect(demo.screen == .computers)
+        demo.saveExampleComputer(example)
+        #expect(demo.computer(with: example.id) == example)
+        var renamed = example
+        renamed.name = "Renamed"
+        demo.saveExampleComputer(renamed)
+        #expect(demo.computer(with: example.id)?.name == "Renamed")
+        let normal = ManagerSession(configuration: ManagerLaunchConfiguration())
+        normal.saveExampleComputer(example)
+        #expect(normal.computer(with: example.id) == nil)
+        #expect(makeFixtureSession().computer(with: example.id) == nil)
+    }
+
     // MARK: - View window demand
 
     @Test("Open dedupes per computer")
@@ -197,6 +214,13 @@ struct ManagerPresentationTests {
         #expect(session.overview.scope.displayedIDs.isEmpty == false)
     }
 
+    @Test("Only the no-results empty state owns Clear Filters")
+    func clearFiltersActionOwnership() {
+        #expect(InventoryEmptyReason.noResults.offersClearFiltersAction)
+        #expect(InventoryEmptyReason.noAuthorizedInventory.offersClearFiltersAction == false)
+        #expect(InventoryEmptyReason.noneIncluded.offersClearFiltersAction == false)
+    }
+
     @Test("Choose Computers opens panel and does not auto-select All")
     func chooseComputersOpensPanelOnly() {
         let session = makeFixtureSession()
@@ -258,4 +282,264 @@ struct ManagerPresentationTests {
         #expect(session.overview.isMonitoringPaused == false)
         #expect(session.overview.admittedStreams[ComputerID("fixture-lab-01")] == .requesting)
     }
+
+    // MARK: - Inventory refresh
+
+    @Test("Manual refresh shows progress and applies authorized inventory")
+    func inventoryRefreshProgressAndSuccess() async {
+        let client = ScriptedInventoryClient()
+        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        session.phase = .signedIn
+        session.screen = .computers
+        let refreshed = Computer(id: ComputerID("refresh-1"), name: "Refresh One", isOnline: true)
+
+        let task = Task { await session.reloadInventory() }
+        await client.waitUntilRequested()
+        #expect(session.isReloadingInventory)
+
+        client.enqueue(.success([refreshed]))
+        await task.value
+
+        #expect(session.overview.authorizedInventory == [refreshed])
+        #expect(session.inventoryReloadError == nil)
+        #expect(session.isReloadingInventory == false)
+        #expect(session.phase == .signedIn)
+    }
+
+    @Test("Failed refresh keeps last known inventory and exposes Retry")
+    func inventoryRefreshFailurePreservesInventory() async {
+        let client = ScriptedInventoryClient()
+        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        session.phase = .signedIn
+        session.screen = .computers
+        let existing = Computer(id: ComputerID("known-1"), name: "Known One", isOnline: true)
+        session.overview.setInventory([existing])
+
+        client.enqueue(.failure(.unreachable))
+        await session.reloadInventory()
+
+        #expect(session.overview.authorizedInventory == [existing])
+        #expect(session.inventoryReloadError == .unreachable)
+        #expect(session.isReloadingInventory == false)
+        #expect(session.phase == .signedIn)
+        #expect(session.screen == .computers)
+    }
+
+    @Test("Permission loss during refresh ends the session instead of keeping stale access")
+    func inventoryRefreshPermissionLoss() async {
+        let client = ScriptedInventoryClient()
+        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        session.phase = .signedIn
+        session.screen = .computers
+        session.overview.setInventory([
+            Computer(id: ComputerID("known-1"), name: "Known One", isOnline: true)
+        ])
+
+        client.enqueue(.failure(.permissionDenied(detail: "Access was revoked.")))
+        await session.reloadInventory()
+
+        #expect(session.overview.authorizedInventory.isEmpty)
+        #expect(session.screen == .signIn)
+        #expect(session.phase == .needsSignIn)
+        #expect(session.inventoryReloadError == .permissionDenied(detail: "Access was revoked."))
+    }
+
+    @Test(
+        "Credential loss during refresh ends the session and clears inventory",
+        arguments: [
+            HelicoidError.sessionExpired(detail: "Your session expired. Sign in again."),
+            HelicoidError.authenticationFailed(detail: "Sign-in was refused."),
+        ]
+    )
+    func inventoryRefreshCredentialLoss(error: HelicoidError) async {
+        let client = ScriptedInventoryClient()
+        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        session.phase = .signedIn
+        session.screen = .computers
+        let existing = Computer(id: ComputerID("known-1"), name: "Known One", isOnline: true)
+        session.overview.setInventory([existing])
+        #expect(session.openRemoteView(for: existing.id) != nil)
+
+        client.enqueue(.failure(error))
+        await session.reloadInventory()
+
+        #expect(session.overview.authorizedInventory.isEmpty)
+        #expect(session.openRemoteWindows.isEmpty)
+        #expect(session.screen == .signIn)
+        #expect(session.phase == .needsSignIn)
+        #expect(session.inventoryReloadError == error)
+        #expect(session.signInError == error)
+        #expect(session.isReloadingInventory == false)
+    }
+
+    @Test("Failed refresh then successful retry clears the stale error")
+    func inventoryRefreshRetryClearsError() async {
+        let client = ScriptedInventoryClient()
+        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        session.phase = .signedIn
+        session.screen = .computers
+        let existing = Computer(id: ComputerID("known-1"), name: "Known One", isOnline: true)
+        session.overview.setInventory([existing])
+
+        client.enqueue(.failure(.unreachable))
+        await session.reloadInventory()
+        #expect(session.overview.authorizedInventory == [existing])
+        #expect(session.inventoryReloadError == .unreachable)
+        #expect(session.signInError == .unreachable)
+        #expect(session.phase == .signedIn)
+
+        let refreshed = Computer(id: ComputerID("refresh-2"), name: "Refresh Two", isOnline: true)
+        client.enqueue(.success([refreshed]))
+        await session.reloadInventory()
+
+        #expect(session.overview.authorizedInventory == [refreshed])
+        #expect(session.inventoryReloadError == nil)
+        #expect(session.signInError == nil)
+        #expect(session.phase == .signedIn)
+        #expect(session.isReloadingInventory == false)
+    }
+
+    @Test("Refresh response after sign-out cannot repopulate inventory")
+    func staleRefreshAfterSignOut() async {
+        let client = ScriptedInventoryClient()
+        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        session.phase = .signedIn
+        session.screen = .computers
+
+        let task = Task { await session.reloadInventory() }
+        await client.waitUntilRequested()
+        #expect(session.isReloadingInventory)
+
+        await session.signOut()
+        client.enqueue(.success([
+            Computer(id: ComputerID("late-1"), name: "Late One", isOnline: true)
+        ]))
+        await task.value
+
+        #expect(session.overview.authorizedInventory.isEmpty)
+        #expect(session.inventoryReloadError == nil)
+        #expect(session.isReloadingInventory == false)
+        #expect(session.screen == .connect)
+        #expect(session.phase == .notConfigured)
+    }
+
+    @Test("Newer refresh wins when an older response arrives later")
+    func newerRefreshSupersedesOlderResponse() async {
+        let client = ScriptedInventoryClient()
+        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        session.phase = .signedIn
+        session.screen = .computers
+        let older = Computer(id: ComputerID("older-1"), name: "Older", isOnline: true)
+        let newer = Computer(id: ComputerID("newer-1"), name: "Newer", isOnline: true)
+
+        let first = Task { await session.reloadInventory() }
+        await client.waitUntilRequested(count: 1)
+        let second = Task { await session.reloadInventory() }
+        await client.waitUntilRequested(count: 2)
+
+        // Complete the newer request first, then let the superseded one return.
+        client.enqueue(.success([newer]))
+        await second.value
+        client.enqueue(.success([older]))
+        await first.value
+
+        #expect(session.overview.authorizedInventory == [newer])
+        #expect(session.inventoryReloadError == nil)
+        #expect(session.isReloadingInventory == false)
+    }
+
+    @Test("Fixture sessions do not refresh or replace edited examples")
+    func fixturesRefreshIsNoOp() async {
+        let session = makeFixtureSession()
+        let before = session.overview.authorizedInventory
+
+        await session.reloadInventory()
+
+        #expect(session.overview.authorizedInventory == before)
+        #expect(session.inventoryReloadError == nil)
+        #expect(session.isReloadingInventory == false)
+    }
+}
+
+/// Scripted inventory boundary. Without a queued result the request suspends
+/// so progress and stale-response fencing are observable.
+private final class ScriptedInventoryClient: ConnectionClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var queued: [Result<[Computer], HelicoidError>] = []
+    private var pending: [CheckedContinuation<Result<[Computer], HelicoidError>, Never>] = []
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var requestCount = 0
+
+    func enqueue(_ result: Result<[Computer], HelicoidError>) {
+        lock.lock()
+        if pending.isEmpty {
+            queued.append(result)
+            lock.unlock()
+        } else {
+            // LIFO lets a test release a newer request before an older one.
+            let continuation = pending.removeLast()
+            lock.unlock()
+            continuation.resume(returning: result)
+        }
+    }
+
+    func waitUntilRequested(count: Int = 1) async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if requestCount >= count {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                startWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+
+    func validateAddress(_ address: String) async -> AddressValidation {
+        _ = address
+        return AddressValidation(outcome: .ok)
+    }
+
+    func connect(address: String) async -> Result<ServerIdentity, HelicoidError> {
+        _ = address
+        return .failure(.serverContractUnavailable)
+    }
+
+    func trust(identity: ServerIdentity, address: String) async -> Result<Void, HelicoidError> {
+        _ = identity
+        _ = address
+        return .failure(.serverContractUnavailable)
+    }
+
+    func signIn(username: String, password: String) async -> Result<OperatorID, HelicoidError> {
+        _ = username
+        _ = password
+        return .failure(.serverContractUnavailable)
+    }
+
+    func authorizedInventory() async -> Result<[Computer], HelicoidError> {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            requestCount += 1
+            let starts = startWaiters
+            startWaiters.removeAll()
+            if queued.isEmpty {
+                pending.append(continuation)
+                lock.unlock()
+                starts.forEach { $0.resume() }
+            } else {
+                let result = queued.removeFirst()
+                lock.unlock()
+                starts.forEach { $0.resume() }
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
+    func managerApprovalState() async -> Result<ManagerApprovalState, HelicoidError> {
+        .success(.approved)
+    }
+
+    func signOut() async {}
 }

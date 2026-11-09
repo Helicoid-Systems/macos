@@ -166,6 +166,7 @@ public final class GuidedServerSetupModel {
     public nonisolated static let packageUnavailableNotice =
         "Server installation is unavailable in this build."
 
+    public let isDemo: Bool
     private let sshClient: SSHSetupClient
     private let localClient: LocalMacSetupClient
     private let managerIdentityStore: ManagerIdentityStore
@@ -175,7 +176,14 @@ public final class GuidedServerSetupModel {
 
     public init(sshClient: SSHSetupClient = SSHSetupClient(),
                 localClient: LocalMacSetupClient = LocalMacSetupClient(),
-                managerIdentityStore: ManagerIdentityStore = ManagerIdentityStore()) {
+                managerIdentityStore: ManagerIdentityStore = ManagerIdentityStore(),
+                demoMode: Bool = false) {
+        self.isDemo = demoMode
+        if demoMode {
+            self.networkAddress = "127.0.0.1"
+            self.deploymentName = "My server"
+            self.administratorUsername = "admin"
+        }
         self.sshClient = sshClient
         self.localClient = localClient
         self.managerIdentityStore = managerIdentityStore
@@ -231,8 +239,8 @@ public final class GuidedServerSetupModel {
         case .review:
             return true
         case .install:
-            // Install cannot succeed in this build; Ready is not reachable by pretend success.
-            return false
+            // Only the explicitly selected demo can advance to a simulated result.
+            return isDemo
         case .ready:
             return true
         }
@@ -242,7 +250,7 @@ public final class GuidedServerSetupModel {
     /// Without a verified server package the walk ends at the install blocker:
     /// network/administrator/storage/review are never entered (H05).
     private var phaseOrder: [SetupPhase] {
-        let installTail: [SetupPhase] = Self.isServerPackageAvailable
+        let installTail: [SetupPhase] = (Self.isServerPackageAvailable || isDemo)
             ? [.network, .deploymentIdentity, .administrator, .storage, .review, .install, .ready]
             : [.install]
         switch route {
@@ -254,6 +262,7 @@ public final class GuidedServerSetupModel {
     }
 
     public func setRoute(_ value: HostingRoute) {
+        guard !isDemo || value == .thisMac else { return }
         guard value != route else { return }
         route = value
         cancelHostCheck()
@@ -364,6 +373,10 @@ public final class GuidedServerSetupModel {
 
     public func verifyAndInspectHost(usingAdministratorAccess: Bool = false) async {
         guard !Task.isCancelled, !isCheckingHost else { return }
+        if isDemo {
+            hostChecks = Dictionary(uniqueKeysWithValues: Self.requiredLocalChecks.map { ($0, .passed) })
+            return
+        }
         let generation = UUID()
         verificationGeneration = generation
         isCheckingHost = true
@@ -447,14 +460,14 @@ public final class GuidedServerSetupModel {
             return
         }
         let next = order[index + 1]
-        if next == .ready {
+        if next == .ready && !isDemo {
             // Ready for Enrollment is only reachable after a real install.
             // This build has no integrated server package, so it stays on Install with an honest refusal.
             installProgress = .refused(reason: HelicoidError.installNotAvailable.explanation)
             blocker = HelicoidError.installNotAvailable.explanation
             return
         }
-        if next == .install {
+        if next == .install && !isDemo {
             installProgress = .refused(reason: HelicoidError.installNotAvailable.explanation)
         }
         if next == .deploymentIdentity {

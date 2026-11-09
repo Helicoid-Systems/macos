@@ -118,14 +118,17 @@ struct RemoteDetailsPopover: View {
                 LabeledContent("Trusted user", value: user)
             }
             LabeledContent("Enrollment", value: computer.enrollmentState ?? "unknown")
-            if let status = computer.statusLabel {
+            if let status = detailStatus {
                 LabeledContent("Status", value: status)
-            }
-            if computer.needsAttention {
-                LabeledContent("Attention", value: computer.statusLabel ?? "Needs attention")
             }
         }
         .formStyle(.grouped)
         .frame(width: 320)
+    }
+
+    /// One status line carries both enrollment state and attention. The prior
+    /// separate Attention row repeated the same label whenever both were set.
+    private var detailStatus: String? {
+        computer.statusLabel ?? (computer.needsAttention ? "Needs attention" : nil)
     }
 }

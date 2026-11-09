@@ -395,8 +395,8 @@ struct SessionExpiryTests {
         #expect(weakClient == nil, "client must deallocate after dispose when no waiters remain")
     }
 
-    @Test("Coordinator 403 denies data but keeps signed-in session")
-    func coordinator403KeepsSession() async throws {
+    @Test("Coordinator 403 denies data and fails the UI session closed")
+    func coordinator403FailsClosed() async throws {
         let clock = ManualSessionTimeSource()
         let sequencer = SequencedTransport()
         let (client, key) = try await makeClient(transport: sequencer, clock: clock)
@@ -407,12 +407,20 @@ struct SessionExpiryTests {
         sequencer.enqueue(status: 200, body: inventoryJSON())
         await coordinator.signIn(username: "u", password: "p")
         #expect(coordinator.phase == .signedIn)
+        #expect(await client.hasLiveSession)
 
         sequencer.enqueue(status: 403, body: Data())
         await coordinator.reloadInventory()
-        #expect(coordinator.phase == .signedIn, "403 must not log the operator out")
+
+        // Denied inventory is not safe to keep presenting. Tear the UI session
+        // down exactly like credential loss so windows and generation advance.
+        #expect(coordinator.phase == .awaitingCredentials)
         #expect(coordinator.inventory.isEmpty, "denied data is not shown")
-        #expect(coordinator.session != nil)
+        #expect(coordinator.session == nil)
+        if case .permissionDenied = coordinator.signInError {} else {
+            Issue.record("expected permissionDenied, got \(String(describing: coordinator.signInError))")
+        }
+        #expect(await client.hasLiveSession == false, "fail-closed teardown clears the live bearer")
     }
 
 }

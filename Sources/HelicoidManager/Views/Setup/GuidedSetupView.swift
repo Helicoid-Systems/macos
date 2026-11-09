@@ -5,8 +5,12 @@ import HelicoidCore
 /// With no verified server package this is a read-only host check (H05).
 struct GuidedSetupView: View {
     @Environment(ManagerSession.self) private var session
-    @State private var model = GuidedServerSetupModel()
+    @State private var model = GuidedServerSetupModel(
+        demoMode: Bundle.main.bundleIdentifier == "systems.helicoid.manager.setup-demo"
+            || CommandLine.arguments.contains("--server-setup-demo")
+    )
     @FocusState private var focusedField: Field?
+    @State private var demoVerificationCode = ""
 
     private enum Field: Hashable {
         case sshAddress
@@ -18,6 +22,13 @@ struct GuidedSetupView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if model.isDemo {
+                Label("DEMO — simulated setup; nothing is installed or checked", systemImage: "eye")
+                    .font(.callout.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(8)
+                    .background(.yellow.opacity(0.25))
+            }
             if session.showDevelopmentBanner {
                 DevelopmentBanner()
             }
@@ -59,7 +70,8 @@ struct GuidedSetupView: View {
 
                 Button(nextButtonTitle, action: continueSetup)
                 .keyboardShortcut(.defaultAction)
-                .disabled(model.isCheckingHost || (!isHostCheck && !model.canContinueFromCurrentPhase))
+                .disabled(model.isCheckingHost || (!isHostCheck && !model.canContinueFromCurrentPhase)
+                    || (model.isDemo && model.phase == .install && demoVerificationCode != "123456"))
                 .help(model.canContinueFromCurrentPhase ? nextButtonTitle : continueDisabledReason)
             }
             .padding(.horizontal, 24)
@@ -151,8 +163,8 @@ struct GuidedSetupView: View {
             } else {
                 "Check Again"
             }
-        case .review: "Install"
-        case .install: "Install Unavailable"
+        case .review: model.isDemo ? "Preview Installation" : "Install"
+        case .install: model.isDemo ? "Simulate Installation" : "Install Unavailable"
         case .ready: "Done"
         default: "Continue"
         }
@@ -172,6 +184,9 @@ struct GuidedSetupView: View {
             } else {
                 model.startHostCheck()
             }
+        } else if model.phase == .ready && model.isDemo {
+            model.reset()
+            session.screen = .connect
         } else {
             model.advance()
         }
@@ -193,13 +208,15 @@ struct GuidedSetupView: View {
                     set: { model.setRoute($0) }
                 )) {
                     Label("This Mac", systemImage: "desktopcomputer").tag(HostingRoute.thisMac)
-                    Label("Existing Linux Server", systemImage: "server.rack").tag(HostingRoute.existingLinuxSSH)
+                    if !model.isDemo {
+                        Label("Existing Linux Server", systemImage: "server.rack").tag(HostingRoute.existingLinuxSSH)
+                    }
                 }
                 .pickerStyle(.radioGroup)
                 .labelsHidden()
                 .accessibilityLabel("Hosting route")
 
-                if !GuidedServerSetupModel.isServerPackageAvailable {
+                if !GuidedServerSetupModel.isServerPackageAvailable && !model.isDemo {
                     Text(GuidedServerSetupModel.packageUnavailableNotice)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -307,7 +324,7 @@ struct GuidedSetupView: View {
 
         case .network:
             Form {
-                Section("Network") {
+                Section {
                     TextField("Server address", text: Binding(
                         get: { model.networkAddress },
                         set: { model.setNetworkAddress($0) }
@@ -351,6 +368,8 @@ struct GuidedSetupView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                    } else if model.isDemo {
+                        Label("Manager identity will be created during a real installation", systemImage: "info.circle")
                     } else {
                         Label("Manager identity unavailable", systemImage: "exclamationmark.triangle")
                             .foregroundStyle(.orange)
@@ -398,12 +417,12 @@ struct GuidedSetupView: View {
 
         case .review:
             Form {
-                Section("Review Changes") {
+                Section {
                     ForEach(model.reviewChanges(), id: \.self) { line in
                         Text(line)
                             .font(.callout)
                     }
-                    Text(GuidedServerSetupModel.packageUnavailableNotice)
+                    Text(model.isDemo ? "Demo only — these changes will not be applied." : GuidedServerSetupModel.packageUnavailableNotice)
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -412,19 +431,27 @@ struct GuidedSetupView: View {
 
         case .install:
             VStack(alignment: .leading, spacing: 12) {
-                Label("Install Not Performed", systemImage: "xmark.octagon")
+                Label(model.isDemo ? "Ready to simulate installation" : "Install Not Performed", systemImage: model.isDemo ? "play.circle" : "xmark.octagon")
                     .font(.headline)
-                Text(model.installProgressExplanation)
+                Text(model.isDemo ? "Demo authenticator: enter the example code 123456. Do not enter a real password or authenticator code." : model.installProgressExplanation)
                     .font(.body)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
+                if model.isDemo {
+                    TextField("Example code: 123456", text: $demoVerificationCode)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 220)
+                    Text("No server, account, authenticator, or service will be created.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
         case .ready:
             VStack(alignment: .leading, spacing: 12) {
-                Label("Server Ready for Enrollment", systemImage: "checkmark.circle")
+                Label(model.isDemo ? "Demo setup complete" : "Server Ready for Enrollment", systemImage: "checkmark.circle")
                     .font(.headline)
-                Text("Next, enroll a computer.")
+                Text(model.isDemo ? "No server was installed, and no computer can be enrolled from this demo." : "Next, enroll a computer.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -439,7 +466,7 @@ struct GuidedSetupView: View {
                 .accessibilityHidden(true)
             Text(name)
             Spacer(minLength: 12)
-            Text(checkLabel(status))
+            Text(model.isDemo && status == .passed ? "Simulated" : checkLabel(status))
                 .foregroundStyle(.secondary)
         }
         .font(.callout)

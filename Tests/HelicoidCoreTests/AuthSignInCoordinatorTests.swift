@@ -77,10 +77,10 @@ struct AuthSignInCoordinatorTests {
         return try! JSONSerialization.data(withJSONObject: object)
     }
 
-    private func inventoryJSON() -> Data {
+    private func inventoryJSON(computerID: String = "computer-1") -> Data {
         let object: [String: Any] = [
             "computers": [[
-                "id": "computer-1",
+                "id": computerID,
                 "public_identity": "computer-key",
                 "enrollment_state": "enrolled",
             ] as [String: Any]],
@@ -196,6 +196,88 @@ struct AuthSignInCoordinatorTests {
         #expect(coordinator2.phase == .idle)
     }
 
+    @Test("Successful inventory retry clears a stale refresh error")
+    func successfulReloadClearsStaleError() async throws {
+        let identity = try makeIdentity()
+        let key = hexKey(identity)
+        let authority = try await makeAuthority()
+        let sequencer = SequencedTransport()
+        sequencer.enqueue(status: 201, body: beginJSON(managerKey: key, mfaRequired: false))
+        sequencer.enqueue(status: 200, body: loginJSON(managerKey: key, mfaRequired: false, mfaAvailable: false))
+        sequencer.enqueue(status: 500, body: Data())
+        let client = NativeV2AuthClient(transport: sequencer, trustedAuthority: authority, signingIdentity: identity)
+        let coordinator = AuthSignInCoordinator(client: client)
+
+        await coordinator.signIn(username: "operator", password: "pw")
+        #expect(coordinator.phase == .signedIn)
+        #expect(coordinator.signInError == .unreachable)
+        #expect(coordinator.inventory.isEmpty)
+
+        sequencer.enqueue(status: 200, body: inventoryJSON())
+        await coordinator.reloadInventory()
+
+        #expect(coordinator.signInError == nil)
+        #expect(coordinator.inventory.count == 1)
+    }
+
+    @Test("Newer inventory request wins when an older response arrives last")
+    func newerInventoryRequestSupersedesOlderResponse() async throws {
+        let identity = try makeIdentity()
+        let key = hexKey(identity)
+        let authority = try await makeAuthority()
+        let sequencer = SequencedTransport()
+        sequencer.enqueue(status: 201, body: beginJSON(managerKey: key, mfaRequired: false))
+        sequencer.enqueue(status: 200, body: loginJSON(managerKey: key, mfaRequired: false, mfaAvailable: false))
+        sequencer.enqueue(status: 200, body: inventoryJSON(computerID: "initial"))
+        let client = NativeV2AuthClient(transport: sequencer, trustedAuthority: authority, signingIdentity: identity)
+        let coordinator = AuthSignInCoordinator(client: client)
+        await coordinator.signIn(username: "operator", password: "pw")
+        #expect(coordinator.inventory.map(\.id.rawValue) == ["initial"])
+
+        // Older request starts first but returns last. The newer response is
+        // already installed and must not be replaced by the stale one.
+        let previousRequests = sequencer.startedRequestCount
+        sequencer.enqueueDelay(status: 200, body: inventoryJSON(computerID: "older"), delayNs: 250_000_000)
+        async let older: Void = coordinator.reloadInventory()
+        await sequencer.waitUntilRequestsStarted(previousRequests + 1)
+
+        sequencer.enqueue(status: 200, body: inventoryJSON(computerID: "newer"))
+        await coordinator.reloadInventory()
+        #expect(coordinator.inventory.map(\.id.rawValue) == ["newer"])
+
+        await older
+        #expect(coordinator.inventory.map(\.id.rawValue) == ["newer"], "older response must be discarded")
+        #expect(coordinator.signInError == nil)
+        #expect(coordinator.session != nil)
+    }
+
+    @Test("Inventory 401 credential loss ends the session and clears inventory")
+    func inventoryExpiryEndsSession() async throws {
+        let identity = try makeIdentity()
+        let key = hexKey(identity)
+        let authority = try await makeAuthority()
+        let sequencer = SequencedTransport()
+        sequencer.enqueue(status: 201, body: beginJSON(managerKey: key, mfaRequired: false))
+        sequencer.enqueue(status: 200, body: loginJSON(managerKey: key, mfaRequired: false, mfaAvailable: false))
+        sequencer.enqueue(status: 200, body: inventoryJSON())
+        let client = NativeV2AuthClient(transport: sequencer, trustedAuthority: authority, signingIdentity: identity)
+        let coordinator = AuthSignInCoordinator(client: client)
+        await coordinator.signIn(username: "operator", password: "pw")
+        #expect(coordinator.phase == .signedIn)
+        #expect(await client.hasLiveSession)
+
+        sequencer.enqueue(status: 401, body: Data())
+        await coordinator.reloadInventory()
+
+        #expect(coordinator.phase == .awaitingCredentials)
+        #expect(coordinator.session == nil)
+        #expect(coordinator.inventory.isEmpty)
+        if case .sessionExpired = coordinator.signInError {} else {
+            Issue.record("expected sessionExpired, got \(String(describing: coordinator.signInError))")
+        }
+        #expect(await client.hasLiveSession == false)
+    }
+
     @Test("Owned sign-in task slot is not stolen by a stale finisher")
     func staleTaskClearIsOwned() async throws {
         let identity = try makeIdentity()
@@ -230,6 +312,26 @@ final class SequencedTransport: HTTPTransport, @unchecked Sendable {
 
     private let lock = NSLock()
     private var items: [Item] = []
+    private var startedRequestCountValue = 0
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+
+    var startedRequestCount: Int {
+        lock.withLock { startedRequestCountValue }
+    }
+
+    /// Wait until at least `count` requests have begun (before any delay).
+    func waitUntilRequestsStarted(_ count: Int) async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if startedRequestCountValue >= count {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                startWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
 
     func enqueue(status: Int, body: Data) {
         lock.lock()
@@ -250,9 +352,15 @@ final class SequencedTransport: HTTPTransport, @unchecked Sendable {
     }
 
     func bytes(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
-        let item: Item? = lock.withLock {
-            guard !items.isEmpty else { return nil }
-            return items.removeFirst()
+        let (item, waiters): (Item?, [CheckedContinuation<Void, Never>]) = lock.withLock {
+            guard !items.isEmpty else { return (nil, []) }
+            startedRequestCountValue += 1
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            return (items.removeFirst(), waiters)
+        }
+        for waiter in waiters {
+            waiter.resume()
         }
         guard let item else {
             throw HelicoidError.unreachable

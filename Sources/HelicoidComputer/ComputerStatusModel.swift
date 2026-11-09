@@ -142,6 +142,24 @@ public final class ComputerStatusModel: ObservableObject {
         accessibilityPermission = permissionProbe.currentStatus(for: .accessibility)
     }
 
+    /// Menu and status summary for screen access. An unconfigured or connecting
+    /// endpoint does not claim "No Active Screen Access"; the connection line
+    /// already carries the truthful state. Active access always stays visible.
+    public var menuAccessSummary: String? {
+        switch screenAccess {
+        case .none:
+            return connection == .connected ? screenAccess.headline : nil
+        case .observed, .controlled:
+            return screenAccess.headline
+        }
+    }
+
+    /// Secondary menu action. An endpoint without a saved identity offers setup
+    /// instead of an ordinary Settings command.
+    public var settingsMenuTitle: String {
+        hasSavedEndpointConfiguration ? "Settings…" : "Set Up This Mac…"
+    }
+
     /// Button shown for the row right now. Granted rows hide the action.
     public func permissionRowAction(for kind: ComputerPermissionKind) -> PermissionRowAction {
         if permissionStatus(for: kind).isAvailable {

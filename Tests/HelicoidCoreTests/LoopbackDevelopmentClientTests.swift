@@ -367,13 +367,23 @@ struct EnrollmentMappingTests {
         #expect(pending.statusLabel == "Pending")
 
         let quarantined = LoopbackDevelopmentClient.mapEnrollmentState("quarantined")
+        #expect(quarantined.needsAttention)
         #expect(quarantined.statusLabel == "Quarantined")
 
         let revoked = LoopbackDevelopmentClient.mapEnrollmentState("revoked")
+        #expect(revoked.needsAttention)
         #expect(revoked.statusLabel == "Revoked")
 
         let unknown = LoopbackDevelopmentClient.mapEnrollmentState("something")
+        #expect(unknown.needsAttention)
         #expect(unknown.statusLabel == "Unavailable")
+
+        // Every attention state carries its own status label, so the remote
+        // details popover can show one Status row without losing context.
+        for raw in ["pending", "quarantined", "revoked", "something"] {
+            let status = LoopbackDevelopmentClient.mapEnrollmentState(raw)
+            #expect(status.needsAttention && !status.statusLabel.isEmpty)
+        }
     }
 }
 

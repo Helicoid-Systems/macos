@@ -6,6 +6,7 @@ import HelicoidCore
 struct ComputersView: View {
     @Environment(ManagerSession.self) private var session
     @State private var selectionAnchor: ComputerID?
+    @State private var editingExample: Computer?
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -18,6 +19,12 @@ struct ComputersView: View {
             VStack(spacing: 0) {
                 if session.showDevelopmentBanner {
                     DevelopmentBanner()
+                }
+
+                if let error = session.inventoryReloadError, !session.isFixturesMode {
+                    InventoryReloadBanner(error: error, isRetrying: session.isReloadingInventory) {
+                        Task { await session.reloadInventory() }
+                    }
                 }
 
                 scopeLine
@@ -45,8 +52,37 @@ struct ComputersView: View {
             placement: .toolbar,
             prompt: "Search computers"
         )
+        .sheet(item: $editingExample) { computer in
+            ExampleComputerEditor(computer: computer) { session.saveExampleComputer($0) }
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                if !session.isFixturesMode {
+                    Button {
+                        Task { await session.reloadInventory() }
+                    } label: {
+                        Label(
+                            session.isReloadingInventory ? "Refreshing" : "Refresh",
+                            systemImage: "arrow.clockwise"
+                        )
+                    }
+                    .disabled(session.isReloadingInventory || session.phase != .signedIn)
+                    .accessibilityLabel("Refresh computers")
+                    .help("Refresh computers from the server")
+                }
+                if session.isFixturesMode {
+                    Menu("Examples") {
+                        Button("Add Example Computer") {
+                            editingExample = Computer(id: ComputerID("example-" + UUID().uuidString), name: "New Computer", isOnline: true)
+                        }
+                        Button("Edit Selected Computer") {
+                            if let id = session.overview.selection.selectedIDs.first {
+                                editingExample = session.computer(with: id)
+                            }
+                        }
+                        .disabled(session.overview.selection.selectedIDs.count != 1)
+                    }
+                }
                 Picker("Layout", selection: Binding(
                     get: { session.presentation.layout },
                     set: { session.setPresentationLayout($0) }
@@ -125,7 +161,7 @@ struct ComputersView: View {
                 }
                 .buttonStyle(.link)
             }
-            if session.overview.filter.isActive {
+            if session.overview.filter.isActive && !session.inventoryEmptyReason.offersClearFiltersAction {
                 Button("Clear Filters") {
                     session.clearInventoryFilters()
                 }
@@ -204,6 +240,9 @@ struct ComputersView: View {
                             }
                     )
                     .contextMenu {
+                        if session.isFixturesMode {
+                            Button("Edit Example…") { editingExample = computer }
+                        }
                         Button("View Screen") {
                             openComputerWindow(computer.id)
                         }
@@ -238,6 +277,9 @@ struct ComputersView: View {
                     openComputerWindow(computer.id)
                 }
                 .contextMenu {
+                    if session.isFixturesMode {
+                        Button("Edit Example…") { editingExample = computer }
+                    }
                     Button("View Screen") {
                         openComputerWindow(computer.id)
                     }
@@ -259,13 +301,86 @@ struct DevelopmentBanner: View {
     var body: some View {
         HStack {
             Image(systemName: "exclamationmark.triangle.fill")
-            Text(DevelopmentFixtures.banner)
+            Text(DevelopmentFixtures.banner + " — edits last until you close the app")
                 .font(.callout.weight(.medium))
             Spacer()
         }
         .padding(8)
         .background(.yellow.opacity(0.25))
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// Named refresh failure beside the inventory. The previous inventory stays
+/// visible and Retry starts a new fenced refresh.
+struct InventoryReloadBanner: View {
+    let error: HelicoidError
+    let isRetrying: Bool
+    let retry: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(error.title)
+                    .font(.callout.weight(.medium))
+                Text(error.explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Button("Retry", action: retry)
+                .disabled(isRetrying)
+                .help("Refresh computers again")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.orange.opacity(0.12))
+        .accessibilityElement(children: .contain)
+    }
+}
+
+/// Edits only the in-memory examples, never a real computer.
+private struct ExampleComputerEditor: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var computer: Computer
+    let onSave: (Computer) -> Void
+
+    init(computer: Computer, onSave: @escaping (Computer) -> Void) {
+        _computer = State(initialValue: computer)
+        self.onSave = onSave
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Edit Example Computer").font(.headline)
+            Text("Demo only. Changes are temporary and do not affect real computers.")
+                .foregroundStyle(.secondary)
+            Form {
+                TextField("Computer name", text: $computer.name)
+                TextField("Example user", text: Binding(
+                    get: { computer.trustedUserName ?? "" },
+                    set: { computer.trustedUserName = $0.isEmpty ? nil : $0 }
+                ))
+                Toggle("Online", isOn: $computer.isOnline)
+                Toggle("Needs attention", isOn: $computer.needsAttention)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Save Example") {
+                    onSave(computer)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(computer.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 430)
     }
 }
 
