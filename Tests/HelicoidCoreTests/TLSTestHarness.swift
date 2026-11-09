@@ -1176,6 +1176,7 @@ enum TLSTestHarness {
 
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            confirm_attempts = 0
 
             def log_message(self, fmt, *args):
                 return
@@ -1244,11 +1245,26 @@ enum TLSTestHarness {
                     time.sleep(30)
                     self._send(200, b'{"late": true}')
                     return
+                if path == "/v2/deployment":
+                    self._send(200, b'{"deployment_id": "tls-deploy-test"}')
+                    return
+                if path == "/health":
+                    self._send(200, json.dumps({
+                        "status": "degraded",
+                        "accepting_authorized_operations": False,
+                        "schema_version": 1,
+                        "bootstrap_completed": False,
+                        "features": {"mfa": True},
+                    }).encode())
+                    return
                 if path == "/status/500":
                     self._send(500, b'{"error": {"code": "internal", "message": "boom"}}')
                     return
                 if path == "/status/403":
                     self._send(403, b'{"error": {"code": "forbidden", "message": "no"}}')
+                    return
+                if path == "/status/403-large":
+                    self._send(403, b"x" * (2 * 1024 * 1024))
                     return
                 if path == "/status/404":
                     self._send(404, b'{"error": {"code": "not_found", "message": "missing"}}')
@@ -1257,7 +1273,33 @@ enum TLSTestHarness {
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", "0") or 0)
-                self.rfile.read(length)
+                body = self.rfile.read(length)
+                path = self.path.split("?", 1)[0]
+                if path == "/v2/bootstrap":
+                    try:
+                        request = json.loads(body)
+                    except Exception:
+                        request = {}
+                    manager_key = request.get("manager_public_key", "")
+                    username = request.get("username", "admin")
+                    self._send(201, json.dumps({
+                        "account_id": "account-1",
+                        "username": username,
+                        "mfa_enrollment_id": "enrollment-1",
+                        "totp_secret_base32": "JBSWY3DPEHPK3PXP",
+                        "recovery_codes": ["AAAA-BBBB-CCCC-DDDD", "EEEE-FFFF-GGGG-HHHH"],
+                        "manager_public_key": manager_key,
+                        "account_state": "pending_mfa",
+                        "server_state": "awaiting_mfa_confirmation",
+                    }).encode())
+                    return
+                if path == "/v2/mfa/enroll/confirm":
+                    Handler.confirm_attempts += 1
+                    if Handler.confirm_attempts == 1:
+                        self._send(401, b'{"error": {"code": "unauthorized", "message": "invalid totp code"}}')
+                    else:
+                        self._send(200, b'{"account_id": "account-1", "mfa_status": "active", "account_state": "active"}')
+                    return
                 self._send(201, b'{"ok": true}')
 
         if __name__ == "__main__":

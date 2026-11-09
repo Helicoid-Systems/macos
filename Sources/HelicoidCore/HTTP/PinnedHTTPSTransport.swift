@@ -93,12 +93,53 @@ public struct PinnedHTTPSResponse: Sendable, Equatable {
     }
 }
 
+/// Transport seam that returns the HTTP status even when it is non-2xx.
+///
+/// This is intentionally narrower than a general HTTP client: the local
+/// bootstrap client uses it only for mutation POSTs whose contract defines a
+/// determinate status (for example, a wrong-TOTP `401`). Trust evaluation,
+/// origin/path validation, redirect refusal, timeouts, and the body-size cap
+/// are identical to `PinnedHTTPSTransport.bytes(for:maxBytes:)`.
+protocol HTTPStatusTransport: HTTPTransport {
+    func requestStatus(
+        for request: URLRequest,
+        maxBytes: Int
+    ) async throws -> PinnedHTTPStatusResponse
+}
+
+/// Result of a bounded pinned HTTPS request that returns the HTTP status even
+/// when it is non-2xx.
+///
+/// Descriptions are redacted because a non-2xx body can still contain
+/// sensitive material. Only the status code and body size are printable.
+struct PinnedHTTPStatusResponse: Sendable, Equatable, CustomStringConvertible,
+    CustomDebugStringConvertible {
+    let statusCode: Int
+    let body: Data
+    let url: URL
+
+    init(statusCode: Int, body: Data, url: URL) {
+        self.statusCode = statusCode
+        self.body = body
+        self.url = url
+    }
+
+    var description: String {
+        "PinnedHTTPStatusResponse(statusCode: \(statusCode), bodyBytes: \(body.count))"
+    }
+
+    var debugDescription: String { description }
+}
+
 /// HTTPTransport seam for pinned HTTPS.
 ///
 /// `bytes(for:maxBytes:)` and `request(...)` share one path that refuses
-/// non-2xx **before** reading any body. Origin, bounds, and redirect
-/// semantics are enforced inside this type.
-public final class PinnedHTTPSTransport: HTTPTransport, @unchecked Sendable {
+/// non-2xx **before** reading any body. `requestStatus(for:maxBytes:)` is the
+/// explicit typed-status seam for callers that must inspect a contractually
+/// determinate non-2xx status; it keeps the same origin, bounds, redirect, and
+/// trust behavior. Origin, bounds, and redirect semantics are enforced inside
+/// this type.
+public final class PinnedHTTPSTransport: HTTPStatusTransport, @unchecked Sendable {
     // Justified @unchecked Sendable: immutable configuration, thread-safe
     // OperationRegistry, and a URLSession. The trust delegate holds immutable
     // pin/root material only (see PinnedTrustDelegate).
@@ -165,6 +206,18 @@ public final class PinnedHTTPSTransport: HTTPTransport, @unchecked Sendable {
     // MARK: - HTTPTransport
 
     public func bytes(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
+        try await bytes(
+            for: request,
+            maxBytes: maxBytes,
+            allowNonSuccessStatus: false
+        )
+    }
+
+    private func bytes(
+        for request: URLRequest,
+        maxBytes: Int,
+        allowNonSuccessStatus: Bool
+    ) async throws -> (Data, URLResponse) {
         // Enforce both the caller cap and the configured cap.
         let configured = configuration.maxResponseBytes
         let cap = min(maxBytes, configured, PinnedHTTPSConfiguration.absoluteMaxResponseBytes)
@@ -176,7 +229,11 @@ public final class PinnedHTTPSTransport: HTTPTransport, @unchecked Sendable {
         }
         try Self.validateRequestURL(url, origin: originURL)
 
-        return try await performRegistered(request: request, maxBytes: cap)
+        return try await performRegistered(
+            request: request,
+            maxBytes: cap,
+            allowNonSuccessStatus: allowNonSuccessStatus
+        )
     }
 
     /// Bounded cancelable request seam. Throws `HelicoidError` on any refusal.
@@ -186,6 +243,54 @@ public final class PinnedHTTPSTransport: HTTPTransport, @unchecked Sendable {
         headers: [String: String] = [:],
         body: Data? = nil
     ) async throws -> PinnedHTTPSResponse {
+        let request = try makeRequest(method: method, path: path, headers: headers, body: body)
+        let (data, response) = try await bytes(for: request, maxBytes: configuration.maxResponseBytes)
+        guard let http = response as? HTTPURLResponse else {
+            throw HelicoidError.unreachable
+        }
+        // Status already refused inside performBounded; this is belt-and-braces.
+        guard (200...299).contains(http.statusCode) else {
+            throw HelicoidError.invalidInput(
+                field: "response",
+                detail: "Pinned HTTPS transport refused non-2xx status \(http.statusCode)."
+            )
+        }
+        return PinnedHTTPSResponse(statusCode: http.statusCode, body: data)
+    }
+
+    /// Bounded cancelable request seam that returns the HTTP status even for
+    /// non-2xx responses. The response body remains bounded by the configured
+    /// cap. Trust, origin, redirect, and timeout behavior are unchanged.
+    ///
+    /// The returned URL is the final response URL. Callers must still verify
+    /// that it is the exact origin and path they requested; redirects are
+    /// refused before this seam returns.
+    func requestStatus(
+        for request: URLRequest,
+        maxBytes: Int
+    ) async throws -> PinnedHTTPStatusResponse {
+        let (data, response) = try await bytes(
+            for: request,
+            maxBytes: maxBytes,
+            allowNonSuccessStatus: true
+        )
+        guard let http = response as? HTTPURLResponse,
+              let url = http.url else {
+            throw HelicoidError.unreachable
+        }
+        return PinnedHTTPStatusResponse(
+            statusCode: http.statusCode,
+            body: data,
+            url: url
+        )
+    }
+
+    private func makeRequest(
+        method: String,
+        path: String,
+        headers: [String: String],
+        body: Data?
+    ) throws -> URLRequest {
         let resolved: URL
         switch DeploymentOriginPolicy.resolve(path: path, origin: originURL) {
         case .allowed(let url):
@@ -201,19 +306,7 @@ public final class PinnedHTTPSTransport: HTTPTransport, @unchecked Sendable {
         for (name, value) in headers {
             request.setValue(value, forHTTPHeaderField: name)
         }
-
-        let (data, response) = try await bytes(for: request, maxBytes: configuration.maxResponseBytes)
-        guard let http = response as? HTTPURLResponse else {
-            throw HelicoidError.unreachable
-        }
-        // Status already refused inside performBounded; this is belt-and-braces.
-        guard (200...299).contains(http.statusCode) else {
-            throw HelicoidError.invalidInput(
-                field: "response",
-                detail: "Pinned HTTPS transport refused non-2xx status \(http.statusCode)."
-            )
-        }
-        return PinnedHTTPSResponse(statusCode: http.statusCode, body: data)
+        return request
     }
 
     /// Release session resources. Cancels tracked operations and defers
@@ -266,7 +359,8 @@ public final class PinnedHTTPSTransport: HTTPTransport, @unchecked Sendable {
 
     private func performRegistered(
         request: URLRequest,
-        maxBytes: Int
+        maxBytes: Int,
+        allowNonSuccessStatus: Bool
     ) async throws -> (Data, URLResponse) {
         let holder = CancellableHolder()
         // Registration is atomic with disposal: begin() throws if disposed and
@@ -282,7 +376,8 @@ public final class PinnedHTTPSTransport: HTTPTransport, @unchecked Sendable {
             try await self.raceWorkAndDeadline(
                 request: request,
                 maxBytes: maxBytes,
-                operationTimeout: operationTimeout
+                operationTimeout: operationTimeout,
+                allowNonSuccessStatus: allowNonSuccessStatus
             )
         }
         holder.bind(op)
@@ -308,7 +403,8 @@ public final class PinnedHTTPSTransport: HTTPTransport, @unchecked Sendable {
     private func raceWorkAndDeadline(
         request: URLRequest,
         maxBytes: Int,
-        operationTimeout: TimeInterval
+        operationTimeout: TimeInterval,
+        allowNonSuccessStatus: Bool
     ) async throws -> (Data, URLResponse) {
         let session = self.session
         let delegate = self.sessionDelegate
@@ -318,7 +414,8 @@ public final class PinnedHTTPSTransport: HTTPTransport, @unchecked Sendable {
                     request: request,
                     session: session,
                     delegate: delegate,
-                    maxBytes: maxBytes
+                    maxBytes: maxBytes,
+                    allowNonSuccessStatus: allowNonSuccessStatus
                 )
                 return .response(data, response)
             }
@@ -393,9 +490,13 @@ public final class PinnedHTTPSTransport: HTTPTransport, @unchecked Sendable {
         request: URLRequest,
         session: URLSession,
         delegate: PinnedTrustDelegate,
-        maxBytes: Int
+        maxBytes: Int,
+        allowNonSuccessStatus: Bool
     ) async throws -> (Data, URLResponse) {
-        let sink = BodySink(maxBytes: maxBytes)
+        let sink = BodySink(
+            maxBytes: maxBytes,
+            allowNonSuccessStatus: allowNonSuccessStatus
+        )
         let task = session.dataTask(with: request)
         // Sink can promptly cancel the actual URLSessionDataTask on overflow.
         sink.bindDataTask(task)
@@ -549,6 +650,7 @@ private final class CancellableHolder: @unchecked Sendable {
 final class BodySink: @unchecked Sendable {
     private let lock = NSLock()
     private let maxBytes: Int
+    private let allowNonSuccessStatus: Bool
     private var data = Data()
     private var response: URLResponse?
     private var continuation: CheckedContinuation<(Data, URLResponse), Error>?
@@ -560,8 +662,9 @@ final class BodySink: @unchecked Sendable {
     /// `HelicoidError.cancelled`. Bounded, non-secret.
     private var trustDiagnostic: TrustEvaluationDiagnostic?
 
-    init(maxBytes: Int) {
+    init(maxBytes: Int, allowNonSuccessStatus: Bool = false) {
         self.maxBytes = maxBytes
+        self.allowNonSuccessStatus = allowNonSuccessStatus
     }
 
     /// Bind the owned URLSessionTask so overflow/refusal can cancel it promptly.
@@ -680,8 +783,18 @@ final class BodySink: @unchecked Sendable {
         guard let http = response as? HTTPURLResponse else {
             return HelicoidError.unreachable
         }
-        // Refuse non-2xx BEFORE reading any body.
-        if !(200...299).contains(http.statusCode) {
+        // Redirects are never followed and are never exposed as a typed
+        // status. Refuse them before reading any body in both modes.
+        if (300...399).contains(http.statusCode) {
+            return HelicoidError.invalidInput(
+                field: "response",
+                detail: "Pinned HTTPS transport refused redirect status \(http.statusCode)."
+            )
+        }
+        // Refuse other non-2xx statuses BEFORE reading any body unless the
+        // caller explicitly requested the typed-status seam. Size checks still
+        // apply in both modes.
+        if !allowNonSuccessStatus, !(200...299).contains(http.statusCode) {
             return HelicoidError.invalidInput(
                 field: "response",
                 detail: "Pinned HTTPS transport refused non-2xx status \(http.statusCode)."

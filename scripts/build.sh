@@ -1,12 +1,34 @@
 #!/bin/bash
 # Build and package the legacy Helicoid Manager and retained Computer app.
-# Independent of sibling repositories: only reads under apps/macos.
+# Independent of sibling repositories: only reads under apps/macos, except for an
+# optional operator-supplied development hs-server helper path (see README).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${HELICOID_BUILD_DIR:-$ROOT/.build}"
 DIST_DIR="${HELICOID_DIST_DIR:-$ROOT/dist}"
+case "$DIST_DIR" in
+  /*) ;;
+  *) DIST_DIR="$ROOT/$DIST_DIR" ;;
+esac
 DERIVED="$BUILD_DIR/DerivedData"
+MANAGER_MINIMUM_MACOS="15.0"
+
+HS_SERVER_HELPER_SOURCE=""
+if [ -n "${HELICOID_HS_SERVER_PATH+x}" ]; then
+  HS_SERVER_HELPER_SOURCE="${HELICOID_HS_SERVER_PATH}"
+  if [ -z "$HS_SERVER_HELPER_SOURCE" ]; then
+    echo "ERROR: HELICOID_HS_SERVER_PATH is set but empty. Unset it for a no-helper build." >&2
+    exit 1
+  fi
+  case "$HS_SERVER_HELPER_SOURCE" in
+    /*) ;;
+    *)
+      echo "ERROR: HELICOID_HS_SERVER_PATH must be an absolute path." >&2
+      exit 1
+      ;;
+  esac
+fi
 
 echo "== Helicoid macOS build =="
 echo "Root: $ROOT"
@@ -30,6 +52,12 @@ MANAGER_BIN="$(xcrun swift build \
   --show-bin-path \
   --scratch-path "$BUILD_DIR" \
   --package-path "$ROOT")"
+if [ -n "$HS_SERVER_HELPER_SOURCE" ]; then
+  "$ROOT/scripts/hs-server-helper.sh" check-source \
+    --source "$HS_SERVER_HELPER_SOURCE" \
+    --manager-binary "$MANAGER_BIN/HelicoidManager" \
+    --minimum-macos "$MANAGER_MINIMUM_MACOS"
+fi
 COMPUTER_BUILD_DIR="$BUILD_DIR/computer-macos13"
 HOST_ARCH="$(uname -m)"
 echo "== swift build (Computer, macOS 13 deployment target) =="
@@ -56,7 +84,13 @@ package_app() {
   local icon_source="$4"
   local binary_dir="$5"
   local minimum_system_version="$6"
+  local helper_source="${7:-}"
   local app="$DIST_DIR/$name.app"
+
+  if [ "$binary" = "HelicoidManager" ]; then
+    # Refuse pre-existing development helper artifacts before touching the app.
+    "$ROOT/scripts/hs-server-helper.sh" assert-absent --app "$app"
+  fi
 
   echo "== Packaging $name =="
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
@@ -143,8 +177,24 @@ PLIST
     echo "Packaged verified artwork fallback: $role.icns"
   fi
   /usr/bin/plutil -replace CFBundleIconFile -string AppIcon "$app/Contents/Info.plist"
+  if [ "$binary" = "HelicoidManager" ]; then
+    if [ -n "$helper_source" ]; then
+      "$ROOT/scripts/hs-server-helper.sh" package \
+        --source "$helper_source" \
+        --app "$app" \
+        --minimum-macos "$minimum_system_version"
+    fi
+  fi
   /usr/bin/codesign --force --sign - "$app"
   /usr/bin/codesign --verify --deep --strict "$app"
+
+  if [ "$binary" = "HelicoidManager" ]; then
+    if [ -n "$helper_source" ]; then
+      "$ROOT/scripts/hs-server-helper.sh" verify --app "$app"
+    else
+      "$ROOT/scripts/hs-server-helper.sh" assert-absent --app "$app"
+    fi
+  fi
 
   echo "Packaged $app"
   return 0
@@ -154,11 +204,14 @@ PLIST
 package_app "Helicoid Manager" "HelicoidManager" \
   "systems.helicoid.manager.dev" \
   "HS Manager App icon.icon" \
-  "$MANAGER_BIN" "15.0"
+  "$MANAGER_BIN" "$MANAGER_MINIMUM_MACOS" "$HS_SERVER_HELPER_SOURCE"
 
 package_app "Helicoid Computer" "HelicoidComputer" \
   "systems.helicoid.computer.dev" \
   "HS App icon.icon" \
   "$COMPUTER_BIN" "13.0"
 
+if [ -n "$HS_SERVER_HELPER_SOURCE" ]; then
+  echo "== Development hs-server helper included in Manager (not installed or launched) =="
+fi
 echo "== Done. Apps in $DIST_DIR =="

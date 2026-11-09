@@ -5,6 +5,7 @@ name: macOS
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test-and-build:
@@ -32,6 +33,10 @@ jobs:
       - name: Test
         run: |
           xcrun swift test --package-path .
+
+      - name: Test development hs-server helper packaging
+        run: |
+          ./scripts/tests/hs-server-helper-tests.sh
 
       - name: Build release
         run: |

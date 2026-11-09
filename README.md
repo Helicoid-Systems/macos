@@ -43,12 +43,46 @@ Optional environment:
 
 - `HELICOID_BUILD_DIR` — scratch build directory (default `apps/macos/.build`)
 - `HELICOID_DIST_DIR` — packaged `.app` output (default `apps/macos/dist`)
+- `HELICOID_HS_SERVER_PATH` — optional absolute path to a locally built
+  development `hs-server` helper (see below)
 
 The script runs the existing Swift tests and macOS 15 package build, builds
 Helicoid Computer from `Sources/Package.swift` with a macOS 13 deployment
 target, packages both apps, and compiles bundled `.icon` sources with `actool`
 into `Assets.car` / `.icns`. The macOS 13 package excludes the three legacy
 Manager-only core files that use newer Observation APIs.
+
+### Optional development hs-server helper
+
+The default build packages no server helper. To include a locally built one:
+
+```bash
+HELICOID_HS_SERVER_PATH=/absolute/path/to/hs-server ./scripts/build.sh
+```
+
+The requested path must be an existing, absolute, regular, executable Mach-O
+executable. It must contain the Manager's architecture and every slice must
+target macOS 15 or older. Missing, malformed, wrong-architecture, or too-new
+inputs fail the build instead of being omitted. The source file is only read,
+never modified.
+
+The validated copy is ad-hoc signed and placed at
+`Contents/Helpers/hs-server`; a digest and validation record tied to the included
+bytes is placed at `Contents/Resources/hs-server-development.json`. Packaging
+refuses to replace an existing helper or evidence file: use a fresh
+`HELICOID_DIST_DIR` (or remove the output app yourself) when switching or
+repeating builds. The build never deletes pre-existing helper artifacts.
+
+This is development packaging only: the helper is not installed or launched, and
+it does not enable local hosting, launchd, TLS trust, deployment identity, service
+management, production authentication, or a release security floor. The recorded
+digest is not a distribution signature.
+
+Packaging tests use disposable scratch app bundles and fixture Mach-O files:
+
+```bash
+./scripts/tests/hs-server-helper-tests.sh
+```
 
 ## Launch modes
 
