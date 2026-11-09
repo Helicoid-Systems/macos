@@ -27,7 +27,11 @@ public struct ObservationAdmissionEndpoint: Sendable {
 }
 
 /// A deployment-signed observation grant whose target and lifetime were
-/// checked against the current local endpoint session.
+/// checked against the current local endpoint session or Manager session.
+///
+/// Every field is a verified server-signed claim. Later challenge, proof, and
+/// certificate steps must compare against these values and derive routes from
+/// them, never from unsigned endpoint messages or unsigned server responses.
 public struct VerifiedObservationAdmissionGrant: Sendable, Equatable {
     public let grantID: String
     public let deploymentID: String
@@ -57,6 +61,9 @@ public struct VerifiedObservationAdmissionGrant: Sendable, Equatable {
 
     /// Bytes the Manager signs after receiving this endpoint's fresh nonce and
     /// the canonical binding exported by its currently verified native peer.
+    /// Deployment, grant, computer, endpoint session, and epoch come only from
+    /// this verified grant. Callers must not substitute unsigned response or
+    /// endpoint-supplied values for those claims.
     public func managerProofMessage(
         endpointNonceHex: String,
         channelBindingHex: String
@@ -93,6 +100,37 @@ public struct VerifiedObservationAdmissionGrant: Sendable, Equatable {
         } catch {
             return false
         }
+    }
+}
+
+/// The Manager session and target computer a server-issued observation grant
+/// must bind. Endpoint key, session, and epoch are intentionally absent: they
+/// are learned only from the server-signed payload, never from endpoint
+/// messages. `managerPublicKeyHex` is the active Manager signing key.
+///
+/// After verification, challenge, proof, and certificate checks must compare
+/// using the returned grant's signed claims and route by those signed values.
+/// Unsigned response fields may be displayed only after an equality check
+/// against the corresponding verified claim.
+public struct ObservationAdmissionManagerExpectation: Sendable {
+    public let deploymentID: String
+    public let accountID: String
+    public let computerID: String
+    public let managerID: String
+    public let managerPublicKeyHex: String
+
+    public init(
+        deploymentID: String,
+        accountID: String,
+        computerID: String,
+        managerID: String,
+        managerPublicKeyHex: String
+    ) {
+        self.deploymentID = deploymentID
+        self.accountID = accountID
+        self.computerID = computerID
+        self.managerID = managerID
+        self.managerPublicKeyHex = managerPublicKeyHex
     }
 }
 
@@ -144,6 +182,58 @@ public enum ObservationAdmissionGrantVerifier {
         expected: ObservationAdmissionEndpoint,
         nowUnixSeconds: Int64 = Int64(Date().timeIntervalSince1970)
     ) throws -> VerifiedObservationAdmissionGrant {
+        let claims = try verifiedClaims(
+            token: token,
+            serverPublicKeyHex: serverPublicKeyHex,
+            nowUnixSeconds: nowUnixSeconds
+        )
+        guard claims.deploymentID == expected.deploymentID,
+              claims.computerID == expected.computerID,
+              claims.endpointPublicKey == expected.endpointPublicKeyHex,
+              claims.endpointSessionID == expected.endpointSessionID,
+              claims.enrollmentEpoch == expected.enrollmentEpoch
+        else { throw invalidGrant() }
+
+        return VerifiedObservationAdmissionGrant(claims: claims)
+    }
+
+    /// Verify a server-issued observation grant for the current Manager
+    /// session and computer. Every grant claim, including the endpoint key,
+    /// session, and epoch, is taken only from the server-signed payload.
+    /// `serverPublicKeyHex` must already be trusted through the deployment's
+    /// pinned HTTPS connection.
+    ///
+    /// The returned grant is the only source for later challenge, nonce-proof,
+    /// and certificate binding, and for routing admission requests. Do not
+    /// route with unsigned response fields.
+    public static func verifyForManager(
+        token: String,
+        serverPublicKeyHex: String,
+        expected: ObservationAdmissionManagerExpectation,
+        nowUnixSeconds: Int64 = Int64(Date().timeIntervalSince1970)
+    ) throws -> VerifiedObservationAdmissionGrant {
+        let claims = try verifiedClaims(
+            token: token,
+            serverPublicKeyHex: serverPublicKeyHex,
+            nowUnixSeconds: nowUnixSeconds
+        )
+        guard claims.deploymentID == expected.deploymentID,
+              claims.accountID == expected.accountID,
+              claims.computerID == expected.computerID,
+              claims.managerID == expected.managerID,
+              claims.managerPublicKey == expected.managerPublicKeyHex
+        else { throw invalidGrant() }
+
+        return VerifiedObservationAdmissionGrant(claims: claims)
+    }
+
+    /// Shared strict parse, signature check, and claim canonicalization.
+    /// Callers add only their endpoint- or Manager-specific expected binding.
+    private static func verifiedClaims(
+        token: String,
+        serverPublicKeyHex: String,
+        nowUnixSeconds: Int64
+    ) throws -> Claims {
         guard token.utf8.count <= maximumTokenBytes,
               token.utf8.allSatisfy({ $0 < 0x80 })
         else { throw invalidGrant() }
@@ -193,15 +283,10 @@ public enum ObservationAdmissionGrantVerifier {
               claims.expiresAtUnix > claims.issuedAtUnix,
               claims.expiresAtUnix >= Int64.min + lifetimeSeconds,
               claims.issuedAtUnix >= claims.expiresAtUnix - lifetimeSeconds,
-              claims.deploymentID == expected.deploymentID,
-              claims.computerID == expected.computerID,
-              claims.endpointPublicKey == expected.endpointPublicKeyHex,
-              claims.endpointSessionID == expected.endpointSessionID,
-              claims.enrollmentEpoch == expected.enrollmentEpoch,
               canonicalPayload(claims) == payload
         else { throw invalidGrant() }
 
-        return VerifiedObservationAdmissionGrant(claims: claims)
+        return claims
     }
 
     /// Produce a cryptographically random 32-byte lowercase-hex endpoint nonce.
