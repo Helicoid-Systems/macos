@@ -243,6 +243,7 @@ struct ManagerSessionExpiryTests {
         #expect(session.screen == .computers)
         #expect(session.phase == .signedIn)
         #expect(!session.overview.authorizedInventory.isEmpty)
+        let generationBeforeExpiry = session.sessionGeneration
 
         // Automatic expiry — no reloadSignIn/cancel/helper call.
         clock.advanceMonotonic(seconds: 3601)
@@ -252,8 +253,113 @@ struct ManagerSessionExpiryTests {
         #expect(session.phase == .needsSignIn)
         #expect(session.overview.authorizedInventory.isEmpty, "overview inventory must clear")
         #expect(session.openRemoteWindows.isEmpty)
+        #expect(session.sessionGeneration > generationBeforeExpiry)
         if case .sessionExpired = session.signInError {} else {
             Issue.record("expected sessionExpired copy, got \(String(describing: session.signInError))")
+        }
+    }
+
+    @Test("Refresh retry clears the stale facade refresh error")
+    func managerSessionRefreshRetryClearsStaleError() async throws {
+        let transport = Transport()
+        let identity = try makeIdentity()
+        let authority = try await makeAuthority()
+        let key = AuthV2Canonical.lowercaseHex(identity.publicKey)
+        let client = NativeV2AuthClient(
+            transport: transport,
+            trustedAuthority: authority,
+            signingIdentity: identity
+        )
+        let session = ManagerSession(
+            configuration: ManagerLaunchConfiguration(),
+            productionAuthClient: client
+        )
+
+        transport.enqueue(status: 200, body: healthJSON())
+        session.serverAddress = "https://server.test:8443"
+        await session.connect()
+
+        transport.enqueue(status: 201, body: beginJSON(key: key, wall: Int(Date().timeIntervalSince1970)))
+        transport.enqueue(status: 200, body: loginJSON(
+            key: key,
+            wall: Int(Date().timeIntervalSince1970),
+            expiresAtUnix: Int(Date().timeIntervalSince1970) + 3_600
+        ))
+        transport.enqueue(status: 200, body: inventoryJSON())
+        session.username = "operator"
+        session.password = "pw"
+        await session.signIn()
+        #expect(session.phase == .signedIn)
+        #expect(!session.overview.authorizedInventory.isEmpty)
+
+        // Transient refresh failure keeps the session and surfaces Retry.
+        transport.enqueue(status: 500, body: Data())
+        await session.reloadInventory()
+        #expect(session.phase == .signedIn)
+        #expect(!session.overview.authorizedInventory.isEmpty)
+        #expect(session.inventoryReloadError == .unreachable)
+        #expect(session.signInError == .unreachable)
+
+        // Successful retry must clear the stale refresh error.
+        transport.enqueue(status: 200, body: inventoryJSON())
+        await session.reloadInventory()
+        #expect(session.inventoryReloadError == nil)
+        #expect(session.signInError == nil)
+        #expect(!session.overview.authorizedInventory.isEmpty)
+        #expect(session.isReloadingInventory == false)
+    }
+
+    @Test("Production inventory denial advances generation and clears windows")
+    func managerSessionPermissionDenialTearsDownGeneration() async throws {
+        let transport = Transport()
+        let identity = try makeIdentity()
+        let authority = try await makeAuthority()
+        let key = AuthV2Canonical.lowercaseHex(identity.publicKey)
+        let client = NativeV2AuthClient(
+            transport: transport,
+            trustedAuthority: authority,
+            signingIdentity: identity
+        )
+        let session = ManagerSession(
+            configuration: ManagerLaunchConfiguration(),
+            productionAuthClient: client
+        )
+
+        transport.enqueue(status: 200, body: healthJSON())
+        session.serverAddress = "https://server.test:8443"
+        await session.connect()
+
+        transport.enqueue(status: 201, body: beginJSON(key: key, wall: Int(Date().timeIntervalSince1970)))
+        transport.enqueue(status: 200, body: loginJSON(
+            key: key,
+            wall: Int(Date().timeIntervalSince1970),
+            expiresAtUnix: Int(Date().timeIntervalSince1970) + 3_600
+        ))
+        transport.enqueue(status: 200, body: inventoryJSON())
+        session.username = "operator"
+        session.password = "pw"
+        await session.signIn()
+        #expect(session.phase == .signedIn)
+
+        let computerID = ComputerID("c1")
+        #expect(session.overview.authorizedInventory.map(\.id) == [computerID])
+        #expect(session.openRemoteView(for: computerID) != nil)
+        let generationBefore = session.sessionGeneration
+
+        transport.enqueue(status: 403, body: Data())
+        await session.reloadInventory()
+
+        #expect(session.phase == .needsSignIn)
+        #expect(session.screen == .signIn)
+        #expect(session.overview.authorizedInventory.isEmpty)
+        #expect(session.openRemoteWindows.isEmpty)
+        #expect(session.sessionGeneration > generationBefore)
+        #expect(session.isReloadingInventory == false)
+        #expect(session.inventoryReloadError == .permissionDenied(
+            detail: "Access to management inventory was denied. Sign in again or ask an administrator."
+        ))
+        if case .permissionDenied = session.signInError {} else {
+            Issue.record("expected permissionDenied, got \(String(describing: session.signInError))")
         }
     }
 

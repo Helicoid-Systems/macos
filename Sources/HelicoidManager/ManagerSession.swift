@@ -37,6 +37,12 @@ public final class ManagerSession: AuthSignInObserving {
     public private(set) var presentationPreferenceScope: PresentationPreferenceScope?
     /// True when a new session generation is live. Stale view-window content must invalidate.
     public private(set) var sessionGeneration: UInt64 = 0
+    /// Manual inventory refresh in progress. Automatic sign-in loading also uses this.
+    public private(set) var isReloadingInventory = false
+    /// Last manual inventory refresh failure. A failed refresh keeps the previous inventory.
+    public private(set) var inventoryReloadError: HelicoidError?
+    /// Fences overlapping refreshes so an older response cannot replace a newer one.
+    private var inventoryReloadGeneration: UInt64 = 0
     /// Cancellable required-code state for v2 device-key sign-in.
     public var authCodeState: AuthCodeState {
         authCoordinator?.authCodeState ?? .idle
@@ -255,6 +261,7 @@ public final class ManagerSession: AuthSignInObserving {
         connectError = nil
         signInError = nil
         authCodeError = nil
+        inventoryReloadError = nil
         overview.setInventory([])
 
         if let coordinator = authCoordinator, !isDevelopmentServerMode, !isFixturesMode {
@@ -325,6 +332,7 @@ public final class ManagerSession: AuthSignInObserving {
 
     private func syncAuthUIFromCoordinator() {
         guard let coordinator = authCoordinator else { return }
+        let hadLiveSession = phase == .signedIn
         switch coordinator.phase {
         case .idle:
             break
@@ -348,9 +356,10 @@ public final class ManagerSession: AuthSignInObserving {
             phase = .needsSignIn
             screen = .signIn
         }
-        if let error = coordinator.signInError {
-            signInError = error
-        }
+        // Coordinator is the authoritative sign-in error surface. Assigning the
+        // optional directly is what lets a successful retry clear a stale
+        // transient refresh failure mirrored onto this facade.
+        signInError = coordinator.signInError
         authCodeError = coordinator.authCodeError
         // Mirror coordinator inventory into the actual overview facade.
         if case .signedIn = coordinator.phase {
@@ -360,10 +369,27 @@ public final class ManagerSession: AuthSignInObserving {
         } else {
             overview.setInventory(coordinator.inventory)
         }
-        // Expiry / credential loss must drop remote windows and selection.
-        if case .sessionExpired = coordinator.signInError {
+        // Expiry, revoked credentials, or permission loss must drop remote
+        // windows and advance the session generation, exactly once.
+        if hadLiveSession,
+           coordinator.session == nil,
+           let error = coordinator.signInError,
+           Self.endsLiveSession(error) {
             bumpSessionGeneration()
             overview.setInventory([])
+            openRemoteWindows = []
+            phase = .needsSignIn
+            screen = .signIn
+        }
+    }
+
+    /// Errors after a live session that must invalidate window/session stamps.
+    private static func endsLiveSession(_ error: HelicoidError) -> Bool {
+        switch error {
+        case .sessionExpired, .authenticationFailed, .permissionDenied:
+            true
+        default:
+            false
         }
     }
 
@@ -373,24 +399,70 @@ public final class ManagerSession: AuthSignInObserving {
     }
 
     public func reloadInventory() async {
-        if isFixturesMode { return }
+        guard !isFixturesMode, phase == .signedIn else { return }
+
+        inventoryReloadGeneration &+= 1
+        let reloadGeneration = inventoryReloadGeneration
+        let sessionGenerationAtStart = sessionGeneration
+        inventoryReloadError = nil
+        isReloadingInventory = true
+        defer {
+            if reloadGeneration == inventoryReloadGeneration {
+                isReloadingInventory = false
+            }
+        }
+
         if let coordinator = authCoordinator, productionAuthClient != nil, !isDevelopmentServerMode {
             await coordinator.reloadInventory()
+            let coordinatorError = coordinator.signInError
+            guard reloadGeneration == inventoryReloadGeneration,
+                  sessionGenerationAtStart == sessionGeneration else {
+                // A fail-closed coordinator teardown invalidated this refresh.
+                // Preserve the terminal cause consistently with the direct path.
+                if coordinator.session == nil,
+                   let coordinatorError,
+                   Self.endsLiveSession(coordinatorError) {
+                    inventoryReloadError = coordinatorError
+                    signInError = coordinatorError
+                }
+                return
+            }
             syncAuthUIFromCoordinator()
+            guard reloadGeneration == inventoryReloadGeneration,
+                  sessionGenerationAtStart == sessionGeneration else { return }
             overview.setInventory(coordinator.inventory)
+            inventoryReloadError = coordinatorError
+            signInError = coordinatorError
             return
         }
+
         let result = await client.authorizedInventory()
+        // A late response after sign-out, replacement, or a newer refresh is stale.
+        guard reloadGeneration == inventoryReloadGeneration,
+              sessionGenerationAtStart == sessionGeneration else { return }
         switch result {
         case .success(let computers):
             overview.setInventory(computers)
+            // A successful retry supersedes any prior refresh failure.
+            signInError = nil
         case .failure(let error):
+            // Keep the last known inventory for transient failures. Confirmed
+            // credential loss or permission revocation fails closed, matching
+            // the coordinator's automatic load behavior.
+            inventoryReloadError = error
             signInError = error
-            if case .permissionDenied = error {
+            switch error {
+            case .sessionExpired, .authenticationFailed, .permissionDenied:
+                bumpSessionGeneration()
+                // Preserve the refresh error that prompted teardown even though
+                // a session-generation bump normally clears stale refresh state.
+                inventoryReloadError = error
+                signInError = error
                 overview.setInventory([])
-                openRemoteWindows = []
                 phase = .needsSignIn
                 screen = .signIn
+            default:
+                break
             }
         }
     }
@@ -427,6 +499,7 @@ public final class ManagerSession: AuthSignInObserving {
         password = ""
         overview = OverviewModel()
         openRemoteWindows = []
+        inventoryReloadError = nil
     }
 
     // MARK: - Remote windows (view-only; engine honestly unavailable)
@@ -570,7 +643,11 @@ public final class ManagerSession: AuthSignInObserving {
 
     private func bumpSessionGeneration() {
         sessionGeneration &+= 1
-        // Session change invalidates every view-only demand immediately.
+        // Session change invalidates every view-only demand and any in-flight
+        // inventory refresh from the previous session.
+        inventoryReloadGeneration &+= 1
+        isReloadingInventory = false
+        inventoryReloadError = nil
         openRemoteWindows = []
     }
 }
