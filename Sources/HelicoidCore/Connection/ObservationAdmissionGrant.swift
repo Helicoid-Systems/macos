@@ -300,13 +300,13 @@ public enum ObservationAdmissionGrantVerifier {
         return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
-    fileprivate static func isLowerHex(_ value: String, byteCount: Int) -> Bool {
+    static func isLowerHex(_ value: String, byteCount: Int) -> Bool {
         value.utf8.count == byteCount * 2 && value.utf8.allSatisfy {
             ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66)
         }
     }
 
-    fileprivate static func lowerHexBytes(_ value: String) -> Data? {
+    static func lowerHexBytes(_ value: String) -> Data? {
         guard isLowerHex(value, byteCount: value.utf8.count / 2) else { return nil }
         var bytes = Data()
         bytes.reserveCapacity(value.utf8.count / 2)
