@@ -5,6 +5,7 @@ public enum HelicoidError: Error, Hashable, Sendable {
     case notConfigured
     case invalidInput(field: String, detail: String)
     case identityMismatch
+    case observationProtocolViolation(detail: String)
     case permissionDenied(detail: String)
     case authenticationFailed(detail: String)
     case computerOutOfScope
@@ -23,6 +24,7 @@ public enum HelicoidError: Error, Hashable, Sendable {
         case .notConfigured: "Not configured"
         case .invalidInput: "Invalid input"
         case .identityMismatch: "Identity mismatch"
+        case .observationProtocolViolation: "Observation rejected"
         case .permissionDenied: "Permission denied"
         case .authenticationFailed: "Sign-in failed"
         case .computerOutOfScope: "Computer out of scope"
@@ -46,6 +48,8 @@ public enum HelicoidError: Error, Hashable, Sendable {
             "\(field): \(detail)"
         case .identityMismatch:
             "The verified identity does not match the stored trust. Access is stopped."
+        case .observationProtocolViolation(let detail):
+            detail
         case .permissionDenied(let detail):
             detail
         case .authenticationFailed(let detail):
