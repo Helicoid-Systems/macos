@@ -70,17 +70,23 @@ private actor EndpointFileDeliveryTransportFixture: HTTPTransport {
     let deploymentID: String
     let grantVerificationKeyHex: String
     let fileJobsEnabled: Bool
+    let screenObservationEnabled: Bool
     private var authorityGeneration: Int64 = 1
+    private var pendingObservationGrantResponses: [Data] = []
     private(set) var requests: [(String, String?, String?)] = []
+    private(set) var requestTimeoutIntervals: [String: TimeInterval] = [:]
+    private(set) var requestMaxBytes: [String: Int] = [:]
 
     init(
         origin: URL,
         fileJobsEnabled: Bool = true,
+        screenObservationEnabled: Bool = false,
         deploymentID: String = "deployment-fixture-42",
         grantVerificationKeyHex: String = String(repeating: "a", count: 64)
     ) {
         self.origin = origin
         self.fileJobsEnabled = fileJobsEnabled
+        self.screenObservationEnabled = screenObservationEnabled
         self.deploymentID = deploymentID
         self.grantVerificationKeyHex = grantVerificationKeyHex
     }
@@ -89,9 +95,15 @@ private actor EndpointFileDeliveryTransportFixture: HTTPTransport {
         authorityGeneration = generation
     }
 
+    func setPendingObservationGrantResponse(_ body: Data) {
+        pendingObservationGrantResponses = [body]
+    }
+
     func bytes(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
         let path = request.url!.path
         requests.append((path, request.httpMethod, request.value(forHTTPHeaderField: "Authorization")))
+        requestTimeoutIntervals[path] = request.timeoutInterval
+        requestMaxBytes[path] = maxBytes
         let digest = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
         let status: Int
         let headers: [String: String]?
@@ -101,7 +113,7 @@ private actor EndpointFileDeliveryTransportFixture: HTTPTransport {
             status = 200
             headers = nil
             body = Data("""
-            {"status":"ok","accepting_authorized_operations":true,"schema_version":1,"bootstrap_completed":true,"features":{"file_jobs":\(fileJobsEnabled)}}
+            {"status":"ok","accepting_authorized_operations":true,"schema_version":1,"bootstrap_completed":true,"features":{"file_jobs":\(fileJobsEnabled),"screen_observation":\(screenObservationEnabled)}}
             """.utf8)
         case "/v2/endpoints/enroll":
             status = 201
@@ -136,6 +148,12 @@ private actor EndpointFileDeliveryTransportFixture: HTTPTransport {
             body = Data("""
             {"computer_id":"\(computerID)","friendly_name":"Science Mac","platform":"macos","enrollment_epoch":1}
             """.utf8)
+        case "/v2/endpoints/admissions/observation/pending":
+            status = 200
+            headers = nil
+            body = pendingObservationGrantResponses.isEmpty
+                ? Data(#"{"grants":[]}"#.utf8)
+                : pendingObservationGrantResponses.removeFirst()
         case "/v2/endpoints/admissions/observation/redeem":
             let requestJSON = try JSONSerialization.jsonObject(with: request.httpBody!) as! [String: String]
             let tokenPayload = String(requestJSON["grant_token"]!.split(separator: ".")[0])
@@ -178,6 +196,114 @@ private actor EndpointFileDeliveryTransportFixture: HTTPTransport {
         let response = HTTPURLResponse(url: request.url!, statusCode: status,
                                        httpVersion: "HTTP/1.1", headerFields: headers)!
         return (body, response)
+    }
+}
+
+/// Pauses the pending-grant response so a test can change local identity
+/// generation while the request is in flight.
+private actor PendingGrantGateTransport: HTTPTransport {
+    private let inner: EndpointFileDeliveryTransportFixture
+    private var pendingRequestSeen = false
+    private var blockedFirstPendingRequest = false
+    private var pendingRequestStarted: CheckedContinuation<Void, Never>?
+    private var pendingRequestRelease: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    init(inner: EndpointFileDeliveryTransportFixture) {
+        self.inner = inner
+    }
+
+    func bytes(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
+        if request.url?.path == "/v2/endpoints/admissions/observation/pending",
+           !blockedFirstPendingRequest {
+            blockedFirstPendingRequest = true
+            pendingRequestSeen = true
+            pendingRequestStarted?.resume()
+            pendingRequestStarted = nil
+            if !released {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    pendingRequestRelease = continuation
+                }
+            }
+        }
+        return try await inner.bytes(for: request, maxBytes: maxBytes)
+    }
+
+    func waitForPendingRequest() async {
+        if pendingRequestSeen { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            pendingRequestStarted = continuation
+        }
+    }
+
+    func releasePendingRequest() {
+        released = true
+        pendingRequestRelease?.resume()
+        pendingRequestRelease = nil
+    }
+}
+
+/// Blocks one exact request path so tests can reset identity or cancel while a
+/// server-consumed operation is in flight.
+private actor BlockingPathTransport: HTTPTransport {
+    private let inner: EndpointFileDeliveryTransportFixture
+    private var path: String
+    private var requestSeen = false
+    private var requestStarted: CheckedContinuation<Void, Never>?
+    private var requestRelease: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    init(inner: EndpointFileDeliveryTransportFixture, path: String) {
+        self.inner = inner
+        self.path = path
+    }
+
+    func setPath(_ value: String) {
+        path = value
+    }
+
+    func bytes(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
+        if request.url?.path == path {
+            requestSeen = true
+            requestStarted?.resume()
+            requestStarted = nil
+            if !released {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    requestRelease = continuation
+                }
+            }
+        }
+        return try await inner.bytes(for: request, maxBytes: maxBytes)
+    }
+
+    func waitForRequest() async {
+        if requestSeen { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            requestStarted = continuation
+        }
+    }
+
+    func releaseRequest() {
+        released = true
+        requestRelease?.resume()
+        requestRelease = nil
+    }
+}
+
+/// Routes test requests by origin so one client can exercise more than one
+/// deployment without sharing a fixture.
+private actor RoutingHTTPTransport: HTTPTransport {
+    private let routes: [String: any HTTPTransport]
+
+    init(routes: [String: any HTTPTransport]) {
+        self.routes = routes
+    }
+
+    func bytes(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
+        guard let host = request.url?.host, let route = routes[host] else {
+            throw HelicoidError.unreachable
+        }
+        return try await route.bytes(for: request, maxBytes: maxBytes)
     }
 }
 
@@ -492,6 +618,400 @@ struct EndpointEnrollmentClientTests {
         #expect(fileRequestList?.2 == "Bearer endpoint-session-fixture-token-0123456789")
     }
 
+    @Test func identityResetDuringInFlightRedeemDoesNotInstallActiveLease() async throws {
+        let deploymentID = "dep_" + String(repeating: "d", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let managerKey = Curve25519.Signing.PrivateKey()
+        let innerTransport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let gate = BlockingPathTransport(
+            inner: innerTransport,
+            path: "/v2/endpoints/admissions/observation/redeem"
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: gate
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let grant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: managerKey,
+            deploymentID: deploymentID,
+            computerID: innerTransport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "c1d2e3f4-a5b6-4c7d-8e9f-0a1b2c3d4e5f",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        let challenge = try await client.prepareObservationAdmission(
+            grantToken: grant.token,
+            deploymentID: deploymentID
+        )
+        let binding = Self.webRTCChannelBinding()
+        let proof = try Self.managerProof(
+            challenge: challenge,
+            deploymentID: deploymentID,
+            managerKey: managerKey,
+            channelBinding: binding
+        )
+        let redemption = Task {
+            try await client.redeemObservationAdmission(
+                challengeID: challenge.id,
+                managerProofHex: proof,
+                currentVerifiedChannelBinding: { binding }
+            )
+        }
+        await gate.waitForRequest()
+        try await client.forgetIdentity(deploymentID: deploymentID)
+        await gate.releaseRequest()
+
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The saved endpoint identity changed while this request was in progress."
+        )) {
+            _ = try await redemption.value
+        }
+    }
+
+    @Test func cancellationDuringInFlightRedeemDoesNotInstallActiveLease() async throws {
+        let deploymentID = "dep_" + String(repeating: "e", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let managerKey = Curve25519.Signing.PrivateKey()
+        let innerTransport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let gate = BlockingPathTransport(
+            inner: innerTransport,
+            path: "/v2/endpoints/admissions/observation/redeem"
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: gate
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let grant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: managerKey,
+            deploymentID: deploymentID,
+            computerID: innerTransport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "d2e3f4a5-b6c7-4d8e-9f0a-1b2c3d4e5f60",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        let challenge = try await client.prepareObservationAdmission(
+            grantToken: grant.token,
+            deploymentID: deploymentID
+        )
+        let binding = Self.webRTCChannelBinding()
+        let proof = try Self.managerProof(
+            challenge: challenge,
+            deploymentID: deploymentID,
+            managerKey: managerKey,
+            channelBinding: binding
+        )
+        let redemption = Task {
+            try await client.redeemObservationAdmission(
+                challengeID: challenge.id,
+                managerProofHex: proof,
+                currentVerifiedChannelBinding: { binding }
+            )
+        }
+        await gate.waitForRequest()
+        redemption.cancel()
+        await gate.releaseRequest()
+
+        do {
+            _ = try await redemption.value
+            Issue.record("A cancelled redemption installed an active lease")
+        } catch {
+            #expect(error is CancellationError)
+        }
+    }
+
+    @Test func activeLeaseCapacityIsPerDeploymentAndReservationsRelease() async throws {
+        let originA = URL(string: "https://a.helicoid.example:8920")!
+        let originB = URL(string: "https://b.helicoid.example:8920")!
+        let deploymentA = "dep_" + String(repeating: "a", count: 32)
+        let deploymentB = "dep_" + String(repeating: "b", count: 32)
+        let serverKeyA = Curve25519.Signing.PrivateKey()
+        let serverKeyB = Curve25519.Signing.PrivateKey()
+        let managerKeyA = Curve25519.Signing.PrivateKey()
+        let managerKeyB = Curve25519.Signing.PrivateKey()
+        let fixtureA = EndpointFileDeliveryTransportFixture(
+            origin: originA,
+            screenObservationEnabled: true,
+            deploymentID: deploymentA,
+            grantVerificationKeyHex: Self.lowerHex(serverKeyA.publicKey.rawRepresentation)
+        )
+        let fixtureB = EndpointFileDeliveryTransportFixture(
+            origin: originB,
+            screenObservationEnabled: true,
+            deploymentID: deploymentB,
+            grantVerificationKeyHex: Self.lowerHex(serverKeyB.publicKey.rawRepresentation)
+        )
+        let gateA = BlockingPathTransport(inner: fixtureA, path: "")
+        let routing = RoutingHTTPTransport(routes: [
+            originA.host!: gateA,
+            originB.host!: fixtureB,
+        ])
+        let store = EndpointKeyFixtureStore()
+        let client = EndpointEnrollmentClient(
+            keyStore: store,
+            transport: routing,
+            localUserIdentity: { "macos:uid:501" }
+        )
+        _ = try await client.enroll(
+            serverAddress: originA.absoluteString,
+            deploymentID: deploymentA,
+            invitationID: invitationID,
+            enrollmentCode: code
+        )
+        _ = try await client.enroll(
+            serverAddress: originB.absoluteString,
+            deploymentID: deploymentB,
+            invitationID: invitationID,
+            enrollmentCode: code
+        )
+        let endpointPublicKeyA = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentA
+        )
+        let endpointPublicKeyB = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentB
+        )
+
+        var lastA: EndpointObservationAdmission?
+        for _ in 0..<7 {
+            let prepared = try await preparedObservationChallenge(
+                client: client,
+                deploymentID: deploymentA,
+                serverKey: serverKeyA,
+                managerKey: managerKeyA,
+                computerID: fixtureA.computerID,
+                endpointPublicKeyHex: endpointPublicKeyA
+            )
+            lastA = try await client.redeemObservationAdmission(
+                challengeID: prepared.challenge.id,
+                managerProofHex: prepared.proof,
+                currentVerifiedChannelBinding: { prepared.binding }
+            )
+        }
+
+        await gateA.setPath("/v2/endpoints/admissions/observation/redeem")
+        let cancelledPreparation = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentA,
+            serverKey: serverKeyA,
+            managerKey: managerKeyA,
+            computerID: fixtureA.computerID,
+            endpointPublicKeyHex: endpointPublicKeyA
+        )
+        let cancelled = Task {
+            try await client.redeemObservationAdmission(
+                challengeID: cancelledPreparation.challenge.id,
+                managerProofHex: cancelledPreparation.proof,
+                currentVerifiedChannelBinding: { cancelledPreparation.binding }
+            )
+        }
+        await gateA.waitForRequest()
+        cancelled.cancel()
+        await gateA.releaseRequest()
+        do {
+            _ = try await cancelled.value
+            Issue.record("A cancelled redemption installed an active lease")
+        } catch {
+            #expect(error is CancellationError)
+        }
+
+        let failedPreparation = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentA,
+            serverKey: serverKeyA,
+            managerKey: managerKeyA,
+            computerID: fixtureA.computerID,
+            endpointPublicKeyHex: endpointPublicKeyA
+        )
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The endpoint observation grant is invalid or expired."
+        )) {
+            _ = try await client.redeemObservationAdmission(
+                challengeID: failedPreparation.challenge.id,
+                managerProofHex: String(repeating: "0", count: 128),
+                currentVerifiedChannelBinding: { failedPreparation.binding }
+            )
+        }
+
+        let eighthPreparation = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentA,
+            serverKey: serverKeyA,
+            managerKey: managerKeyA,
+            computerID: fixtureA.computerID,
+            endpointPublicKeyHex: endpointPublicKeyA
+        )
+        let eighth = try await client.redeemObservationAdmission(
+            challengeID: eighthPreparation.challenge.id,
+            managerProofHex: eighthPreparation.proof,
+            currentVerifiedChannelBinding: { eighthPreparation.binding }
+        )
+        #expect(await client.observationAdmissionIsCurrent(eighth))
+        if let lastA { #expect(await client.observationAdmissionIsCurrent(lastA)) }
+
+        let ninthPreparation = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentA,
+            serverKey: serverKeyA,
+            managerKey: managerKeyA,
+            computerID: fixtureA.computerID,
+            endpointPublicKeyHex: endpointPublicKeyA
+        )
+        await #expect(throws: HelicoidError.setupBlocked(
+            reason: "Too many admitted observation leases are already active."
+        )) {
+            _ = try await client.redeemObservationAdmission(
+                challengeID: ninthPreparation.challenge.id,
+                managerProofHex: ninthPreparation.proof,
+                currentVerifiedChannelBinding: { ninthPreparation.binding }
+            )
+        }
+
+        let preparedB = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentB,
+            serverKey: serverKeyB,
+            managerKey: managerKeyB,
+            computerID: fixtureB.computerID,
+            endpointPublicKeyHex: endpointPublicKeyB
+        )
+        let admittedB = try await client.redeemObservationAdmission(
+            challengeID: preparedB.challenge.id,
+            managerProofHex: preparedB.proof,
+            currentVerifiedChannelBinding: { preparedB.binding }
+        )
+        #expect(await client.observationAdmissionIsCurrent(admittedB))
+    }
+
+    @Test func publishSignalRejectsIdentityResetDuringRequest() async throws {
+        let deploymentID = "dep_" + String(repeating: "f", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let managerKey = Curve25519.Signing.PrivateKey()
+        let innerTransport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let gate = BlockingPathTransport(inner: innerTransport, path: "")
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: gate
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let prepared = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentID,
+            serverKey: serverKey,
+            managerKey: managerKey,
+            computerID: innerTransport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex
+        )
+        await gate.setPath(
+            "/v2/endpoints/admissions/observation/\(prepared.challenge.grantID)/signals"
+        )
+        let publish = Task {
+            try await client.publishObservationSignal(
+                challengeID: prepared.challenge.id,
+                kind: .ice,
+                payload: "candidate:1"
+            )
+        }
+        await gate.waitForRequest()
+        try await client.forgetIdentity(deploymentID: deploymentID)
+        await gate.releaseRequest()
+
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The saved endpoint identity changed while this request was in progress."
+        )) {
+            try await publish.value
+        }
+    }
+
+    @Test func pollSignalsRejectsIdentityResetDuringRequest() async throws {
+        let deploymentID = "dep_" + String(repeating: "9", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let managerKey = Curve25519.Signing.PrivateKey()
+        let innerTransport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let gate = BlockingPathTransport(inner: innerTransport, path: "")
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: gate
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let prepared = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentID,
+            serverKey: serverKey,
+            managerKey: managerKey,
+            computerID: innerTransport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex
+        )
+        await gate.setPath(
+            "/v2/endpoints/admissions/observation/\(prepared.challenge.grantID)/signals"
+        )
+        let poll = Task {
+            try await client.pollObservationSignals(
+                challengeID: prepared.challenge.id,
+                after: 0
+            )
+        }
+        await gate.waitForRequest()
+        try await client.forgetIdentity(deploymentID: deploymentID)
+        await gate.releaseRequest()
+
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The saved endpoint identity changed while this request was in progress."
+        )) {
+            _ = try await poll.value
+        }
+    }
+
     @Test func refusesPlainHTTPBeforeGeneratingOrPersistingAKey() async {
         let store = EndpointKeyFixtureStore()
         let transport = EndpointEnrollmentTransportFixture(responseBody: Data(), responseURL: endpointURL)
@@ -518,6 +1038,1157 @@ struct EndpointEnrollmentClientTests {
                                     invitationID: invitationID, enrollmentCode: code)
         }
         #expect(await store.insertions == 1)
+    }
+
+    @Test func fetchesAndVerifiesPendingObservationGrant() async throws {
+        let deploymentID = "dep_" + String(repeating: "a", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let pollTransport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport,
+            observationPollTransport: pollTransport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let grant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "b8eeedb7-1d8d-4c29-9e13-05ec6045a173",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        await pollTransport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (grant.grantID, transport.computerID, grant.expiresAtUnix, grant.token),
+        ]))
+
+        let challenges = try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+
+        #expect(challenges.count == 1)
+        let challenge = try #require(challenges.first)
+        #expect(challenge.grantID == grant.grantID)
+        #expect(challenge.computerID == transport.computerID)
+        #expect(challenge.endpointSessionID == Self.endpointSessionID)
+        #expect(challenge.endpointNonceHex.count == 64)
+        #expect(challenge.endpointNonceHex.utf8.allSatisfy {
+            ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66)
+        })
+        #expect(challenge.expiresAtUnix == grant.expiresAtUnix)
+
+        let mainRequests = await transport.requests
+        let pollRequests = await pollTransport.requests
+        let pending = try #require(pollRequests.first {
+            $0.0 == "/v2/endpoints/admissions/observation/pending"
+        })
+        #expect(pending.1 == "GET")
+        #expect(pending.2 == "Bearer endpoint-session-fixture-token-0123456789")
+        let mainPending = mainRequests.filter {
+            $0.0 == "/v2/endpoints/admissions/observation/pending"
+        }
+        #expect(mainPending.isEmpty)
+        let timeouts = await pollTransport.requestTimeoutIntervals
+        let pollTimeout = timeouts["/v2/endpoints/admissions/observation/pending"]
+        #expect(pollTimeout == 15)
+        let caps = await pollTransport.requestMaxBytes
+        #expect(caps["/v2/endpoints/admissions/observation/pending"] == 8 * 8 * 1024 + 8 * 1024)
+
+        let paths = mainRequests.map(\.0)
+        #expect(paths.filter { $0 == "/v2/endpoints/session/challenge" }.count == 1)
+        #expect(paths.filter { $0 == "/v2/endpoints/session/complete" }.count == 1)
+        #expect(!paths.contains("/v2/endpoints/admissions/observation/redeem"))
+        #expect(paths.filter { $0.contains("/signals") }.isEmpty)
+    }
+
+    @Test func fetchesFullEightGrantBatchAtCapacity() async throws {
+        let deploymentID = "dep_" + String(repeating: "5", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let grants = try (0..<8).map { _ in
+            try Self.observationGrant(
+                serverKey: serverKey,
+                managerKey: Curve25519.Signing.PrivateKey(),
+                deploymentID: deploymentID,
+                computerID: transport.computerID,
+                endpointPublicKeyHex: endpointPublicKeyHex,
+                endpointSessionID: Self.endpointSessionID,
+                grantID: UUID().uuidString.lowercased(),
+                issuedAtUnix: now - 1,
+                expiresAtUnix: now + 9
+            )
+        }
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody(
+            grants.map { ($0.grantID, transport.computerID, $0.expiresAtUnix, $0.token) }
+        ))
+
+        let challenges = try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        #expect(challenges.count == 8)
+        #expect(Set(challenges.map(\.grantID)).count == 8)
+
+        let requestCount = await transport.requests.count
+        await #expect(throws: HelicoidError.setupBlocked(
+            reason: "Observation grant polling is waiting for pending observation requests to finish."
+        )) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+        #expect(await transport.requests.count == requestCount)
+    }
+
+    @Test func acceptsExpiredEntriesWithoutDiscardingValidSiblings() async throws {
+        let deploymentID = "dep_" + String(repeating: "4", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let expiredGrant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "6e1f2a3b-4c5d-4e6f-8a9b-0c1d2e3f4a5b",
+            issuedAtUnix: now - 6,
+            expiresAtUnix: now - 5
+        )
+        let activeGrant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "7f2a3b4c-5d6e-4f7a-9b0c-1d2e3f4a5b6c",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (expiredGrant.grantID, transport.computerID,
+             expiredGrant.expiresAtUnix, expiredGrant.token),
+            (activeGrant.grantID, transport.computerID,
+             activeGrant.expiresAtUnix, activeGrant.token),
+        ]))
+
+        let challenges = try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        #expect(challenges.count == 1)
+        #expect(challenges.first?.grantID == activeGrant.grantID)
+    }
+
+    @Test func rejectsTamperedExpiredEntryWithoutPartialAdmission() async throws {
+        let deploymentID = "dep_" + String(repeating: "3", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let tamperedExpiredGrant = try Self.observationGrant(
+            serverKey: Curve25519.Signing.PrivateKey(),
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "8a3b4c5d-6e7f-4a8b-9c0d-2e3f4a5b6c7d",
+            issuedAtUnix: now - 6,
+            expiresAtUnix: now - 5
+        )
+        let activeGrant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "9b4c5d6e-7f8a-4b9c-0d1e-3f4a5b6c7d8e",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (activeGrant.grantID, transport.computerID,
+             activeGrant.expiresAtUnix, activeGrant.token),
+            (tamperedExpiredGrant.grantID, transport.computerID,
+             tamperedExpiredGrant.expiresAtUnix, tamperedExpiredGrant.token),
+        ]))
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The endpoint observation grant is invalid or expired."
+        )) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (activeGrant.grantID, transport.computerID,
+             activeGrant.expiresAtUnix, activeGrant.token),
+        ]))
+        #expect(try await client.fetchPendingObservationGrants(deploymentID: deploymentID).count == 1)
+    }
+
+    @Test func longPollOnDedicatedTransportDoesNotStarveMainRequests() async throws {
+        let deploymentID = "dep_" + String(repeating: "6", count: 32)
+        let mainTransport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID
+        )
+        let pollInner = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID
+        )
+        let pollTransport = PendingGrantGateTransport(inner: pollInner)
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: mainTransport,
+            observationPollTransport: pollTransport
+        )
+
+        let fetchTask = Task {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+        await pollTransport.waitForPendingRequest()
+
+        let requests = try await client.listAvailableFileRequests(deploymentID: deploymentID)
+        #expect(requests.isEmpty)
+
+        await pollTransport.releasePendingRequest()
+        #expect(try await fetchTask.value.isEmpty)
+        let mainPaths = await mainTransport.requests.map(\.0)
+        #expect(mainPaths.contains("/v2/endpoints/file-requests"))
+        #expect(!mainPaths.contains("/v2/endpoints/admissions/observation/pending"))
+        let pollPaths = await pollInner.requests.map(\.0)
+        #expect(pollPaths == ["/v2/endpoints/admissions/observation/pending"])
+    }
+
+    @Test func multipleDeploymentsPollAndPrepareIndependently() async throws {
+        let originA = URL(string: "https://a.helicoid.example:8920")!
+        let originB = URL(string: "https://b.helicoid.example:8920")!
+        let deploymentA = "dep_" + String(repeating: "a", count: 32)
+        let deploymentB = "dep_" + String(repeating: "b", count: 32)
+        let serverKeyA = Curve25519.Signing.PrivateKey()
+        let serverKeyB = Curve25519.Signing.PrivateKey()
+        let fixtureA = EndpointFileDeliveryTransportFixture(
+            origin: originA,
+            screenObservationEnabled: true,
+            deploymentID: deploymentA,
+            grantVerificationKeyHex: Self.lowerHex(serverKeyA.publicKey.rawRepresentation)
+        )
+        let fixtureB = EndpointFileDeliveryTransportFixture(
+            origin: originB,
+            screenObservationEnabled: true,
+            deploymentID: deploymentB,
+            grantVerificationKeyHex: Self.lowerHex(serverKeyB.publicKey.rawRepresentation)
+        )
+        let pollFixtureA = EndpointFileDeliveryTransportFixture(
+            origin: originA,
+            screenObservationEnabled: true,
+            deploymentID: deploymentA,
+            grantVerificationKeyHex: Self.lowerHex(serverKeyA.publicKey.rawRepresentation)
+        )
+        let pollFixtureB = EndpointFileDeliveryTransportFixture(
+            origin: originB,
+            screenObservationEnabled: true,
+            deploymentID: deploymentB,
+            grantVerificationKeyHex: Self.lowerHex(serverKeyB.publicKey.rawRepresentation)
+        )
+        let gateA = PendingGrantGateTransport(inner: pollFixtureA)
+        let mainTransport = RoutingHTTPTransport(routes: [
+            originA.host!: fixtureA,
+            originB.host!: fixtureB,
+        ])
+        let pollTransport = RoutingHTTPTransport(routes: [
+            originA.host!: gateA,
+            originB.host!: pollFixtureB,
+        ])
+        let store = EndpointKeyFixtureStore()
+        let client = EndpointEnrollmentClient(
+            keyStore: store,
+            transport: mainTransport,
+            observationPollTransport: pollTransport,
+            localUserIdentity: { "macos:uid:501" }
+        )
+        _ = try await client.enroll(
+            serverAddress: originA.absoluteString,
+            deploymentID: deploymentA,
+            invitationID: invitationID,
+            enrollmentCode: code
+        )
+        _ = try await client.enroll(
+            serverAddress: originB.absoluteString,
+            deploymentID: deploymentB,
+            invitationID: invitationID,
+            enrollmentCode: code
+        )
+        let endpointPublicKeyB = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentB
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let grantB = try Self.observationGrant(
+            serverKey: serverKeyB,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentB,
+            computerID: fixtureB.computerID,
+            endpointPublicKeyHex: endpointPublicKeyB,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "5c6d7e8f-9a0b-4c5d-8e9f-0a1b2c3d4e5f",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+
+        let fetchA = Task {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentA)
+        }
+        await gateA.waitForPendingRequest()
+
+        // Deployment B is not blocked by A's in-flight long poll.
+        #expect(try await client.fetchPendingObservationGrants(deploymentID: deploymentB).isEmpty)
+        let preparedB = try await client.prepareObservationAdmission(
+            grantToken: grantB.token,
+            deploymentID: deploymentB
+        )
+        #expect(preparedB.grantID == grantB.grantID)
+        #expect(preparedB.computerID == fixtureB.computerID)
+
+        await gateA.releasePendingRequest()
+        #expect(try await fetchA.value.isEmpty)
+        let pollAPaths = await pollFixtureA.requests.map(\.0)
+        let pollBPaths = await pollFixtureB.requests.map(\.0)
+        #expect(pollAPaths == ["/v2/endpoints/admissions/observation/pending"])
+        #expect(pollBPaths == ["/v2/endpoints/admissions/observation/pending"])
+    }
+
+    @Test func sameDeploymentRejectsConcurrentPollAndDirectPrepare() async throws {
+        let deploymentID = "dep_" + String(repeating: "2", count: 32)
+        let mainTransport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID
+        )
+        let pollInner = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID
+        )
+        let pollTransport = PendingGrantGateTransport(inner: pollInner)
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: mainTransport,
+            observationPollTransport: pollTransport
+        )
+        let fetchTask = Task {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+        await pollTransport.waitForPendingRequest()
+
+        await #expect(throws: HelicoidError.setupBlocked(
+            reason: "Another observation admission operation is in progress for this deployment."
+        )) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+        await #expect(throws: HelicoidError.setupBlocked(
+            reason: "Another observation admission operation is in progress for this deployment."
+        )) {
+            try await client.prepareObservationAdmission(
+                grantToken: "invalid",
+                deploymentID: deploymentID
+            )
+        }
+
+        await pollTransport.releasePendingRequest()
+        #expect(try await fetchTask.value.isEmpty)
+        let pollPaths = await pollInner.requests.map(\.0)
+        #expect(pollPaths == ["/v2/endpoints/admissions/observation/pending"])
+    }
+
+    @Test func cancelledPollReleasesTheDeploymentOperation() async throws {
+        let deploymentID = "dep_" + String(repeating: "0", count: 32)
+        let mainTransport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID
+        )
+        let pollInner = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID
+        )
+        let pollTransport = PendingGrantGateTransport(inner: pollInner)
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: mainTransport,
+            observationPollTransport: pollTransport
+        )
+        let fetchTask = Task {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+        await pollTransport.waitForPendingRequest()
+        fetchTask.cancel()
+
+        // The cancellation handler must release the busy owner even though the
+        // first transport request is still blocked.
+        var replacementPollSucceeded = false
+        for _ in 0..<64 {
+            do {
+                _ = try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+                replacementPollSucceeded = true
+                break
+            } catch let error as HelicoidError {
+                if case .setupBlocked(let reason) = error,
+                   reason == "Another observation admission operation is in progress for this deployment." {
+                    await Task.yield()
+                } else {
+                    throw error
+                }
+            }
+        }
+        #expect(replacementPollSucceeded)
+
+        await pollTransport.releasePendingRequest()
+        do {
+            _ = try await fetchTask.value
+            Issue.record("A cancelled observation poll returned a value")
+        } catch {
+            #expect(error is CancellationError)
+        }
+    }
+
+    @Test func publicGrantVerifierRejectsExpiredToken() async throws {
+        let deploymentID = "dep_" + String(repeating: "2", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let endpointKey = Curve25519.Signing.PrivateKey()
+        let endorsement = "f0e1d2c3-b4a5-4968-8776-655443322110"
+        let now = Int64(Date().timeIntervalSince1970)
+        let grant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: "e475b9ca-801a-4f71-b5d5-b87daaaae731",
+            endpointPublicKeyHex: Self.lowerHex(endpointKey.publicKey.rawRepresentation),
+            endpointSessionID: Self.endpointSessionID,
+            grantID: endorsement,
+            issuedAtUnix: now - 6,
+            expiresAtUnix: now - 5
+        )
+        let expected = ObservationAdmissionEndpoint(
+            deploymentID: deploymentID,
+            computerID: "e475b9ca-801a-4f71-b5d5-b87daaaae731",
+            endpointPublicKeyHex: Self.lowerHex(endpointKey.publicKey.rawRepresentation),
+            endpointSessionID: Self.endpointSessionID,
+            enrollmentEpoch: 1
+        )
+
+        #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The endpoint observation grant is invalid or expired."
+        )) {
+            _ = try ObservationAdmissionGrantVerifier.verify(
+                token: grant.token,
+                serverPublicKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation),
+                expected: expected,
+                nowUnixSeconds: now
+            )
+        }
+    }
+
+    @Test func refusesPendingPollWithoutFullBatchCapacityBeforeNetwork() async throws {
+        let deploymentID = "dep_" + String(repeating: "8", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let grant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "8a0d1f42-5b8f-4d4d-b06f-58a3f1e6c2a9",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (grant.grantID, transport.computerID, grant.expiresAtUnix, grant.token),
+        ]))
+        #expect(try await client.fetchPendingObservationGrants(deploymentID: deploymentID).count == 1)
+
+        let requestCountBeforeRefusal = await transport.requests.count
+        await #expect(throws: HelicoidError.setupBlocked(
+            reason: "Observation grant polling is waiting for pending observation requests to finish."
+        )) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+        let requestCountAfterRefusal = await transport.requests.count
+        #expect(requestCountAfterRefusal == requestCountBeforeRefusal)
+    }
+
+    @Test func refusesPendingFetchWhenScreenObservationIsDisabled() async throws {
+        let deploymentID = "dep_" + String(repeating: "9", count: 32)
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: false,
+            deploymentID: deploymentID
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+
+        await #expect(throws: HelicoidError.setupBlocked(
+            reason: "Screen observation is not enabled by this deployment."
+        )) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+        let paths = await transport.requests.map(\.0)
+        #expect(paths.contains("/health"))
+        #expect(!paths.contains("/v2/endpoints/admissions/observation/pending"))
+        #expect(!paths.contains("/v2/endpoints/session/challenge"))
+        #expect(!paths.contains("/v2/endpoints/session/complete"))
+        #expect(!paths.contains("/v2/endpoints/self"))
+    }
+
+    @Test func rejectsPendingGrantForAnotherComputer() async throws {
+        let deploymentID = "dep_" + String(repeating: "b", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let grant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "4b9ba3e6-7e42-4c88-95a8-6e9c70cf9f19",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        let otherComputerID = "f4b0c9e2-6a7f-4a9f-8f6d-9f8f6b2c1d3e"
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (grant.grantID, otherComputerID, grant.expiresAtUnix, grant.token),
+        ]))
+
+        await #expect(throws: HelicoidError.serverContractUnavailable) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (grant.grantID, transport.computerID, grant.expiresAtUnix, grant.token),
+        ]))
+        #expect(try await client.fetchPendingObservationGrants(deploymentID: deploymentID).count == 1)
+    }
+
+    @Test func rejectsStaleEndpointSessionEpochAndKeyBindings() async throws {
+        let deploymentID = "dep_" + String(repeating: "7", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let staleSessionGrant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: "0b8d2d3f-0c4a-4f4a-9d3e-7f3b6f1c2a90",
+            grantID: "7c1e7e2a-1f4c-4f1e-9f0a-6f4b2d9c8e71",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (staleSessionGrant.grantID, transport.computerID,
+             staleSessionGrant.expiresAtUnix, staleSessionGrant.token),
+        ]))
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The endpoint observation grant is invalid or expired."
+        )) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+
+        let staleEpochGrant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "2d4b8d1a-6c3e-4f6b-8b2d-1f0e9c7a5d43",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9,
+            enrollmentEpoch: 2
+        )
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (staleEpochGrant.grantID, transport.computerID,
+             staleEpochGrant.expiresAtUnix, staleEpochGrant.token),
+        ]))
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The endpoint observation grant is invalid or expired."
+        )) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+
+        let staleEndpointKey = Curve25519.Signing.PrivateKey()
+        let staleKeyGrant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: Self.lowerHex(staleEndpointKey.publicKey.rawRepresentation),
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "9e6c3a2b-5d1f-4c7e-8a0b-3d2f1e4c6b85",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (staleKeyGrant.grantID, transport.computerID,
+             staleKeyGrant.expiresAtUnix, staleKeyGrant.token),
+        ]))
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The endpoint observation grant is invalid or expired."
+        )) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+    }
+
+    @Test func rejectsDuplicatePendingObservationGrants() async throws {
+        let deploymentID = "dep_" + String(repeating: "c", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let grant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "ff4d5d5b-ccb5-4f4d-91f1-a6d8c9a3ae08",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (grant.grantID, transport.computerID, grant.expiresAtUnix, grant.token),
+            (grant.grantID, transport.computerID, grant.expiresAtUnix, grant.token),
+        ]))
+
+        await #expect(throws: HelicoidError.serverContractUnavailable) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (grant.grantID, transport.computerID, grant.expiresAtUnix, grant.token),
+        ]))
+        #expect(try await client.fetchPendingObservationGrants(deploymentID: deploymentID).count == 1)
+    }
+
+    @Test func rejectsExpiredOrMismatchedPendingObservationGrant() async throws {
+        let deploymentID = "dep_" + String(repeating: "d", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let grant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "1d1872b1-42e5-4a2d-96e0-ac66b0fc51e0",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (grant.grantID, transport.computerID, now - 1, grant.token),
+        ]))
+        await #expect(throws: HelicoidError.serverContractUnavailable) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (grant.grantID, transport.computerID, now + 10, grant.token),
+        ]))
+        await #expect(throws: HelicoidError.serverContractUnavailable) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            ("c0d3c0de-4b01-4e6c-8f2a-7c9f1d2e3a4b", transport.computerID,
+             grant.expiresAtUnix, grant.token),
+        ]))
+        await #expect(throws: HelicoidError.serverContractUnavailable) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+    }
+
+    @Test func rejectsOversizedAndMalformedPendingObservationGrantPayloads() async throws {
+        let deploymentID = "dep_" + String(repeating: "e", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let repeated = (0..<9).map { index in
+            [
+                "grant_id": "00000000-0000-4000-8000-\(String(format: "%012d", index))",
+                "computer_id": transport.computerID,
+                "expires_at_unix": now + 9,
+                "grant_token": "token",
+            ] as [String: Any]
+        }
+        await transport.setPendingObservationGrantResponse(
+            try JSONSerialization.data(withJSONObject: ["grants": repeated])
+        )
+        await #expect(throws: HelicoidError.serverContractUnavailable) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+
+        let extraField = try JSONSerialization.data(withJSONObject: [
+            "grants": [[
+                "grant_id": "b8eeedb7-1d8d-4c29-9e13-05ec6045a173",
+                "computer_id": transport.computerID,
+                "expires_at_unix": now + 9,
+                "grant_token": "token",
+                "unexpected": true,
+            ]],
+        ])
+        await transport.setPendingObservationGrantResponse(extraField)
+        await #expect(throws: HelicoidError.serverContractUnavailable) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+
+        let unknownEnvelopeField = try JSONSerialization.data(withJSONObject: [
+            "grants": [],
+            "unexpected": true,
+        ])
+        await transport.setPendingObservationGrantResponse(unknownEnvelopeField)
+        await #expect(throws: HelicoidError.serverContractUnavailable) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+    }
+
+    @Test func rejectsTamperedPendingGrantWithoutPartialAdmission() async throws {
+        let deploymentID = "dep_" + String(repeating: "f", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let validGrant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "a1f27d40-0c3f-4b91-95bf-6f0f0b9ec6cf",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        let tamperedGrant = try Self.observationGrant(
+            serverKey: Curve25519.Signing.PrivateKey(),
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "b5e7c5f1-6a2d-4e8c-8f3a-2d1b0c9e7a64",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (validGrant.grantID, transport.computerID, validGrant.expiresAtUnix, validGrant.token),
+            (tamperedGrant.grantID, transport.computerID, tamperedGrant.expiresAtUnix, tamperedGrant.token),
+        ]))
+
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The endpoint observation grant is invalid or expired."
+        )) {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+
+        await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (validGrant.grantID, transport.computerID, validGrant.expiresAtUnix, validGrant.token),
+        ]))
+        #expect(try await client.fetchPendingObservationGrants(deploymentID: deploymentID).count == 1)
+    }
+
+    @Test func forgettingIdentityDuringPendingFetchDiscardsDeliveredGrant() async throws {
+        let deploymentID = "dep_" + String(repeating: "1", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let innerTransport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let transport = PendingGrantGateTransport(inner: innerTransport)
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let now = Int64(Date().timeIntervalSince1970)
+        let grant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: Curve25519.Signing.PrivateKey(),
+            deploymentID: deploymentID,
+            computerID: innerTransport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: "7ce0c16f-4a63-4e5f-92dd-8f87c8a3b6b4",
+            issuedAtUnix: now - 1,
+            expiresAtUnix: now + 9
+        )
+        await innerTransport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
+            (grant.grantID, innerTransport.computerID, grant.expiresAtUnix, grant.token),
+        ]))
+
+        let fetchTask = Task {
+            try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
+        }
+        await transport.waitForPendingRequest()
+        try await client.forgetIdentity(deploymentID: deploymentID)
+        await transport.releasePendingRequest()
+
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The saved endpoint identity changed while this request was in progress."
+        )) {
+            _ = try await fetchTask.value
+        }
+
+        // The invalidated poll must not leave the deployment busy or poison a
+        // replacement identity.
+        _ = try await client.enroll(
+            serverAddress: server,
+            deploymentID: deploymentID,
+            invitationID: invitationID,
+            enrollmentCode: code
+        )
+        #expect(try await client.fetchPendingObservationGrants(deploymentID: deploymentID).isEmpty)
+    }
+
+    private static let endpointSessionID = "b4a3f66d-4ac1-4ac6-8847-e50d0c6f55a1"
+
+    private struct ObservationGrantMaterial {
+        let token: String
+        let grantID: String
+        let expiresAtUnix: Int64
+    }
+
+    private func makeObservationClient(
+        deploymentID: String,
+        store: EndpointKeyFixtureStore,
+        transport: any HTTPTransport,
+        observationPollTransport: (any HTTPTransport)? = nil
+    ) async throws -> EndpointEnrollmentClient {
+        let client = EndpointEnrollmentClient(
+            keyStore: store,
+            transport: transport,
+            observationPollTransport: observationPollTransport,
+            localUserIdentity: { "macos:uid:501" }
+        )
+        _ = try await client.enroll(
+            serverAddress: server,
+            deploymentID: deploymentID,
+            invitationID: invitationID,
+            enrollmentCode: code
+        )
+        return client
+    }
+
+    private func enrolledEndpointPublicKeyHex(
+        store: EndpointKeyFixtureStore,
+        deploymentID: String
+    ) async throws -> String {
+        let account = SHA256.hash(data: Data(deploymentID.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let storedData = try #require(await store.read(account: account))
+        let stored = try JSONDecoder().decode(StoredEndpointFixture.self, from: storedData)
+        let endpointKey = try Curve25519.Signing.PrivateKey(rawRepresentation: stored.privateKey)
+        return Self.lowerHex(endpointKey.publicKey.rawRepresentation)
+    }
+
+    private func preparedObservationChallenge(
+        client: EndpointEnrollmentClient,
+        deploymentID: String,
+        serverKey: Curve25519.Signing.PrivateKey,
+        managerKey: Curve25519.Signing.PrivateKey,
+        computerID: String,
+        endpointPublicKeyHex: String
+    ) async throws -> (
+        challenge: ObservationAdmissionChallenge,
+        binding: Data,
+        proof: String
+    ) {
+        let now = Int64(Date().timeIntervalSince1970)
+        let grant = try Self.observationGrant(
+            serverKey: serverKey,
+            managerKey: managerKey,
+            deploymentID: deploymentID,
+            computerID: computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            endpointSessionID: Self.endpointSessionID,
+            grantID: UUID().uuidString.lowercased(),
+            issuedAtUnix: now,
+            expiresAtUnix: now + 10
+        )
+        let challenge = try await client.prepareObservationAdmission(
+            grantToken: grant.token,
+            deploymentID: deploymentID
+        )
+        let binding = Self.webRTCChannelBinding()
+        let proof = try Self.managerProof(
+            challenge: challenge,
+            deploymentID: deploymentID,
+            managerKey: managerKey,
+            channelBinding: binding
+        )
+        return (challenge, binding, proof)
+    }
+
+    private static func managerProof(
+        challenge: ObservationAdmissionChallenge,
+        deploymentID: String,
+        managerKey: Curve25519.Signing.PrivateKey,
+        channelBinding: Data
+    ) throws -> String {
+        guard let channelBindingHex = ObservationAdmissionGrantVerifier.canonicalChannelBindingHex(
+            channelBinding
+        ) else {
+            throw HelicoidError.authenticationFailed(detail: "Invalid test channel binding")
+        }
+        let message = Data(
+            "hs-observation-peer-proof-v2|deployment:\(deploymentID)|grant:\(challenge.grantID)|computer:\(challenge.computerID)|endpoint_session:\(challenge.endpointSessionID)|epoch:1|nonce:\(challenge.endpointNonceHex)|channel_binding:\(channelBindingHex)".utf8
+        )
+        return Self.lowerHex(try managerKey.signature(for: message))
+    }
+
+    private static func observationGrant(
+        serverKey: Curve25519.Signing.PrivateKey,
+        managerKey: Curve25519.Signing.PrivateKey,
+        deploymentID: String,
+        computerID: String,
+        endpointPublicKeyHex: String,
+        endpointSessionID: String,
+        grantID: String,
+        issuedAtUnix: Int64,
+        expiresAtUnix: Int64,
+        enrollmentEpoch: Int64 = 1
+    ) throws -> ObservationGrantMaterial {
+        let accountID = "ef255e0d-4f8c-4c08-bff2-4e11cbd23f9d"
+        let managerID = "7a01cf88-6fdb-4cc1-a72f-d155f5309355"
+        let managerPublicKeyHex = Self.lowerHex(managerKey.publicKey.rawRepresentation)
+        let payload = Data([
+            "{\"version\":1,\"grant_id\":\"", grantID,
+            "\",\"deployment_id\":\"", deploymentID,
+            "\",\"account_id\":\"", accountID,
+            "\",\"manager_id\":\"", managerID,
+            "\",\"manager_public_key\":\"", managerPublicKeyHex,
+            "\",\"computer_id\":\"", computerID,
+            "\",\"endpoint_public_key\":\"", endpointPublicKeyHex,
+            "\",\"endpoint_session_id\":\"", endpointSessionID,
+            "\",\"enrollment_epoch\":", String(enrollmentEpoch),
+            ",\"issued_at_unix\":", String(issuedAtUnix),
+            ",\"expires_at_unix\":", String(expiresAtUnix),
+            ",\"capability\":\"observe\"}",
+        ].joined().utf8)
+        let signature = try serverKey.signature(
+            for: Data("hs-observation-grant-v1\0".utf8) + payload
+        )
+        let token = payload.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+            + "." + Self.lowerHex(signature)
+        return ObservationGrantMaterial(
+            token: token,
+            grantID: grantID,
+            expiresAtUnix: expiresAtUnix
+        )
+    }
+
+    private static func pendingObservationGrantBody(
+        _ grants: [(grantID: String, computerID: String, expiresAtUnix: Int64, grantToken: String)]
+    ) throws -> Data {
+        let values = grants.map { grant -> [String: Any] in
+            [
+                "grant_id": grant.grantID,
+                "computer_id": grant.computerID,
+                "expires_at_unix": grant.expiresAtUnix,
+                "grant_token": grant.grantToken,
+            ]
+        }
+        return try JSONSerialization.data(withJSONObject: ["grants": values])
     }
 
     private static func decodeHex(_ value: String) -> Data {

@@ -161,8 +161,15 @@ public struct EndpointObservationAdmission: Sendable {
 /// endpoint signing key in the macOS Keychain. The one-time code is never
 /// persisted by this client.
 public actor EndpointEnrollmentClient {
+    private static let maximumPendingObservationGrants = 8
+    private static let maximumActiveObservationLeases = 8
+    private static let maximumObservationGrantTokenBytes = 8 * 1024
+    private static let maximumPendingObservationGrantResponseBytes =
+        maximumPendingObservationGrants * maximumObservationGrantTokenBytes + 8 * 1024
+
     private let keyStore: any EndpointEnrollmentKeyStoring
     private let transport: any HTTPTransport
+    private let observationPollTransport: any HTTPTransport
     private let receivedFilesDirectory: @Sendable () throws -> URL
     private let localUserIdentity: @Sendable () throws -> String?
     private let encoder = JSONEncoder()
@@ -170,13 +177,30 @@ public actor EndpointEnrollmentClient {
     private var pendingObservationAdmissions: [UUID: PendingObservationAdmission] = [:]
     private var observationGrantExpirations: [ObservationGrantKey: Int64] = [:]
     private var activeObservationAdmissions: [ObservationGrantKey: ActiveObservationAdmission] = [:]
+    private var activeObservationRedemptionReservations: [String: Set<UUID>] = [:]
+    private var observationAdmissionOperations: [String: UUID] = [:]
     private var cachedEndpointSessions: [String: CachedEndpointSession] = [:]
     private var endpointSessionFlights: [String: EndpointSessionFlight] = [:]
     private var endpointIdentityGenerations: [String: UInt64] = [:]
 
-    public init(transport: (any HTTPTransport)? = nil) {
+    public init(
+        transport: (any HTTPTransport)? = nil,
+        observationPollTransport: (any HTTPTransport)? = nil
+    ) {
         self.keyStore = KeychainEndpointEnrollmentKeyStore()
         self.transport = transport ?? Self.makeTransport()
+        // The default production client gives the observation long-poll its own
+        // bounded URLSession so it cannot occupy the main connection. A caller
+        // injecting a custom transport must also inject a matching poll
+        // transport if it needs isolation; falling back to that transport
+        // preserves its trust policy instead of silently changing trust.
+        if let observationPollTransport {
+            self.observationPollTransport = observationPollTransport
+        } else if let transport {
+            self.observationPollTransport = transport
+        } else {
+            self.observationPollTransport = Self.makeTransport()
+        }
         self.receivedFilesDirectory = { try Self.receivedFilesDirectoryURL() }
         self.localUserIdentity = { Self.verifiedConsoleUserIdentity() }
     }
@@ -184,11 +208,13 @@ public actor EndpointEnrollmentClient {
     init(
         keyStore: any EndpointEnrollmentKeyStoring,
         transport: any HTTPTransport,
+        observationPollTransport: (any HTTPTransport)? = nil,
         receivedFilesDirectory: @escaping @Sendable () throws -> URL = { try EndpointEnrollmentClient.receivedFilesDirectoryURL() },
         localUserIdentity: @escaping @Sendable () throws -> String? = { EndpointEnrollmentClient.verifiedConsoleUserIdentity() }
     ) {
         self.keyStore = keyStore
         self.transport = transport
+        self.observationPollTransport = observationPollTransport ?? transport
         self.receivedFilesDirectory = receivedFilesDirectory
         self.localUserIdentity = localUserIdentity
     }
@@ -208,6 +234,7 @@ public actor EndpointEnrollmentClient {
             throw HelicoidError.authenticationFailed(detail: "The endpoint identity cannot be safely reset right now.")
         }
         endpointIdentityGenerations[deployment] = generation + 1
+        observationAdmissionOperations.removeValue(forKey: deployment)
         if let flight = endpointSessionFlights.removeValue(forKey: deployment) {
             flight.task.cancel()
         }
@@ -221,6 +248,7 @@ public actor EndpointEnrollmentClient {
         activeObservationAdmissions = activeObservationAdmissions.filter {
             $0.key.deploymentID != deployment
         }
+        activeObservationRedemptionReservations.removeValue(forKey: deployment)
 
         try await keyStore.delete(account: Self.keychainAccount(for: deployment))
     }
@@ -370,35 +398,367 @@ public actor EndpointEnrollmentClient {
     /// Validate a Manager-delivered grant against the deployment key pinned at
     /// enrollment and bind it to a newly authenticated endpoint session.
     /// The caller sends `endpointNonceHex` to the Manager over its peer channel.
+    /// Refuses with a busy error while another observation admission operation
+    /// is active for the same deployment. Cancellation is linearized at the
+    /// final check before challenge registration: passing it commits the
+    /// challenge, and later cancellation does not roll it back.
     public func prepareObservationAdmission(
         grantToken: String,
         deploymentID: String
     ) async throws -> ObservationAdmissionChallenge {
-        let context = try await makeFileRequestSession(deploymentID: deploymentID)
-        guard let verificationKey = context.grantVerificationPublicKeyHex else {
-            throw HelicoidError.authenticationFailed(
-                detail: "This endpoint has no pinned observation-grant key. A trusted enrollment is required."
+        let deployment = try Self.validatedDeploymentID(deploymentID)
+        try Task.checkCancellation()
+        let operationID = try beginObservationAdmissionOperation(deploymentID: deployment)
+        return try await withTaskCancellationHandler {
+            defer {
+                self.finishObservationAdmissionOperation(
+                    deploymentID: deployment,
+                    operationID: operationID
+                )
+            }
+            return try await self.prepareObservationAdmissionBody(
+                grantToken: grantToken,
+                deployment: deployment,
+                operationID: operationID
+            )
+        } onCancel: {
+            Task {
+                await self.invalidateObservationAdmissionOperation(
+                    deploymentID: deployment,
+                    operationID: operationID
+                )
+            }
+        }
+    }
+
+    private func prepareObservationAdmissionBody(
+        grantToken: String,
+        deployment: String,
+        operationID: UUID
+    ) async throws -> ObservationAdmissionChallenge {
+        try Task.checkCancellation()
+        try requireCurrentObservationAdmissionOperation(
+            deploymentID: deployment,
+            operationID: operationID
+        )
+        let identityGeneration = endpointIdentityGenerations[deployment, default: 0]
+        let pruneAt = Int64(Date().timeIntervalSince1970)
+        pruneExpiredObservationState(nowUnixSeconds: pruneAt)
+        guard pendingObservationAdmissionCount(deploymentID: deployment)
+            < Self.maximumPendingObservationGrants else {
+            throw HelicoidError.setupBlocked(reason: "Too many observation requests are already waiting for Manager proof.")
+        }
+
+        let context = try await makeEndpointSession(
+            deploymentID: deployment,
+            requiresScreenObservation: false,
+            expectedIdentityGeneration: identityGeneration
+        )
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
+        try requireCurrentObservationAdmissionOperation(
+            deploymentID: deployment,
+            operationID: operationID
+        )
+
+        let now = Int64(Date().timeIntervalSince1970)
+        let grant = try verifiedObservationGrant(
+            token: grantToken,
+            context: context,
+            nowUnixSeconds: now
+        )
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
+        try requireCurrentObservationAdmissionOperation(
+            deploymentID: deployment,
+            operationID: operationID
+        )
+        return try registerObservationAdmission(
+            grantToken: grantToken,
+            grant: grant,
+            context: context,
+            nowUnixSeconds: now
+        )
+    }
+
+    /// Long-poll for grants queued to this exact authenticated endpoint
+    /// session. The server consumes each queued copy once. Every delivered
+    /// grant is checked against the enrollment pin and the current endpoint
+    /// session before an in-memory challenge is registered.
+    ///
+    /// This prepares the existing signaling and redemption exchange only. It
+    /// does not publish a challenge, start a peer, exchange an answer or proof,
+    /// redeem a grant, or start capture.
+    ///
+    /// The server deletes the whole queued batch when it answers. A malformed,
+    /// tampered, or internally inconsistent entry therefore fails the batch
+    /// closed and any valid siblings are unavoidably lost; the Manager must
+    /// request a fresh grant. Genuine entries that are already expired are
+    /// verified and skipped without being admitted.
+    ///
+    /// Polling is serialized per deployment. If another poll or direct
+    /// preparation is active for this deployment, this method refuses with a
+    /// busy error before any network work rather than queueing an unbounded
+    /// waiter. Cancellation releases that local owner even when the transport
+    /// ignores cancellation, but it cannot revoke a request already accepted
+    /// by the server; a noncooperative transport may still consume a batch.
+    /// This client cannot impose a deadline on an injected transport that
+    /// never returns; the default URLSession path uses a 15-second deadline.
+    /// Cancellation is linearized at the final check before registration:
+    /// passing it commits the challenges, and later cancellation does not roll
+    /// them back.
+    public func fetchPendingObservationGrants(
+        deploymentID: String
+    ) async throws -> [ObservationAdmissionChallenge] {
+        let deployment = try Self.validatedDeploymentID(deploymentID)
+        try Task.checkCancellation()
+        let operationID = try beginObservationAdmissionOperation(deploymentID: deployment)
+        return try await withTaskCancellationHandler {
+            defer {
+                self.finishObservationAdmissionOperation(
+                    deploymentID: deployment,
+                    operationID: operationID
+                )
+            }
+            return try await self.fetchPendingObservationGrantsBody(
+                deployment: deployment,
+                operationID: operationID
+            )
+        } onCancel: {
+            // Release the owner even when the transport ignores cancellation.
+            // A newer operation can start; this operation's ID prevents stale
+            // cleanup from clearing it.
+            Task {
+                await self.invalidateObservationAdmissionOperation(
+                    deploymentID: deployment,
+                    operationID: operationID
+                )
+            }
+        }
+    }
+
+    private func fetchPendingObservationGrantsBody(
+        deployment: String,
+        operationID: UUID
+    ) async throws -> [ObservationAdmissionChallenge] {
+        try Task.checkCancellation()
+        try requireCurrentObservationAdmissionOperation(
+            deploymentID: deployment,
+            operationID: operationID
+        )
+        let identityGeneration = endpointIdentityGenerations[deployment, default: 0]
+
+        // The server dequeues up to eight grants irreversibly. Refuse before
+        // any network work unless this deployment can accept a full batch.
+        pruneExpiredObservationState(nowUnixSeconds: Int64(Date().timeIntervalSince1970))
+        guard pendingObservationAdmissionCount(deploymentID: deployment) == 0 else {
+            throw HelicoidError.setupBlocked(
+                reason: "Observation grant polling is waiting for pending observation requests to finish."
             )
         }
-        let expected = ObservationAdmissionEndpoint(
+
+        let context = try await makeObservationPollSession(
+            deploymentID: deployment,
+            identityGeneration: identityGeneration
+        )
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
+        try requireCurrentObservationAdmissionOperation(
+            deploymentID: deployment,
+            operationID: operationID
+        )
+
+        let delivered = try await requestPendingObservationGrants(context: context)
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
+        try requireCurrentObservationAdmissionOperation(
+            deploymentID: deployment,
+            operationID: operationID
+        )
+        do {
+            try requireSameLocalUser(context.localUserID)
+        } catch {
+            throw HelicoidError.setupBlocked(
+                reason: "Observation stopped because the signed-in console user changed."
+            )
+        }
+
+        let validatedAt = Int64(Date().timeIntervalSince1970)
+        pruneExpiredObservationState(nowUnixSeconds: validatedAt)
+        let verified = try verifiedDeliveredObservationGrants(
+            delivered,
+            context: context,
+            nowUnixSeconds: validatedAt
+        )
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
+        try requireCurrentObservationAdmissionOperation(
+            deploymentID: deployment,
+            operationID: operationID
+        )
+        guard pendingObservationAdmissionCount(deploymentID: deployment) + verified.count
+            <= Self.maximumPendingObservationGrants else {
+            throw HelicoidError.setupBlocked(
+                reason: "Too many observation requests are already waiting for Manager proof."
+            )
+        }
+
+        var challenges: [ObservationAdmissionChallenge] = []
+        challenges.reserveCapacity(verified.count)
+        for deliveredGrant in verified {
+            challenges.append(try registerObservationAdmission(
+                grantToken: deliveredGrant.token,
+                grant: deliveredGrant.grant,
+                context: context,
+                nowUnixSeconds: validatedAt
+            ))
+        }
+        return challenges
+    }
+
+    private func pruneExpiredObservationState(nowUnixSeconds: Int64) {
+        pendingObservationAdmissions = pendingObservationAdmissions.filter {
+            $0.value.grant.expiresAtUnix > nowUnixSeconds
+        }
+        observationGrantExpirations = observationGrantExpirations.filter {
+            $0.value > nowUnixSeconds
+        }
+    }
+
+    private func pendingObservationAdmissionCount(deploymentID: String) -> Int {
+        pendingObservationAdmissions.values.reduce(into: 0) { count, pending in
+            if pending.context.deploymentID == deploymentID {
+                count += 1
+            }
+        }
+    }
+
+    private func beginObservationAdmissionOperation(deploymentID: String) throws -> UUID {
+        guard observationAdmissionOperations[deploymentID] == nil else {
+            throw HelicoidError.setupBlocked(
+                reason: "Another observation admission operation is in progress for this deployment."
+            )
+        }
+        let operationID = UUID()
+        observationAdmissionOperations[deploymentID] = operationID
+        return operationID
+    }
+
+    private func finishObservationAdmissionOperation(
+        deploymentID: String,
+        operationID: UUID
+    ) {
+        guard observationAdmissionOperations[deploymentID] == operationID else { return }
+        observationAdmissionOperations.removeValue(forKey: deploymentID)
+    }
+
+    private func requireCurrentObservationAdmissionOperation(
+        deploymentID: String,
+        operationID: UUID
+    ) throws {
+        guard observationAdmissionOperations[deploymentID] == operationID else {
+            throw HelicoidError.authenticationFailed(
+                detail: "The observation admission operation was cancelled or superseded by an identity change."
+            )
+        }
+    }
+
+    private func invalidateObservationAdmissionOperation(
+        deploymentID: String,
+        operationID: UUID
+    ) {
+        guard observationAdmissionOperations[deploymentID] == operationID else { return }
+        observationAdmissionOperations.removeValue(forKey: deploymentID)
+    }
+
+    private func pruneExpiredActiveObservationState(nowUnixSeconds: Int64) {
+        activeObservationAdmissions = activeObservationAdmissions.filter {
+            $0.value.expiresAtUnix > nowUnixSeconds
+        }
+    }
+
+    private func activeObservationAdmissionCount(deploymentID: String) -> Int {
+        activeObservationAdmissions.keys.reduce(into: 0) { count, key in
+            if key.deploymentID == deploymentID {
+                count += 1
+            }
+        }
+    }
+
+    private func activeObservationCapacityUsed(deploymentID: String) -> Int {
+        activeObservationAdmissionCount(deploymentID: deploymentID)
+            + (activeObservationRedemptionReservations[deploymentID]?.count ?? 0)
+    }
+
+    private func releaseActiveObservationRedemptionReservation(
+        deploymentID: String,
+        reservationID: UUID
+    ) {
+        guard var reservations = activeObservationRedemptionReservations[deploymentID] else {
+            return
+        }
+        reservations.remove(reservationID)
+        if reservations.isEmpty {
+            activeObservationRedemptionReservations.removeValue(forKey: deploymentID)
+        } else {
+            activeObservationRedemptionReservations[deploymentID] = reservations
+        }
+    }
+
+    private func observationAdmissionEndpoint(
+        context: FileRequestSession
+    ) -> ObservationAdmissionEndpoint {
+        ObservationAdmissionEndpoint(
             deploymentID: context.deploymentID,
             computerID: context.computerID,
             endpointPublicKeyHex: context.endpointPublicKeyHex,
             endpointSessionID: context.session.sessionID,
             enrollmentEpoch: context.session.enrollmentEpoch
         )
-        let grant = try ObservationAdmissionGrantVerifier.verify(
-            token: grantToken,
-            serverPublicKeyHex: verificationKey,
-            expected: expected
+    }
+
+    private func pinnedObservationGrantKey(context: FileRequestSession) throws -> String {
+        guard let verificationKey = context.grantVerificationPublicKeyHex else {
+            throw HelicoidError.authenticationFailed(
+                detail: "This endpoint has no pinned observation-grant key. A trusted enrollment is required."
+            )
+        }
+        return verificationKey
+    }
+
+    private func verifiedObservationGrant(
+        token: String,
+        context: FileRequestSession,
+        nowUnixSeconds: Int64
+    ) throws -> VerifiedObservationAdmissionGrant {
+        try ObservationAdmissionGrantVerifier.verify(
+            token: token,
+            serverPublicKeyHex: try pinnedObservationGrantKey(context: context),
+            expected: observationAdmissionEndpoint(context: context),
+            nowUnixSeconds: nowUnixSeconds
         )
-        let now = Int64(Date().timeIntervalSince1970)
-        pendingObservationAdmissions = pendingObservationAdmissions.filter {
-            $0.value.grant.expiresAtUnix > now
-        }
-        observationGrantExpirations = observationGrantExpirations.filter {
-            $0.value > now
-        }
+    }
+
+    private func verifiedExpiredObservationGrant(
+        token: String,
+        context: FileRequestSession,
+        nowUnixSeconds: Int64
+    ) throws -> VerifiedObservationAdmissionGrant {
+        try ObservationAdmissionGrantVerifier.verifyExpired(
+            token: token,
+            serverPublicKeyHex: try pinnedObservationGrantKey(context: context),
+            expected: observationAdmissionEndpoint(context: context),
+            nowUnixSeconds: nowUnixSeconds
+        )
+    }
+
+    private func registerObservationAdmission(
+        grantToken: String,
+        grant: VerifiedObservationAdmissionGrant,
+        context: FileRequestSession,
+        nowUnixSeconds: Int64
+    ) throws -> ObservationAdmissionChallenge {
+        pruneExpiredObservationState(nowUnixSeconds: nowUnixSeconds)
         let grantKey = ObservationGrantKey(
             deploymentID: context.deploymentID,
             grantID: grant.grantID
@@ -406,7 +766,8 @@ public actor EndpointEnrollmentClient {
         guard observationGrantExpirations[grantKey] == nil else {
             throw ObservationAdmissionGrantVerifier.invalidGrant()
         }
-        guard pendingObservationAdmissions.count < 8 else {
+        guard pendingObservationAdmissionCount(deploymentID: context.deploymentID)
+            < Self.maximumPendingObservationGrants else {
             throw HelicoidError.setupBlocked(reason: "Too many observation requests are already waiting for Manager proof.")
         }
         let challenge = ObservationAdmissionChallenge(
@@ -427,6 +788,136 @@ public actor EndpointEnrollmentClient {
         return challenge
     }
 
+    private func requestPendingObservationGrants(
+        context: FileRequestSession
+    ) async throws -> [EndpointPendingObservationGrant] {
+        let endpointURL = context.baseURL.appending(
+            path: "/v2/endpoints/admissions/observation/pending"
+        )
+        var request = URLRequest(url: endpointURL)
+        request.httpMethod = "GET"
+        // The server holds this request for at most 10 seconds; native
+        // endpoint clients use a 15-second request deadline.
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(context.session.token)", forHTTPHeaderField: "Authorization")
+        let (responseData, response) = try await observationPollTransport.bytes(
+            for: request,
+            maxBytes: Self.maximumPendingObservationGrantResponseBytes
+        )
+        var responseBody = responseData
+        defer { responseBody.resetBytes(in: responseBody.startIndex..<responseBody.endIndex) }
+        guard let http = response as? HTTPURLResponse, http.url == endpointURL else {
+            throw HelicoidError.serverContractUnavailable
+        }
+        guard http.statusCode == 200 else {
+            if http.statusCode == 401 || http.statusCode == 403 {
+                throw HelicoidError.authenticationFailed(
+                    detail: "The endpoint is waiting for administrator approval or its session is no longer valid."
+                )
+            }
+            throw HelicoidError.serverContractUnavailable
+        }
+        return try Self.decodePendingObservationGrants(responseBody)
+    }
+
+    private func verifiedDeliveredObservationGrants(
+        _ delivered: [EndpointPendingObservationGrant],
+        context: FileRequestSession,
+        nowUnixSeconds: Int64
+    ) throws -> [(token: String, grant: VerifiedObservationAdmissionGrant)] {
+        var seenGrantIDs = Set<String>()
+        for grant in delivered {
+            let grantKey = ObservationGrantKey(
+                deploymentID: context.deploymentID,
+                grantID: grant.grantID
+            )
+            guard grant.computerID == context.computerID,
+                  Self.isCanonicalUUID(grant.grantID),
+                  Self.isBoundedObservationGrantToken(grant.grantToken),
+                  seenGrantIDs.insert(grant.grantID).inserted,
+                  observationGrantExpirations[grantKey] == nil else {
+                throw Self.invalidPendingObservationGrantResponse()
+            }
+        }
+
+        var verified: [(token: String, grant: VerifiedObservationAdmissionGrant)] = []
+        verified.reserveCapacity(delivered.count)
+        for grant in delivered {
+            if grant.expiresAtUnix <= nowUnixSeconds {
+                // A genuine but stale delivery is skipped. Its signature,
+                // claims, bindings, and envelope equality are still verified,
+                // so a malformed or tampered expired entry fails the batch.
+                let expiredGrant = try verifiedExpiredObservationGrant(
+                    token: grant.grantToken,
+                    context: context,
+                    nowUnixSeconds: nowUnixSeconds
+                )
+                guard expiredGrant.grantID == grant.grantID,
+                      expiredGrant.computerID == grant.computerID,
+                      expiredGrant.expiresAtUnix == grant.expiresAtUnix else {
+                    throw Self.invalidPendingObservationGrantResponse()
+                }
+                continue
+            }
+            let verifiedGrant = try verifiedObservationGrant(
+                token: grant.grantToken,
+                context: context,
+                nowUnixSeconds: nowUnixSeconds
+            )
+            guard verifiedGrant.grantID == grant.grantID,
+                  verifiedGrant.computerID == grant.computerID,
+                  verifiedGrant.expiresAtUnix == grant.expiresAtUnix else {
+                throw Self.invalidPendingObservationGrantResponse()
+            }
+            verified.append((token: grant.grantToken, grant: verifiedGrant))
+        }
+        return verified
+    }
+
+    private static func decodePendingObservationGrants(
+        _ data: Data
+    ) throws -> [EndpointPendingObservationGrant] {
+        guard !data.isEmpty,
+              data.count <= maximumPendingObservationGrantResponseBytes,
+              let root = try? JSONSerialization.jsonObject(with: data),
+              let object = root as? [String: Any],
+              object.count == 1,
+              let rawGrants = object["grants"] as? [Any],
+              rawGrants.count <= maximumPendingObservationGrants else {
+            throw invalidPendingObservationGrantResponse()
+        }
+        for rawGrant in rawGrants {
+            guard let grant = rawGrant as? [String: Any],
+                  grant.count == 4,
+                  grant["grant_id"] is String,
+                  grant["computer_id"] is String,
+                  grant["expires_at_unix"] is NSNumber,
+                  grant["grant_token"] is String else {
+                throw invalidPendingObservationGrantResponse()
+            }
+        }
+        let decoded: EndpointPendingObservationGrants
+        do {
+            decoded = try JSONDecoder().decode(EndpointPendingObservationGrants.self, from: data)
+        } catch {
+            throw invalidPendingObservationGrantResponse()
+        }
+        guard decoded.grants.count == rawGrants.count else {
+            throw invalidPendingObservationGrantResponse()
+        }
+        return decoded.grants
+    }
+
+    private static func isBoundedObservationGrantToken(_ token: String) -> Bool {
+        !token.isEmpty && token.utf8.count <= maximumObservationGrantTokenBytes
+            && token.utf8.allSatisfy { $0 < 0x80 }
+    }
+
+    private static func invalidPendingObservationGrantResponse() -> HelicoidError {
+        .serverContractUnavailable
+    }
+
     /// Send one bounded signaling value for the pending grant. This carries
     /// SDP/ICE only; a native peer must still verify its DTLS channel binding.
     public func publishObservationSignal(
@@ -439,13 +930,21 @@ public actor EndpointEnrollmentClient {
               pending.grant.expiresAtUnix > Int64(Date().timeIntervalSince1970) else {
             throw ObservationAdmissionGrantVerifier.invalidGrant()
         }
+        let deployment = pending.context.deploymentID
+        let identityGeneration = endpointIdentityGenerations[deployment, default: 0]
+        try Task.checkCancellation()
         try requireSameLocalUser(pending.context.localUserID)
         try await verifyEndpointSession(
             pending.context.session,
             baseURL: pending.context.baseURL,
-            deploymentID: pending.context.deploymentID,
+            deploymentID: deployment,
             enrollment: pending.context.enrollment
         )
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
+        guard pendingObservationAdmissions[challengeID]?.grant.grantID == pending.grant.grantID else {
+            throw ObservationAdmissionGrantVerifier.invalidGrant()
+        }
         guard Self.validObservationSignal(kind: kind, payload: payload) else {
             throw HelicoidError.invalidInput(
                 field: "observation signaling",
@@ -468,6 +967,8 @@ public actor EndpointEnrollmentClient {
         let (responseData, response) = try await transport.bytes(for: request, maxBytes: 1024)
         var responseBody = responseData
         defer { responseBody.resetBytes(in: responseBody.startIndex..<responseBody.endIndex) }
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
         guard let http = response as? HTTPURLResponse, http.url == endpointURL else {
             throw HelicoidError.serverContractUnavailable
         }
@@ -492,13 +993,21 @@ public actor EndpointEnrollmentClient {
               pending.grant.expiresAtUnix > Int64(Date().timeIntervalSince1970) else {
             throw ObservationAdmissionGrantVerifier.invalidGrant()
         }
+        let deployment = pending.context.deploymentID
+        let identityGeneration = endpointIdentityGenerations[deployment, default: 0]
+        try Task.checkCancellation()
         try requireSameLocalUser(pending.context.localUserID)
         try await verifyEndpointSession(
             pending.context.session,
             baseURL: pending.context.baseURL,
-            deploymentID: pending.context.deploymentID,
+            deploymentID: deployment,
             enrollment: pending.context.enrollment
         )
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
+        guard pendingObservationAdmissions[challengeID]?.grant.grantID == pending.grant.grantID else {
+            throw ObservationAdmissionGrantVerifier.invalidGrant()
+        }
         var components = URLComponents(
             url: pending.context.baseURL.appending(
                 path: "/v2/endpoints/admissions/observation/\(pending.grant.grantID)/signals"
@@ -517,6 +1026,8 @@ public actor EndpointEnrollmentClient {
         let (responseData, response) = try await transport.bytes(for: request, maxBytes: 1024 * 1024)
         var responseBody = responseData
         defer { responseBody.resetBytes(in: responseBody.startIndex..<responseBody.endIndex) }
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
         guard let http = response as? HTTPURLResponse, http.url == endpointURL else {
             throw HelicoidError.serverContractUnavailable
         }
@@ -539,15 +1050,74 @@ public actor EndpointEnrollmentClient {
     /// challenge with the server under the current endpoint bearer session.
     /// The exporter must read the live native verified-channel handle; the
     /// returned admission keeps using it to reject stale channel bindings.
+    ///
+    /// The server can consume the one-use grant as soon as the redemption
+    /// request is sent. If this task is cancelled or the endpoint identity
+    /// changes before the accepted response is installed, the grant is not
+    /// treated as an active lease; callers must request a fresh grant.
+    /// Cancellation releases this redemption's local capacity reservation, but
+    /// an injected transport that never returns cannot be forced to observe a
+    /// deadline by this client. Cancellation is linearized at the final check
+    /// before active-lease insertion: passing it commits the lease, and later
+    /// cancellation does not roll it back.
     public func redeemObservationAdmission(
         challengeID: UUID,
         managerProofHex: String,
         currentVerifiedChannelBinding: @escaping @Sendable () throws -> Data
     ) async throws -> EndpointObservationAdmission {
-        guard let pending = pendingObservationAdmissions.removeValue(forKey: challengeID) else {
+        guard let pending = pendingObservationAdmissions[challengeID] else {
             throw ObservationAdmissionGrantVerifier.invalidGrant()
         }
+        let deployment = pending.context.deploymentID
+        let identityGeneration = endpointIdentityGenerations[deployment, default: 0]
+        try Task.checkCancellation()
+        pruneExpiredActiveObservationState(nowUnixSeconds: Int64(Date().timeIntervalSince1970))
+        guard activeObservationCapacityUsed(deploymentID: deployment)
+            < Self.maximumActiveObservationLeases else {
+            throw HelicoidError.setupBlocked(reason: "Too many admitted observation leases are already active.")
+        }
+        let reservationID = UUID()
+        activeObservationRedemptionReservations[deployment, default: []].insert(reservationID)
+        pendingObservationAdmissions.removeValue(forKey: challengeID)
+
+        return try await withTaskCancellationHandler {
+            defer {
+                self.releaseActiveObservationRedemptionReservation(
+                    deploymentID: deployment,
+                    reservationID: reservationID
+                )
+            }
+            return try await self.redeemObservationAdmissionBody(
+                pending: pending,
+                challengeID: challengeID,
+                managerProofHex: managerProofHex,
+                currentVerifiedChannelBinding: currentVerifiedChannelBinding,
+                identityGeneration: identityGeneration
+            )
+        } onCancel: {
+            // Release one bounded capacity reservation even if the transport
+            // ignores cancellation. The body still refuses to install an
+            // active lease after observing cancellation.
+            Task {
+                await self.releaseActiveObservationRedemptionReservation(
+                    deploymentID: deployment,
+                    reservationID: reservationID
+                )
+            }
+        }
+    }
+
+    private func redeemObservationAdmissionBody(
+        pending: PendingObservationAdmission,
+        challengeID: UUID,
+        managerProofHex: String,
+        currentVerifiedChannelBinding: @escaping @Sendable () throws -> Data,
+        identityGeneration: UInt64
+    ) async throws -> EndpointObservationAdmission {
         let context = pending.context
+        let deployment = context.deploymentID
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
         let verifiedChannelBinding: Data
         do {
             verifiedChannelBinding = try currentVerifiedChannelBinding()
@@ -574,12 +1144,16 @@ public actor EndpointEnrollmentClient {
         } catch {
             throw HelicoidError.setupBlocked(reason: "Observation stopped because the signed-in console user changed.")
         }
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
         try await verifyEndpointSession(
             context.session,
             baseURL: context.baseURL,
-            deploymentID: context.deploymentID,
+            deploymentID: deployment,
             enrollment: context.enrollment
         )
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
         guard pending.grant.expiresAtUnix > Int64(Date().timeIntervalSince1970),
               Self.currentChannelBindingMatches(
                 currentVerifiedChannelBinding,
@@ -601,6 +1175,10 @@ public actor EndpointEnrollmentClient {
             bearerToken: context.session.token,
             expectedStatus: 200
         )
+        // The server may already have consumed the grant. Cancellation or an
+        // identity reset here must not install it as a local active lease.
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
         guard accepted.grantID == pending.grant.grantID,
               accepted.computerID == context.computerID,
               accepted.endpointSessionID == context.session.sessionID,
@@ -618,15 +1196,13 @@ public actor EndpointEnrollmentClient {
         ) else {
             throw ObservationAdmissionGrantVerifier.invalidGrant()
         }
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
+
         let now = Int64(Date().timeIntervalSince1970)
-        activeObservationAdmissions = activeObservationAdmissions.filter {
-            $0.value.expiresAtUnix > now
-        }
-        guard activeObservationAdmissions.count < 8 else {
-            throw HelicoidError.setupBlocked(reason: "Too many admitted observation leases are already active.")
-        }
+        pruneExpiredActiveObservationState(nowUnixSeconds: now)
         activeObservationAdmissions[ObservationGrantKey(
-            deploymentID: context.deploymentID,
+            deploymentID: deployment,
             grantID: accepted.grantID
         )] = ActiveObservationAdmission(
             computerID: accepted.computerID,
@@ -634,7 +1210,7 @@ public actor EndpointEnrollmentClient {
             expiresAtUnix: accepted.expiresAtUnix
         )
         return EndpointObservationAdmission(
-            deploymentID: context.deploymentID,
+            deploymentID: deployment,
             grantID: accepted.grantID,
             computerID: accepted.computerID,
             endpointSessionID: accepted.endpointSessionID,
@@ -739,6 +1315,7 @@ public actor EndpointEnrollmentClient {
         if generation < UInt64.max {
             endpointIdentityGenerations[deploymentID] = generation + 1
         }
+        observationAdmissionOperations.removeValue(forKey: deploymentID)
         if let flight = endpointSessionFlights.removeValue(forKey: deploymentID) {
             flight.task.cancel()
         }
@@ -752,6 +1329,7 @@ public actor EndpointEnrollmentClient {
         activeObservationAdmissions = activeObservationAdmissions.filter {
             $0.key.deploymentID != deploymentID
         }
+        activeObservationRedemptionReservations.removeValue(forKey: deploymentID)
     }
 
     /// Authenticate this enrolled endpoint, receive only its leased file jobs,
@@ -1216,11 +1794,29 @@ public actor EndpointEnrollmentClient {
     }
 
     private func makeFileRequestSession(deploymentID: String) async throws -> FileRequestSession {
-        let deployment = deploymentID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !deployment.isEmpty, deployment.count <= 128,
-              deployment.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
-            throw HelicoidError.invalidInput(field: "Deployment ID", detail: "The configured deployment identity is invalid.")
-        }
+        try await makeEndpointSession(
+            deploymentID: deploymentID,
+            requiresScreenObservation: false
+        )
+    }
+
+    private func makeObservationPollSession(
+        deploymentID: String,
+        identityGeneration: UInt64
+    ) async throws -> FileRequestSession {
+        try await makeEndpointSession(
+            deploymentID: deploymentID,
+            requiresScreenObservation: true,
+            expectedIdentityGeneration: identityGeneration
+        )
+    }
+
+    private func makeEndpointSession(
+        deploymentID: String,
+        requiresScreenObservation: Bool,
+        expectedIdentityGeneration: UInt64? = nil
+    ) async throws -> FileRequestSession {
+        let deployment = try Self.validatedDeploymentID(deploymentID)
         let account = Self.keychainAccount(for: deployment)
         guard var storedBytes = try await keyStore.read(account: account) else {
             throw HelicoidError.authenticationFailed(detail: "This Mac has no saved endpoint identity for the selected deployment.")
@@ -1251,6 +1847,18 @@ public actor EndpointEnrollmentClient {
             grantVerificationPublicKeyHex: stored.grantVerificationPublicKeyHex,
             authorityGeneration: stored.authorityGeneration
         )
+        if let expectedIdentityGeneration {
+            try requireCurrentIdentityGeneration(expectedIdentityGeneration, deploymentID: deployment)
+        }
+        if requiresScreenObservation {
+            // Check availability before creating or rotating the endpoint
+            // session so a disabled feature cannot consume endpoint sessions
+            // or invalidate another in-progress session.
+            try await requireScreenObservationEnabled(baseURL: baseURL)
+            if let expectedIdentityGeneration {
+                try requireCurrentIdentityGeneration(expectedIdentityGeneration, deploymentID: deployment)
+            }
+        }
         guard let localUserID = try localUserIdentity() else {
             throw HelicoidError.setupBlocked(reason: "Waiting for an eligible signed-in console user.")
         }
@@ -1268,7 +1876,8 @@ public actor EndpointEnrollmentClient {
             enrollment: enrolled,
             localUserID: localUserID,
             publicKeyHex: publicKeyHex,
-            privateKey: privateKey
+            privateKey: privateKey,
+            expectedIdentityGeneration: expectedIdentityGeneration
         )
         try requireSameLocalUser(localUserID)
         return FileRequestSession(
@@ -1321,9 +1930,11 @@ public actor EndpointEnrollmentClient {
         enrollment: EndpointEnrollmentResult,
         localUserID: String?,
         publicKeyHex: String,
-        privateKey: Curve25519.Signing.PrivateKey
+        privateKey: Curve25519.Signing.PrivateKey,
+        expectedIdentityGeneration: UInt64? = nil
     ) async throws -> EndpointSession {
-        let identityGeneration = endpointIdentityGenerations[deploymentID, default: 0]
+        let identityGeneration = expectedIdentityGeneration
+            ?? endpointIdentityGenerations[deploymentID, default: 0]
         if let cached = cachedEndpointSessions[deploymentID],
            cached.localUserID == localUserID,
            cached.session.expiresAtUnix > Int64(Date().timeIntervalSince1970) + 30 {
@@ -1437,6 +2048,23 @@ public actor EndpointEnrollmentClient {
         }
         guard health.features["file_jobs"] == true else {
             throw HelicoidError.setupBlocked(reason: "File delivery is not enabled by this deployment.")
+        }
+    }
+
+    private func requireScreenObservationEnabled(baseURL: URL) async throws {
+        let healthURL = baseURL.appending(path: "/health")
+        var request = URLRequest(url: healthURL)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, response) = try await transport.bytes(for: request, maxBytes: 16_384)
+        guard let http = response as? HTTPURLResponse, http.url == healthURL, http.statusCode == 200,
+              let health = try? decoder.decode(HealthDTO.self, from: data),
+              health.status == "ok", health.schemaVersion == 1 else {
+            throw HelicoidError.serverContractUnavailable
+        }
+        guard health.features["screen_observation"] == true else {
+            throw HelicoidError.setupBlocked(reason: "Screen observation is not enabled by this deployment.")
         }
     }
 
@@ -2267,6 +2895,15 @@ public actor EndpointEnrollmentClient {
         return value
     }
 
+    private static func validatedDeploymentID(_ raw: String) throws -> String {
+        let deployment = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !deployment.isEmpty, deployment.count <= 128,
+              deployment.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+            throw HelicoidError.invalidInput(field: "Deployment ID", detail: "The configured deployment identity is invalid.")
+        }
+        return deployment
+    }
+
     private static func validateServerAddress(_ raw: String) throws -> URL {
         guard raw == raw.trimmingCharacters(in: .whitespacesAndNewlines),
               let components = URLComponents(string: raw),
@@ -2304,6 +2941,9 @@ public actor EndpointEnrollmentClient {
         configuration.httpShouldSetCookies = false
         configuration.httpCookieAcceptPolicy = .never
         configuration.urlCache = nil
+        // Each call creates an independent URLSession. The observation
+        // long-poll owns a dedicated session so its connection cannot occupy
+        // the only connection used by signaling and file delivery.
         configuration.httpMaximumConnectionsPerHost = 1
         let session = URLSession(configuration: configuration,
                                  delegate: EndpointEnrollmentRedirectRefuser(),
@@ -2422,6 +3062,24 @@ private struct ObservationAdmissionAccepted: Decodable {
         case computerID = "computer_id"
         case endpointSessionID = "endpoint_session_id"
         case expiresAtUnix = "expires_at_unix"
+    }
+}
+
+private struct EndpointPendingObservationGrants: Decodable {
+    let grants: [EndpointPendingObservationGrant]
+}
+
+private struct EndpointPendingObservationGrant: Decodable {
+    let grantID: String
+    let computerID: String
+    let expiresAtUnix: Int64
+    let grantToken: String
+
+    enum CodingKeys: String, CodingKey {
+        case grantID = "grant_id"
+        case computerID = "computer_id"
+        case expiresAtUnix = "expires_at_unix"
+        case grantToken = "grant_token"
     }
 }
 

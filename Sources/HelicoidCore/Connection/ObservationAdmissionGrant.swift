@@ -197,6 +197,35 @@ public enum ObservationAdmissionGrantVerifier {
         return VerifiedObservationAdmissionGrant(claims: claims)
     }
 
+    /// Verify that a delivered grant is a genuine but already expired grant.
+    /// The signature, canonical encoding, claims, endpoint binding, and
+    /// lifetime relationships are all checked; only the requirement that the
+    /// grant still be unexpired is inverted. This exists so a client can
+    /// distinguish a safely stale server delivery from a malformed or
+    /// tampered credential. The result must never be admitted.
+    static func verifyExpired(
+        token: String,
+        serverPublicKeyHex: String,
+        expected: ObservationAdmissionEndpoint,
+        nowUnixSeconds: Int64 = Int64(Date().timeIntervalSince1970)
+    ) throws -> VerifiedObservationAdmissionGrant {
+        let claims = try verifiedClaims(
+            token: token,
+            serverPublicKeyHex: serverPublicKeyHex,
+            nowUnixSeconds: nowUnixSeconds,
+            allowExpired: true
+        )
+        guard claims.expiresAtUnix <= nowUnixSeconds,
+              claims.deploymentID == expected.deploymentID,
+              claims.computerID == expected.computerID,
+              claims.endpointPublicKey == expected.endpointPublicKeyHex,
+              claims.endpointSessionID == expected.endpointSessionID,
+              claims.enrollmentEpoch == expected.enrollmentEpoch
+        else { throw invalidGrant() }
+
+        return VerifiedObservationAdmissionGrant(claims: claims)
+    }
+
     /// Verify a server-issued observation grant for the current Manager
     /// session and computer. Every grant claim, including the endpoint key,
     /// session, and epoch, is taken only from the server-signed payload.
@@ -232,7 +261,8 @@ public enum ObservationAdmissionGrantVerifier {
     private static func verifiedClaims(
         token: String,
         serverPublicKeyHex: String,
-        nowUnixSeconds: Int64
+        nowUnixSeconds: Int64,
+        allowExpired: Bool = false
     ) throws -> Claims {
         guard token.utf8.count <= maximumTokenBytes,
               token.utf8.allSatisfy({ $0 < 0x80 })
@@ -279,7 +309,7 @@ public enum ObservationAdmissionGrantVerifier {
               isLowerHex(claims.endpointPublicKey, byteCount: 32),
               claims.enrollmentEpoch > 0,
               claims.issuedAtUnix <= nowUnixSeconds + 5,
-              claims.expiresAtUnix > nowUnixSeconds,
+              allowExpired || claims.expiresAtUnix > nowUnixSeconds,
               claims.expiresAtUnix > claims.issuedAtUnix,
               claims.expiresAtUnix >= Int64.min + lifetimeSeconds,
               claims.issuedAtUnix >= claims.expiresAtUnix - lifetimeSeconds,
