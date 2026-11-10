@@ -175,6 +175,7 @@ public actor EndpointEnrollmentClient {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var pendingObservationAdmissions: [UUID: PendingObservationAdmission] = [:]
+    private var observationChallengePublishAttempts: [UUID: ObservationChallengePublishAttempt] = [:]
     private var observationGrantExpirations: [ObservationGrantKey: Int64] = [:]
     private var activeObservationAdmissions: [ObservationGrantKey: ActiveObservationAdmission] = [:]
     private var activeObservationRedemptionReservations: [String: Set<UUID>] = [:]
@@ -241,6 +242,9 @@ public actor EndpointEnrollmentClient {
         cachedEndpointSessions.removeValue(forKey: deployment)
         pendingObservationAdmissions = pendingObservationAdmissions.filter {
             $0.value.context.deploymentID != deployment
+        }
+        observationChallengePublishAttempts = observationChallengePublishAttempts.filter {
+            $0.value.deploymentID != deployment
         }
         observationGrantExpirations = observationGrantExpirations.filter {
             $0.key.deploymentID != deployment
@@ -481,6 +485,153 @@ public actor EndpointEnrollmentClient {
         )
     }
 
+    /// Sign the endpoint's exact DTLS certificate for an already verified,
+    /// partially prepared observation grant and publish the contract's fixed
+    /// six-field `challenge` signal. The caller must supply the certificate PEM
+    /// exported by its real native peer; this method does not create or fake a
+    /// peer and does not enable observation or capture.
+    ///
+    /// The first attempt permanently consumes this challenge's publish slot.
+    /// A lost response, cancellation, server conflict, or signing failure is
+    /// fail-closed; obtaining another certificate requires a fresh grant.
+    @discardableResult
+    public func publishObservationChallenge(
+        challengeID: UUID,
+        endpointCertificatePEM: String
+    ) async throws -> String {
+        guard let certificateData = endpointCertificatePEM.data(using: .ascii),
+              ObservationEndpointChallengeVerifier.isCanonicalCertificatePEM(certificateData) else {
+            throw HelicoidError.invalidInput(
+                field: "endpoint certificate",
+                detail: "The endpoint certificate must be canonical ASCII PEM with exact BEGIN and END lines."
+            )
+        }
+        guard let pending = pendingObservationAdmissions[challengeID],
+              pending.challenge.id == challengeID,
+              pending.grant.expiresAtUnix > Int64(Date().timeIntervalSince1970) else {
+            throw ObservationAdmissionGrantVerifier.invalidGrant()
+        }
+        let deployment = pending.context.deploymentID
+        let identityGeneration = endpointIdentityGenerations[deployment, default: 0]
+        do {
+            try requireSameLocalUser(pending.context.localUserID)
+        } catch {
+            throw HelicoidError.setupBlocked(
+                reason: "Observation stopped because the signed-in console user changed."
+            )
+        }
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
+        guard observationChallengePublishAttempts[challengeID] == nil else {
+            throw HelicoidError.setupBlocked(
+                reason: "The observation challenge publish has already been attempted."
+            )
+        }
+        observationChallengePublishAttempts[challengeID] = ObservationChallengePublishAttempt(
+            deploymentID: deployment
+        )
+
+        let signingKey = try await endpointSigningKey(
+            deploymentID: deployment,
+            expectedComputerID: pending.context.computerID,
+            expectedPublicKeyHex: pending.context.endpointPublicKeyHex
+        )
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
+        guard pendingObservationAdmissions[challengeID]?.grant.grantID == pending.grant.grantID else {
+            throw ObservationAdmissionGrantVerifier.invalidGrant()
+        }
+        do {
+            try requireSameLocalUser(pending.context.localUserID)
+        } catch {
+            throw HelicoidError.setupBlocked(
+                reason: "Observation stopped because the signed-in console user changed."
+            )
+        }
+
+        let now = Int64(Date().timeIntervalSince1970)
+        guard pending.grant.expiresAtUnix > now else {
+            throw ObservationAdmissionGrantVerifier.invalidGrant()
+        }
+        let attestationMessage = try pending.grant.peerCertificateAttestationMessage(
+            certificatePEM: certificateData,
+            endpointNonceHex: pending.challenge.endpointNonceHex,
+            role: .endpoint,
+            nowUnixSeconds: now
+        )
+        var signature = try signingKey.signature(for: attestationMessage)
+        defer { signature.resetBytes(in: signature.startIndex..<signature.endIndex) }
+        let certificateText = String(decoding: certificateData, as: UTF8.self)
+        let wire = ObservationEndpointChallengeWire(
+            computerID: pending.challenge.computerID,
+            endpointSessionID: pending.challenge.endpointSessionID,
+            endpointNonce: pending.challenge.endpointNonceHex,
+            expiresAtUnix: pending.challenge.expiresAtUnix,
+            endpointCertificatePEM: certificateText,
+            endpointCertificateSignature: AuthV2Canonical.lowercaseHex(signature)
+        )
+        let payloadData = try encoder.encode(wire)
+        var payloadBytes = payloadData
+        defer { payloadBytes.resetBytes(in: payloadBytes.startIndex..<payloadBytes.endIndex) }
+        guard let payload = String(data: payloadData, encoding: .utf8),
+              !payload.isEmpty,
+              payload.utf8.count <= 4_096 else {
+            throw HelicoidError.invalidInput(
+                field: "endpoint certificate",
+                detail: "The signed endpoint challenge exceeds the signaling payload limit."
+            )
+        }
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
+        try await sendObservationSignal(
+            challengeID: challengeID,
+            kind: "challenge",
+            payload: payload,
+            isSignedChallenge: true
+        )
+        try Task.checkCancellation()
+        try requireCurrentIdentityGeneration(identityGeneration, deploymentID: deployment)
+        return payload
+    }
+
+    private func endpointSigningKey(
+        deploymentID: String,
+        expectedComputerID: String,
+        expectedPublicKeyHex: String
+    ) async throws -> Curve25519.Signing.PrivateKey {
+        let account = Self.keychainAccount(for: deploymentID)
+        guard var storedBytes = try await keyStore.read(account: account) else {
+            throw HelicoidError.authenticationFailed(
+                detail: "This Mac has no saved endpoint identity for the selected deployment."
+            )
+        }
+        defer { storedBytes.resetBytes(in: storedBytes.startIndex..<storedBytes.endIndex) }
+        var stored: StoredEndpointIdentity
+        do {
+            stored = try decoder.decode(StoredEndpointIdentity.self, from: storedBytes)
+        } catch {
+            throw HelicoidError.authenticationFailed(detail: "The saved endpoint identity is invalid.")
+        }
+        defer { stored.privateKey.resetBytes(in: stored.privateKey.startIndex..<stored.privateKey.endIndex) }
+        guard stored.version == 4,
+              stored.deploymentID == deploymentID,
+              stored.privateKey.count == 32,
+              stored.result?.computerID == expectedComputerID,
+              stored.result?.platform == "macos" else {
+            throw HelicoidError.authenticationFailed(
+                detail: "The saved endpoint identity cannot sign this observation challenge."
+            )
+        }
+        let key = try Curve25519.Signing.PrivateKey(rawRepresentation: stored.privateKey)
+        let publicKeyHex = AuthV2Canonical.lowercaseHex(key.publicKey.rawRepresentation)
+        guard publicKeyHex == expectedPublicKeyHex else {
+            throw HelicoidError.authenticationFailed(
+                detail: "The saved endpoint identity does not match the verified observation grant."
+            )
+        }
+        return key
+    }
+
     /// Long-poll for grants queued to this exact authenticated endpoint
     /// session. The server consumes each queued copy once. Every delivered
     /// grant is checked against the enrollment pin and the current endpoint
@@ -622,6 +773,9 @@ public actor EndpointEnrollmentClient {
         }
         observationGrantExpirations = observationGrantExpirations.filter {
             $0.value > nowUnixSeconds
+        }
+        observationChallengePublishAttempts = observationChallengePublishAttempts.filter {
+            pendingObservationAdmissions[$0.key] != nil
         }
     }
 
@@ -919,11 +1073,27 @@ public actor EndpointEnrollmentClient {
     }
 
     /// Send one bounded signaling value for the pending grant. This carries
-    /// SDP/ICE only; a native peer must still verify its DTLS channel binding.
+    /// SDP/ICE/close only. Signed endpoint `challenge` signals are published
+    /// only through `publishObservationChallenge`; the public generic method
+    /// cannot construct an unsigned challenge.
     public func publishObservationSignal(
         challengeID: UUID,
         kind: ObservationSignalKind,
         payload: String
+    ) async throws {
+        try await sendObservationSignal(
+            challengeID: challengeID,
+            kind: kind.rawValue,
+            payload: payload,
+            isSignedChallenge: false
+        )
+    }
+
+    private func sendObservationSignal(
+        challengeID: UUID,
+        kind: String,
+        payload: String,
+        isSignedChallenge: Bool
     ) async throws {
         guard let pending = pendingObservationAdmissions[challengeID],
               pending.challenge.id == challengeID,
@@ -945,11 +1115,28 @@ public actor EndpointEnrollmentClient {
         guard pendingObservationAdmissions[challengeID]?.grant.grantID == pending.grant.grantID else {
             throw ObservationAdmissionGrantVerifier.invalidGrant()
         }
-        guard Self.validObservationSignal(kind: kind, payload: payload) else {
-            throw HelicoidError.invalidInput(
-                field: "observation signaling",
-                detail: "The signaling value is invalid or exceeds its size limit."
-            )
+        if isSignedChallenge {
+            guard kind == "challenge" else {
+                throw HelicoidError.invalidInput(
+                    field: "observation signaling",
+                    detail: "Only a signed endpoint challenge may use the challenge signal kind."
+                )
+            }
+            guard Self.validSignedObservationChallengePayload(payload) else {
+                throw HelicoidError.invalidInput(
+                    field: "observation signaling",
+                    detail: "The signaling value is invalid or exceeds its size limit."
+                )
+            }
+        } else {
+            guard kind != "challenge",
+                  let signalKind = ObservationSignalKind(rawValue: kind),
+                  Self.validObservationSignal(kind: signalKind, payload: payload) else {
+                throw HelicoidError.invalidInput(
+                    field: "observation signaling",
+                    detail: "The signaling value is invalid or exceeds its size limit."
+                )
+            }
         }
         let endpointURL = pending.context.baseURL.appending(
             path: "/v2/endpoints/admissions/observation/\(pending.grant.grantID)/signals"
@@ -973,6 +1160,11 @@ public actor EndpointEnrollmentClient {
             throw HelicoidError.serverContractUnavailable
         }
         guard http.statusCode == 204, responseBody.isEmpty else {
+            if http.statusCode == 409 && isSignedChallenge {
+                throw HelicoidError.setupBlocked(
+                    reason: "The observation challenge was already published."
+                )
+            }
             if http.statusCode == 401 || http.statusCode == 403 {
                 throw HelicoidError.authenticationFailed(
                     detail: "The endpoint observation session or grant is no longer current."
@@ -1322,6 +1514,9 @@ public actor EndpointEnrollmentClient {
         cachedEndpointSessions.removeValue(forKey: deploymentID)
         pendingObservationAdmissions = pendingObservationAdmissions.filter {
             $0.value.context.deploymentID != deploymentID
+        }
+        observationChallengePublishAttempts = observationChallengePublishAttempts.filter {
+            $0.value.deploymentID != deploymentID
         }
         observationGrantExpirations = observationGrantExpirations.filter {
             $0.key.deploymentID != deploymentID
@@ -2618,6 +2813,13 @@ public actor EndpointEnrollmentClient {
         }
     }
 
+    private static func validSignedObservationChallengePayload(_ payload: String) -> Bool {
+        let bytes = Array(payload.utf8)
+        return !bytes.isEmpty && bytes.count <= 4_096 && bytes.allSatisfy {
+            $0 != 0 && (!($0 < 0x20 || $0 == 0x7f) || $0 == 9 || $0 == 10 || $0 == 13)
+        }
+    }
+
     private static func currentChannelBindingMatches(
         _ provider: @Sendable () throws -> Data,
         expectedHex: String
@@ -3047,8 +3249,26 @@ private struct RedeemObservationGrantRequest: Encodable {
 }
 
 private struct ObservationSignalRequest: Encodable {
-    let kind: ObservationSignalKind
+    let kind: String
     let payload: String
+}
+
+private struct ObservationEndpointChallengeWire: Encodable {
+    let computerID: String
+    let endpointSessionID: String
+    let endpointNonce: String
+    let expiresAtUnix: Int64
+    let endpointCertificatePEM: String
+    let endpointCertificateSignature: String
+
+    enum CodingKeys: String, CodingKey {
+        case computerID = "computer_id"
+        case endpointSessionID = "endpoint_session_id"
+        case endpointNonce = "endpoint_nonce"
+        case expiresAtUnix = "expires_at_unix"
+        case endpointCertificatePEM = "endpoint_certificate_pem"
+        case endpointCertificateSignature = "endpoint_certificate_signature"
+    }
 }
 
 private struct ObservationAdmissionAccepted: Decodable {
@@ -3272,6 +3492,10 @@ private struct PendingObservationAdmission {
     let grant: VerifiedObservationAdmissionGrant
     let challenge: ObservationAdmissionChallenge
     let context: FileRequestSession
+}
+
+private struct ObservationChallengePublishAttempt {
+    let deploymentID: String
 }
 
 private struct ActiveObservationAdmission {

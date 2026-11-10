@@ -52,7 +52,7 @@ private actor EndpointEnrollmentTransportFixture: HTTPTransport {
     }
 }
 
-private struct StoredEndpointFixture: Decodable {
+private struct StoredEndpointFixture: Codable {
     let version: Int
     let deploymentID: String
     let privateKey: Data
@@ -73,7 +73,9 @@ private actor EndpointFileDeliveryTransportFixture: HTTPTransport {
     let screenObservationEnabled: Bool
     private var authorityGeneration: Int64 = 1
     private var pendingObservationGrantResponses: [Data] = []
+    private var signalsResponseStatusOverride: Int?
     private(set) var requests: [(String, String?, String?)] = []
+    private(set) var requestBodies: [(String, Data?)] = []
     private(set) var requestTimeoutIntervals: [String: TimeInterval] = [:]
     private(set) var requestMaxBytes: [String: Int] = [:]
 
@@ -99,9 +101,14 @@ private actor EndpointFileDeliveryTransportFixture: HTTPTransport {
         pendingObservationGrantResponses = [body]
     }
 
+    func setSignalsResponseStatus(_ status: Int?) {
+        signalsResponseStatusOverride = status
+    }
+
     func bytes(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
         let path = request.url!.path
         requests.append((path, request.httpMethod, request.value(forHTTPHeaderField: "Authorization")))
+        requestBodies.append((path, request.httpBody))
         requestTimeoutIntervals[path] = request.timeoutInterval
         requestMaxBytes[path] = maxBytes
         let digest = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
@@ -170,6 +177,16 @@ private actor EndpointFileDeliveryTransportFixture: HTTPTransport {
                 "endpoint_session_id": claims["endpoint_session_id"]!,
                 "expires_at_unix": claims["expires_at_unix"]!,
             ])
+        case _ where path.hasPrefix("/v2/endpoints/admissions/observation/")
+            && path.hasSuffix("/signals"):
+            headers = nil
+            if request.httpMethod == "POST" {
+                status = signalsResponseStatusOverride ?? 204
+                body = Data()
+            } else {
+                status = signalsResponseStatusOverride ?? 200
+                body = Data(#"{"cursor":0,"messages":[]}"#.utf8)
+            }
         case "/v2/endpoints/jobs":
             status = 200
             headers = nil
@@ -1009,6 +1026,440 @@ struct EndpointEnrollmentClientTests {
             detail: "The saved endpoint identity changed while this request was in progress."
         )) {
             _ = try await poll.value
+        }
+    }
+
+    @Test func publishesSignedEndpointChallengeWithFixedSixFieldWire() async throws {
+        let deploymentID = "dep_" + String(repeating: "c", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let managerKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let prepared = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentID,
+            serverKey: serverKey,
+            managerKey: managerKey,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex
+        )
+        let signalsPath =
+            "/v2/endpoints/admissions/observation/\(prepared.challenge.grantID)/signals"
+
+        let payload = try await client.publishObservationChallenge(
+            challengeID: prepared.challenge.id,
+            endpointCertificatePEM: Self.endpointCertificatePEM
+        )
+
+        let rawObject = try JSONSerialization.jsonObject(with: Data(payload.utf8))
+        let object = try #require(rawObject as? [String: Any])
+        #expect(object.count == 6)
+        #expect(Set(object.keys) == Set([
+            "computer_id",
+            "endpoint_session_id",
+            "endpoint_nonce",
+            "expires_at_unix",
+            "endpoint_certificate_pem",
+            "endpoint_certificate_signature",
+        ]))
+        #expect(object["computer_id"] as? String == prepared.challenge.computerID)
+        #expect(object["endpoint_session_id"] as? String == prepared.challenge.endpointSessionID)
+        #expect(object["endpoint_nonce"] as? String == prepared.challenge.endpointNonceHex)
+        #expect((object["expires_at_unix"] as? NSNumber)?.int64Value == prepared.challenge.expiresAtUnix)
+        #expect(object["endpoint_certificate_pem"] as? String == Self.endpointCertificatePEM)
+        let signatureHex = try #require(object["endpoint_certificate_signature"] as? String)
+        #expect(signatureHex.count == 128)
+        #expect(signatureHex.utf8.allSatisfy {
+            ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66)
+        })
+
+        let certificateDigest = SHA256.hash(data: Data(Self.endpointCertificatePEM.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let message = Data(
+            "hs-observation-peer-certificate-v1|deployment:\(deploymentID)|grant:\(prepared.challenge.grantID)|computer:\(prepared.challenge.computerID)|endpoint_session:\(prepared.challenge.endpointSessionID)|epoch:1|nonce:\(prepared.challenge.endpointNonceHex)|role:endpoint|certificate_sha256:\(certificateDigest)".utf8
+        )
+        let endpointKey = try Curve25519.Signing.PublicKey(
+            rawRepresentation: Self.decodeHex(endpointPublicKeyHex)
+        )
+        #expect(endpointKey.isValidSignature(Self.decodeHex(signatureHex), for: message))
+
+        let verified = try ObservationEndpointChallengeVerifier.verify(
+            payload: payload,
+            grant: prepared.grant,
+            nowUnixSeconds: Int64(Date().timeIntervalSince1970)
+        )
+        #expect(verified.computerID == prepared.challenge.computerID)
+        #expect(verified.endpointSessionID == prepared.challenge.endpointSessionID)
+        #expect(verified.endpointNonceHex == prepared.challenge.endpointNonceHex)
+        #expect(verified.expiresAtUnix == prepared.challenge.expiresAtUnix)
+        #expect(verified.endpointCertificatePEM == Data(Self.endpointCertificatePEM.utf8))
+
+        let bodies = await transport.requestBodies
+        let body = try #require(bodies.last(where: { $0.0 == signalsPath })?.1)
+        let rawOuter = try JSONSerialization.jsonObject(with: body)
+        let outer = try #require(rawOuter as? [String: String])
+        #expect(outer.count == 2)
+        #expect(outer["kind"] == "challenge")
+        #expect(outer["payload"] == payload)
+    }
+
+    @Test func rejectsNonCanonicalEndpointCertificatePEMBeforePublishing() async throws {
+        let transport = EndpointFileDeliveryTransportFixture(origin: URL(string: server)!)
+        let store = EndpointKeyFixtureStore()
+        let client = EndpointEnrollmentClient(keyStore: store, transport: transport)
+        let invalidCertificates = [
+            "-----BEGIN CERTIFICATE-----\r\nAQIDBA==\r\n-----END CERTIFICATE-----\r\n",
+            "-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----",
+            "-----BEGIN CERTIFICATE-----\nAQ ID BA==\n-----END CERTIFICATE-----\n",
+            "-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\nextra",
+            "-----BEGIN CERTIFICATE-----\nAQIDB\u{00E9}==\n-----END CERTIFICATE-----\n",
+        ]
+        for certificate in invalidCertificates {
+            await #expect(throws: HelicoidError.invalidInput(
+                field: "endpoint certificate",
+                detail: "The endpoint certificate must be canonical ASCII PEM with exact BEGIN and END lines."
+            )) {
+                _ = try await client.publishObservationChallenge(
+                    challengeID: UUID(),
+                    endpointCertificatePEM: certificate
+                )
+            }
+        }
+        #expect(await transport.requests.isEmpty)
+    }
+
+    @Test func endpointChallengePublishRejectsIdentityResetDuringRequest() async throws {
+        let deploymentID = "dep_" + String(repeating: "b", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let managerKey = Curve25519.Signing.PrivateKey()
+        let innerTransport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let gate = BlockingPathTransport(inner: innerTransport, path: "")
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: gate
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let prepared = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentID,
+            serverKey: serverKey,
+            managerKey: managerKey,
+            computerID: innerTransport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex
+        )
+        await gate.setPath(
+            "/v2/endpoints/admissions/observation/\(prepared.challenge.grantID)/signals"
+        )
+        let publish = Task {
+            try await client.publishObservationChallenge(
+                challengeID: prepared.challenge.id,
+                endpointCertificatePEM: Self.endpointCertificatePEM
+            )
+        }
+        await gate.waitForRequest()
+        try await client.forgetIdentity(deploymentID: deploymentID)
+        await gate.releaseRequest()
+
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The saved endpoint identity changed while this request was in progress."
+        )) {
+            _ = try await publish.value
+        }
+    }
+
+    @Test func endpointChallengePublishCancellationDoesNotReportSuccess() async throws {
+        let deploymentID = "dep_" + String(repeating: "1", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let managerKey = Curve25519.Signing.PrivateKey()
+        let innerTransport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let gate = BlockingPathTransport(inner: innerTransport, path: "")
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: gate
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let prepared = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentID,
+            serverKey: serverKey,
+            managerKey: managerKey,
+            computerID: innerTransport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex
+        )
+        await gate.setPath(
+            "/v2/endpoints/admissions/observation/\(prepared.challenge.grantID)/signals"
+        )
+        let publish = Task {
+            try await client.publishObservationChallenge(
+                challengeID: prepared.challenge.id,
+                endpointCertificatePEM: Self.endpointCertificatePEM
+            )
+        }
+        await gate.waitForRequest()
+        publish.cancel()
+        await gate.releaseRequest()
+
+        do {
+            _ = try await publish.value
+            Issue.record("A cancelled endpoint challenge attestation reported success")
+        } catch {
+            #expect(error is CancellationError)
+        }
+    }
+
+    @Test func genericSignalPublisherCannotConstructUnsignedChallenge() async {
+        #expect(ObservationSignalKind(rawValue: "challenge") == nil)
+        #expect(ObservationSignalKind(rawValue: "ice") == ObservationSignalKind.ice)
+    }
+
+    @Test func endpointChallengePublishIsSingleShotAcrossCertificates() async throws {
+        let deploymentID = "dep_" + String(repeating: "d", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let managerKey = Curve25519.Signing.PrivateKey()
+        let innerTransport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let gate = BlockingPathTransport(inner: innerTransport, path: "")
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: gate
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let prepared = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentID,
+            serverKey: serverKey,
+            managerKey: managerKey,
+            computerID: innerTransport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex
+        )
+        let signalsPath =
+            "/v2/endpoints/admissions/observation/\(prepared.challenge.grantID)/signals"
+        await gate.setPath(signalsPath)
+
+        let first = Task {
+            try await client.publishObservationChallenge(
+                challengeID: prepared.challenge.id,
+                endpointCertificatePEM: Self.endpointCertificatePEM
+            )
+        }
+        await gate.waitForRequest()
+        await #expect(throws: HelicoidError.setupBlocked(
+            reason: "The observation challenge publish has already been attempted."
+        )) {
+            _ = try await client.publishObservationChallenge(
+                challengeID: prepared.challenge.id,
+                endpointCertificatePEM: Self.otherEndpointCertificatePEM
+            )
+        }
+        await gate.releaseRequest()
+        let payload = try await first.value
+        let rawObject = try JSONSerialization.jsonObject(with: Data(payload.utf8))
+        let object = try #require(rawObject as? [String: Any])
+        #expect(object["endpoint_certificate_pem"] as? String == Self.endpointCertificatePEM)
+
+        await #expect(throws: HelicoidError.setupBlocked(
+            reason: "The observation challenge publish has already been attempted."
+        )) {
+            _ = try await client.publishObservationChallenge(
+                challengeID: prepared.challenge.id,
+                endpointCertificatePEM: Self.endpointCertificatePEM
+            )
+        }
+        let bodies = await innerTransport.requestBodies
+        #expect(bodies.filter { $0.0 == signalsPath }.count == 1)
+    }
+
+    @Test func endpointChallengePublishRejectsExpiredChallenge() async throws {
+        let deploymentID = "dep_" + String(repeating: "e", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let managerKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let prepared = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentID,
+            serverKey: serverKey,
+            managerKey: managerKey,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex,
+            lifetimeSeconds: 2
+        )
+        try await Task.sleep(nanoseconds: 3_000_000_000)
+
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The endpoint observation grant is invalid or expired."
+        )) {
+            _ = try await client.publishObservationChallenge(
+                challengeID: prepared.challenge.id,
+                endpointCertificatePEM: Self.endpointCertificatePEM
+            )
+        }
+        let bodies = await transport.requestBodies
+        #expect(bodies.filter { $0.0.contains("/signals") }.isEmpty)
+    }
+
+    @Test func endpointChallengePublishRejectsMismatchedSigningIdentity() async throws {
+        let deploymentID = "dep_" + String(repeating: "f", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let managerKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let prepared = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentID,
+            serverKey: serverKey,
+            managerKey: managerKey,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex
+        )
+        let replacement = Curve25519.Signing.PrivateKey()
+        let originalKey = try await replaceStoredEndpointPrivateKey(
+            store: store,
+            deploymentID: deploymentID,
+            privateKey: replacement.rawRepresentation
+        )
+
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The saved endpoint identity does not match the verified observation grant."
+        )) {
+            _ = try await client.publishObservationChallenge(
+                challengeID: prepared.challenge.id,
+                endpointCertificatePEM: Self.endpointCertificatePEM
+            )
+        }
+
+        try await replaceStoredEndpointPrivateKey(
+            store: store,
+            deploymentID: deploymentID,
+            privateKey: originalKey
+        )
+        await #expect(throws: HelicoidError.setupBlocked(
+            reason: "The observation challenge publish has already been attempted."
+        )) {
+            _ = try await client.publishObservationChallenge(
+                challengeID: prepared.challenge.id,
+                endpointCertificatePEM: Self.endpointCertificatePEM
+            )
+        }
+    }
+
+    @Test func endpointChallengePublishMapsServerConflict() async throws {
+        let deploymentID = "dep_" + String(repeating: "0", count: 32)
+        let serverKey = Curve25519.Signing.PrivateKey()
+        let managerKey = Curve25519.Signing.PrivateKey()
+        let transport = EndpointFileDeliveryTransportFixture(
+            origin: URL(string: server)!,
+            screenObservationEnabled: true,
+            deploymentID: deploymentID,
+            grantVerificationKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation)
+        )
+        let store = EndpointKeyFixtureStore()
+        let client = try await makeObservationClient(
+            deploymentID: deploymentID,
+            store: store,
+            transport: transport
+        )
+        let endpointPublicKeyHex = try await enrolledEndpointPublicKeyHex(
+            store: store,
+            deploymentID: deploymentID
+        )
+        let prepared = try await preparedObservationChallenge(
+            client: client,
+            deploymentID: deploymentID,
+            serverKey: serverKey,
+            managerKey: managerKey,
+            computerID: transport.computerID,
+            endpointPublicKeyHex: endpointPublicKeyHex
+        )
+        await transport.setSignalsResponseStatus(409)
+
+        await #expect(throws: HelicoidError.setupBlocked(
+            reason: "The observation challenge was already published."
+        )) {
+            _ = try await client.publishObservationChallenge(
+                challengeID: prepared.challenge.id,
+                endpointCertificatePEM: Self.endpointCertificatePEM
+            )
+        }
+        await #expect(throws: HelicoidError.setupBlocked(
+            reason: "The observation challenge publish has already been attempted."
+        )) {
+            _ = try await client.publishObservationChallenge(
+                challengeID: prepared.challenge.id,
+                endpointCertificatePEM: Self.endpointCertificatePEM
+            )
         }
     }
 
@@ -2042,6 +2493,10 @@ struct EndpointEnrollmentClientTests {
     }
 
     private static let endpointSessionID = "b4a3f66d-4ac1-4ac6-8847-e50d0c6f55a1"
+    private static let endpointCertificatePEM =
+        "-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n"
+    private static let otherEndpointCertificatePEM =
+        "-----BEGIN CERTIFICATE-----\nBQYHCA==\n-----END CERTIFICATE-----\n"
 
     private struct ObservationGrantMaterial {
         let token: String
@@ -2083,19 +2538,47 @@ struct EndpointEnrollmentClientTests {
         return Self.lowerHex(endpointKey.publicKey.rawRepresentation)
     }
 
+    @discardableResult
+    private func replaceStoredEndpointPrivateKey(
+        store: EndpointKeyFixtureStore,
+        deploymentID: String,
+        privateKey: Data
+    ) async throws -> Data {
+        let account = SHA256.hash(data: Data(deploymentID.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let storedData = try #require(await store.read(account: account))
+        let stored = try JSONDecoder().decode(StoredEndpointFixture.self, from: storedData)
+        let replacement = StoredEndpointFixture(
+            version: stored.version,
+            deploymentID: stored.deploymentID,
+            privateKey: privateKey,
+            result: stored.result,
+            serverAddress: stored.serverAddress,
+            grantVerificationPublicKeyHex: stored.grantVerificationPublicKeyHex,
+            authorityGeneration: stored.authorityGeneration
+        )
+        let encoded = try JSONEncoder().encode(replacement)
+        try await store.update(encoded, account: account)
+        return stored.privateKey
+    }
+
     private func preparedObservationChallenge(
         client: EndpointEnrollmentClient,
         deploymentID: String,
         serverKey: Curve25519.Signing.PrivateKey,
         managerKey: Curve25519.Signing.PrivateKey,
         computerID: String,
-        endpointPublicKeyHex: String
+        endpointPublicKeyHex: String,
+        lifetimeSeconds: Int64 = 10
     ) async throws -> (
         challenge: ObservationAdmissionChallenge,
         binding: Data,
-        proof: String
+        proof: String,
+        grant: VerifiedObservationAdmissionGrant
     ) {
         let now = Int64(Date().timeIntervalSince1970)
+        let expiresAt = now + lifetimeSeconds
         let grant = try Self.observationGrant(
             serverKey: serverKey,
             managerKey: managerKey,
@@ -2105,7 +2588,19 @@ struct EndpointEnrollmentClientTests {
             endpointSessionID: Self.endpointSessionID,
             grantID: UUID().uuidString.lowercased(),
             issuedAtUnix: now,
-            expiresAtUnix: now + 10
+            expiresAtUnix: expiresAt
+        )
+        let verifiedGrant = try ObservationAdmissionGrantVerifier.verify(
+            token: grant.token,
+            serverPublicKeyHex: Self.lowerHex(serverKey.publicKey.rawRepresentation),
+            expected: ObservationAdmissionEndpoint(
+                deploymentID: deploymentID,
+                computerID: computerID,
+                endpointPublicKeyHex: endpointPublicKeyHex,
+                endpointSessionID: Self.endpointSessionID,
+                enrollmentEpoch: 1
+            ),
+            nowUnixSeconds: now
         )
         let challenge = try await client.prepareObservationAdmission(
             grantToken: grant.token,
@@ -2118,7 +2613,7 @@ struct EndpointEnrollmentClientTests {
             managerKey: managerKey,
             channelBinding: binding
         )
-        return (challenge, binding, proof)
+        return (challenge, binding, proof, verifiedGrant)
     }
 
     private static func managerProof(
