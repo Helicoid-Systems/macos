@@ -239,7 +239,7 @@ struct ManagerObservationEndpointChallengeTests {
                 endpointSessionID: "00000000-0000-4000-8000-000000000002"
             ), Self.now),
             (try challengeJSON(signatureHex: signatureHex, nonce: "not-lower-hex"), Self.now),
-            (try challengeJSON(signatureHex: signatureHex, nonce: Self.nonce.uppercased()), Self.now),
+            (try challengeJSON(signatureHex: signatureHex, nonce: "A" + String(Self.nonce.dropFirst())), Self.now),
             (try challengeJSON(signatureHex: signatureHex, expiresAtUnix: Self.now + 8), Self.now),
             (try challengeJSON(signatureHex: signatureHex, expiresAtUnix: Self.now + 10), Self.now),
             (try challengeJSON(signatureHex: signatureHex), Self.now + 9),
