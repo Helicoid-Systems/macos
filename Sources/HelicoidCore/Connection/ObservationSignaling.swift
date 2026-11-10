@@ -97,7 +97,7 @@ public struct ManagerObservationSignalingSession: Sendable {
               !isBooleanNumber(cursorNumber),
               let rawMessages = object["messages"] as? [Any],
               rawMessages.count <= maximumBatchMessages
-        else { throw invalidSignal() }
+        else { throw Self.invalidSignal() }
 
         for rawMessage in rawMessages {
             guard let message = rawMessage as? [String: Any],
@@ -107,18 +107,18 @@ public struct ManagerObservationSignalingSession: Sendable {
                   message["sender"] is String,
                   message["kind"] is String,
                   message["payload"] is String
-            else { throw invalidSignal() }
+            else { throw Self.invalidSignal() }
         }
 
         let batch: ObservationSignalBatch
         do {
             batch = try JSONDecoder().decode(ObservationSignalBatch.self, from: data)
         } catch {
-            throw invalidSignal()
+            throw Self.invalidSignal()
         }
         guard batch.cursor <= maximumSignalSequence,
               batch.messages.count <= maximumBatchMessages
-        else { throw invalidSignal() }
+        else { throw Self.invalidSignal() }
         return batch
     }
 
@@ -147,7 +147,7 @@ public struct ManagerObservationSignalingSession: Sendable {
         _ batch: ObservationSignalBatch,
         nowUnixSeconds: Int64 = Int64(Date().timeIntervalSince1970)
     ) throws -> VerifiedObservationEndpointChallenge? {
-        guard phase == .awaitingChallenge else { throw invalidSignal() }
+        guard phase == .awaitingChallenge else { throw Self.invalidSignal() }
         let messages = try validatedMessages(in: batch)
 
         guard !messages.isEmpty else {
@@ -161,14 +161,14 @@ public struct ManagerObservationSignalingSession: Sendable {
         var closeSeen = false
 
         for (index, message) in messages.enumerated() {
-            guard message.sender == "endpoint" else { throw invalidChallengeSignal() }
+            guard message.sender == "endpoint" else { throw Self.invalidChallengeSignal() }
 
             switch message.kind {
             case "challenge":
                 guard !challengeSeen,
                       !message.payload.isEmpty,
                       message.payload.utf8.count <= Self.maximumChallengeBytes
-                else { throw invalidChallengeSignal() }
+                else { throw Self.invalidChallengeSignal() }
 
                 // The challenge payload is unsigned JSON. The verifier requires
                 // every identity claim to match the signed grant and verifies
@@ -182,7 +182,7 @@ public struct ManagerObservationSignalingSession: Sendable {
                         nowUnixSeconds: nowUnixSeconds
                     )
                 } catch {
-                    throw invalidChallengeSignal()
+                    throw Self.invalidChallengeSignal()
                 }
                 challengeSeen = true
                 nextPhase = .awaitingAnswer
@@ -191,13 +191,13 @@ public struct ManagerObservationSignalingSession: Sendable {
                 guard !closeSeen,
                       index == messages.count - 1,
                       message.payload.isEmpty
-                else { throw invalidChallengeSignal() }
+                else { throw Self.invalidChallengeSignal() }
                 closeSeen = true
                 nextPhase = .closed
 
             default:
                 // No offer, answer, or ICE may precede admission.
-                throw invalidChallengeSignal()
+                throw Self.invalidChallengeSignal()
             }
         }
 
@@ -231,7 +231,7 @@ public struct ManagerObservationSignalingSession: Sendable {
     ) throws -> [VerifiedManagerObservationSignal] {
         guard phase == .awaitingAnswer || phase == .negotiating,
               grant.expiresAtUnix > nowUnixSeconds
-        else { throw invalidSignal() }
+        else { throw Self.invalidSignal() }
 
         let messages = try validatedMessages(in: batch)
         var nextPhase = phase
@@ -239,16 +239,16 @@ public struct ManagerObservationSignalingSession: Sendable {
         var verified: [VerifiedManagerObservationSignal] = []
 
         for message in messages {
-            guard message.sender == "endpoint" else { throw invalidSignal() }
+            guard message.sender == "endpoint" else { throw Self.invalidSignal() }
 
             switch message.kind {
             case "answer":
                 guard nextPhase == .awaitingAnswer, !nextHasRemoteAnswer else {
-                    throw invalidSignal()
+                    throw Self.invalidSignal()
                 }
                 guard message.payload.hasPrefix("v=0"),
                       message.payload.utf8.count <= Self.maximumAnswerBytes
-                else { throw invalidSignal() }
+                else { throw Self.invalidSignal() }
                 nextHasRemoteAnswer = true
                 nextPhase = .negotiating
                 verified.append(VerifiedManagerObservationSignal(
@@ -261,7 +261,7 @@ public struct ManagerObservationSignalingSession: Sendable {
                 guard nextPhase == .awaitingAnswer || nextPhase == .negotiating,
                       !message.payload.isEmpty,
                       message.payload.utf8.count <= Self.maximumICEBytes
-                else { throw invalidSignal() }
+                else { throw Self.invalidSignal() }
                 verified.append(VerifiedManagerObservationSignal(
                     sequence: message.sequence,
                     kind: .ice,
@@ -270,7 +270,7 @@ public struct ManagerObservationSignalingSession: Sendable {
 
             case "close":
                 guard nextPhase != .closed, message.payload.isEmpty else {
-                    throw invalidSignal()
+                    throw Self.invalidSignal()
                 }
                 nextPhase = .closed
                 verified.append(VerifiedManagerObservationSignal(
@@ -282,7 +282,7 @@ public struct ManagerObservationSignalingSession: Sendable {
             default:
                 // In particular, never accept a relayed `offer` or a repeated
                 // `challenge` as post-admission negotiation.
-                throw invalidSignal()
+                throw Self.invalidSignal()
             }
         }
 
@@ -314,7 +314,7 @@ public struct ManagerObservationSignalingSession: Sendable {
         guard batch.cursor >= cursor,
               batch.cursor <= Self.maximumSignalSequence,
               batch.messages.count <= Self.maximumBatchMessages
-        else { throw invalidSignal() }
+        else { throw Self.invalidSignal() }
 
         var lastSequence = cursor
         var result: [ValidatedMessage] = []
@@ -326,7 +326,7 @@ public struct ManagerObservationSignalingSession: Sendable {
                   message.sequence <= Self.maximumSignalSequence,
                   isServerSignalPayload(message.payload),
                   message.payload.utf8.count <= Self.maximumAnswerBytes
-            else { throw invalidSignal() }
+            else { throw Self.invalidSignal() }
             lastSequence = message.sequence
             result.append(ValidatedMessage(
                 sequence: message.sequence,
