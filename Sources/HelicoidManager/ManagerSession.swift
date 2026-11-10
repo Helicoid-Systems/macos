@@ -14,6 +14,16 @@ public final class ManagerSession: AuthSignInObserving {
         case guidedSetup
     }
 
+    private enum SessionMode: Sendable {
+        case fixtures
+        case development
+        case production
+    }
+
+    /// Immutable for the lifetime of the session. Trust gates must not be
+    /// derived from mutable UI/state flags.
+    private let sessionMode: SessionMode
+
     public var screen: Screen
     public var phase: ConnectionPhase
     public var serverAddress: String
@@ -27,8 +37,9 @@ public final class ManagerSession: AuthSignInObserving {
     public var signOutError: HelicoidError?
     public var overview: OverviewModel
     public var openRemoteWindows: [ComputerID]
-    public var isFixturesMode: Bool
-    public var isDevelopmentServerMode: Bool
+    /// Immutable launch mode. These flags are derived, never mutable gate input.
+    public var isFixturesMode: Bool { sessionMode == .fixtures }
+    public var isDevelopmentServerMode: Bool { sessionMode == .development }
     public var managerPublicIdentity: String?
     public var showDevelopmentBanner: Bool
     /// Session-owned inventory presentation (layout, size, panel). Survives view identity resets.
@@ -43,6 +54,9 @@ public final class ManagerSession: AuthSignInObserving {
     public private(set) var inventoryReloadError: HelicoidError?
     /// Fences overlapping refreshes so an older response cannot replace a newer one.
     private var inventoryReloadGeneration: UInt64 = 0
+    /// Fences asynchronous authority checks so a stale result cannot overwrite
+    /// a newer connect/sign-in/sign-out state.
+    private var authorityCheckGeneration: UInt64 = 0
     /// Cancellable required-code state for v2 device-key sign-in.
     public var authCodeState: AuthCodeState {
         authCoordinator?.authCodeState ?? .idle
@@ -52,24 +66,50 @@ public final class ManagerSession: AuthSignInObserving {
     /// Facade error field; synced from the coordinator after each step.
     public var authCodeError: HelicoidError?
 
+    /// True when this session is on the real production path.
+    private var requiresProductionTrust: Bool {
+        sessionMode == .production && productionAuthClient != nil
+    }
+
     /// True when a connection path is actually available.
+    ///
+    /// Production requires both a pinned client and a persisted authority
+    /// checkpoint store. Source fixtures and the explicit loopback development
+    /// mode remain independent and do not require production trust. A generic
+    /// `ConnectionClient` injection cannot satisfy the production gate.
     public var allowsConnect: Bool {
-        isFixturesMode || isDevelopmentServerMode || productionAuthClient != nil
+        switch sessionMode {
+        case .fixtures, .development:
+            return true
+        case .production:
+            return productionAuthClient != nil && authorityTrust != nil
+        }
     }
 
     private let client: any ConnectionClient
     private let developmentClient: LoopbackDevelopmentClient?
     private let productionAuthClient: NativeV2AuthClient?
+    /// Persisted, independently confirmed deployment authority checkpoint.
+    /// When supplied, production connect and sign-in require an exact match.
+    private let authorityTrust: ManagerAuthorityTrustStore?
     /// Actual v2 sign-in state owner (causal generation fencing lives here).
     private var authCoordinator: AuthSignInCoordinator?
 
     public init(
         configuration: ManagerLaunchConfiguration = ManagerLaunchConfiguration(),
         client: (any ConnectionClient)? = nil,
-        productionAuthClient: NativeV2AuthClient? = nil
+        productionAuthClient: NativeV2AuthClient? = nil,
+        authorityTrust: ManagerAuthorityTrustStore? = nil
     ) {
-        self.isFixturesMode = configuration.useSourceFixtures
-        self.isDevelopmentServerMode = configuration.useDevelopmentServer
+        let mode: SessionMode
+        if configuration.useSourceFixtures {
+            mode = .fixtures
+        } else if configuration.useDevelopmentServer {
+            mode = .development
+        } else {
+            mode = .production
+        }
+        self.sessionMode = mode
         self.managerPublicIdentity = configuration.managerPublicIdentity
         self.screen = configuration.useSourceFixtures ? .computers : .connect
         self.phase = configuration.useSourceFixtures ? .signedIn : .notConfigured
@@ -88,10 +128,11 @@ public final class ManagerSession: AuthSignInObserving {
         self.presentationPreferenceScope = nil
         self.showDevelopmentBanner = configuration.useSourceFixtures
         self.authCode = ""
-        self.productionAuthClient = configuration.useDevelopmentServer ? nil : productionAuthClient
-        self.authCoordinator = (configuration.useDevelopmentServer || configuration.useSourceFixtures)
-            ? nil
-            : productionAuthClient.map { AuthSignInCoordinator(client: $0) }
+        self.productionAuthClient = mode == .production ? productionAuthClient : nil
+        self.authorityTrust = mode == .production ? authorityTrust : nil
+        self.authCoordinator = (mode == .production ? productionAuthClient : nil).map {
+            AuthSignInCoordinator(client: $0)
+        }
 
         if configuration.useSourceFixtures {
             self.overview = DevelopmentFixtures.overviewModel()
@@ -131,8 +172,11 @@ public final class ManagerSession: AuthSignInObserving {
         if isDevelopmentServerMode {
             return "Local development loopback server. No production server identity is verified."
         }
+        if productionAuthClient != nil, authorityTrust != nil {
+            return "Pinned HTTPS with independently supplied deployment trust and an authority checkpoint store. No fallback to development login."
+        }
         if productionAuthClient != nil {
-            return "Pinned HTTPS with independently supplied deployment trust. No fallback to development login."
+            return "Production connection is closed until a saved deployment authority checkpoint is available."
         }
         return "Production connection is closed until a trusted server identity is available."
     }
@@ -152,19 +196,30 @@ public final class ManagerSession: AuthSignInObserving {
         signOutError = nil
         clearSessionMaterial()
         bumpSessionGeneration()
+        let authorityCheck = beginAuthorityCheck()
 
         guard allowsConnect else {
-            connectError = .serverContractUnavailable
-            phase = .failed(.serverContractUnavailable)
+            let failure: ConnectionFailure = sessionMode == .production
+                ? .identityUnverified
+                : .serverContractUnavailable
+            connectError = failure
+            phase = .failed(failure)
             return
         }
 
 
-        if let auth = productionAuthClient, !isDevelopmentServerMode, !isFixturesMode {
+        if let auth = productionAuthClient, sessionMode == .production {
             // Trust configuration is already supplied. Discovery does not
             // establish trust and is never used to mint a deployment identity.
             phase = .connecting
+            if let error = await verifyAuthorityBeforeProductionUse() {
+                guard !Task.isCancelled, isCurrentAuthorityCheck(authorityCheck) else { return }
+                applyConnectFailure(error)
+                return
+            }
+            guard !Task.isCancelled, isCurrentAuthorityCheck(authorityCheck) else { return }
             let result = await auth.connect(address: serverAddress.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard !Task.isCancelled, isCurrentAuthorityCheck(authorityCheck) else { return }
             switch result {
             case .success(let identity):
                 pendingIdentity = nil
@@ -231,22 +286,82 @@ public final class ManagerSession: AuthSignInObserving {
     }
 
     private func applyConnectFailure(_ error: HelicoidError) {
+        let failure = Self.connectionFailure(for: error)
+        connectError = failure
+        phase = .failed(failure)
+    }
+
+    /// Honest mapping from authority/production failures to connection UI.
+    private static func connectionFailure(for error: HelicoidError) -> ConnectionFailure {
         switch error {
         case .serverContractUnavailable:
-            connectError = .serverContractUnavailable
+            return .serverContractUnavailable
         case .invalidInput(_, let detail):
-            connectError = .invalidAddress(detail: detail)
+            return .invalidAddress(detail: detail)
+        case .identityMismatch:
+            return .identityChanged
+        case .authenticationFailed(let detail):
+            return .authenticationFailed(detail: detail)
+        case .permissionDenied(let detail):
+            return .authenticationFailed(detail: detail)
         case .cancelled:
-            connectError = .cancelled
+            return .cancelled
         case .engineUnavailable:
-            connectError = .engineUnavailable
-        default:
-            connectError = .unreachable
+            return .engineUnavailable
+        case .notConfigured, .sessionExpired(_), .computerOutOfScope,
+             .observationProtocolViolation(_), .setupBlocked(_), .hostIdentityUnverified,
+             .installNotAvailable, .unreachable, .offline:
+            return .unreachable
         }
-        phase = .failed(connectError ?? .unreachable)
+    }
+
+    /// Re-read the published deployment authority and require the exact saved
+    /// checkpoint before production connect or sign-in. The caller must supply a
+    /// store on the production path; without one, `allowsConnect` is false and
+    /// this method is not reached.
+    private func verifyAuthorityBeforeProductionUse() async -> HelicoidError? {
+        guard sessionMode == .production else {
+            return nil
+        }
+        guard productionAuthClient != nil else {
+            return nil
+        }
+        guard let auth = productionAuthClient, let authorityTrust else {
+            // A production client without a checkpoint store must not be
+            // treated as verified. Callers surface this as identityUnverified.
+            return .authenticationFailed(
+                detail: "No independently verified deployment authority checkpoint is saved. Complete out-of-band trust setup before connecting."
+            )
+        }
+        do {
+            // Fail before touching the authority endpoint when this deployment
+            // has no locally adopted checkpoint. Fetching alone would not adopt
+            // anything, but there is no reason to contact the server first.
+            let deploymentID = await auth.deploymentID
+            let saved = try await authorityTrust.savedCheckpoint(deploymentID: deploymentID)
+            guard saved != nil else {
+                return .authenticationFailed(
+                    detail: "No independently verified deployment authority checkpoint is saved. Complete out-of-band trust setup before connecting."
+                )
+            }
+            let observed = try await auth.fetchDeploymentAuthority()
+            _ = try await authorityTrust.requireCurrent(observed)
+            return nil
+        } catch let error as HelicoidError {
+            return error
+        } catch {
+            return .identityMismatch
+        }
     }
 
     public func trustPendingIdentity() async {
+        guard allowsConnect else {
+            connectError = sessionMode == .production
+                ? .identityUnverified
+                : .serverContractUnavailable
+            phase = .failed(connectError ?? .serverContractUnavailable)
+            return
+        }
         guard let identity = pendingIdentity else {
             connectError = .identityUnverified
             return
@@ -265,13 +380,48 @@ public final class ManagerSession: AuthSignInObserving {
     }
 
     public func signIn() async {
+        guard allowsConnect else {
+            password = ""
+            let failure: ConnectionFailure = sessionMode == .production
+                ? .identityUnverified
+                : .serverContractUnavailable
+            signInError = .authenticationFailed(
+                detail: sessionMode == .production
+                    ? "No independently verified deployment authority checkpoint is available. Complete out-of-band trust setup before signing in."
+                    : "Connect to a Helicoid server before signing in."
+            )
+            phase = .failed(failure)
+            screen = .signIn
+            return
+        }
         connectError = nil
         signInError = nil
         authCodeError = nil
         inventoryReloadError = nil
         overview.setInventory([])
+        let authorityCheck = beginAuthorityCheck()
 
-        if let coordinator = authCoordinator, !isDevelopmentServerMode, !isFixturesMode {
+        if requiresProductionTrust, authorityTrust == nil {
+            password = ""
+            signInError = .authenticationFailed(
+                detail: "No independently verified deployment authority checkpoint is saved. Complete out-of-band trust setup before signing in."
+            )
+            phase = .failed(.identityUnverified)
+            screen = .signIn
+            return
+        }
+
+        if let error = await verifyAuthorityBeforeProductionUse() {
+            guard !Task.isCancelled, isCurrentAuthorityCheck(authorityCheck) else { return }
+            password = ""
+            signInError = error
+            phase = .failed(Self.connectionFailure(for: error))
+            screen = .signIn
+            return
+        }
+        guard !Task.isCancelled, isCurrentAuthorityCheck(authorityCheck) else { return }
+
+        if let coordinator = authCoordinator, sessionMode == .production {
             let username = self.username
             let password = self.password
             self.password = ""
@@ -313,6 +463,28 @@ public final class ManagerSession: AuthSignInObserving {
             authCode = ""
             return
         }
+        let authorityCheck = beginAuthorityCheck()
+
+        // Required MFA completion is a later trust decision. Recheck the full
+        // authority checkpoint immediately before completing the challenge.
+        if sessionMode == .production {
+            if let error = await verifyAuthorityBeforeProductionUse() {
+                guard !Task.isCancelled, isCurrentAuthorityCheck(authorityCheck) else { return }
+                // Clear the pending challenge without letting its observer
+                // overwrite the fail-closed error below.
+                await coordinator.cancelAuthCode()
+                guard !Task.isCancelled, isCurrentAuthorityCheck(authorityCheck) else { return }
+                authCode = ""
+                password = ""
+                authCodeError = error
+                signInError = error
+                phase = .failed(Self.connectionFailure(for: error))
+                screen = .signIn
+                return
+            }
+            guard !Task.isCancelled, isCurrentAuthorityCheck(authorityCheck) else { return }
+        }
+
         // Push the UI buffer into the coordinator before submit.
         coordinator.setAuthCode(authCode)
         await coordinator.submitAuthCode()
@@ -326,6 +498,7 @@ public final class ManagerSession: AuthSignInObserving {
 
     /// Cancel required-code collection and clear challenge secrets.
     public func cancelAuthCode() async {
+        _ = beginAuthorityCheck()
         authCode = ""
         password = ""
         if let coordinator = authCoordinator {
@@ -419,7 +592,21 @@ public final class ManagerSession: AuthSignInObserving {
             }
         }
 
-        if let coordinator = authCoordinator, productionAuthClient != nil, !isDevelopmentServerMode {
+        if sessionMode == .production {
+            guard let coordinator = authCoordinator,
+                  productionAuthClient != nil,
+                  coordinator.session != nil else {
+                let error = HelicoidError.authenticationFailed(
+                    detail: "No verified production authority session is available. Sign in again after trust setup."
+                )
+                bumpSessionGeneration()
+                inventoryReloadError = error
+                signInError = error
+                overview.setInventory([])
+                phase = .failed(.identityUnverified)
+                screen = .signIn
+                return
+            }
             await coordinator.reloadInventory()
             let coordinatorError = coordinator.signInError
             guard reloadGeneration == inventoryReloadGeneration,
@@ -443,6 +630,7 @@ public final class ManagerSession: AuthSignInObserving {
             return
         }
 
+        // Nonproduction development path. Fixtures returned above.
         let result = await client.authorizedInventory()
         // A late response after sign-out, replacement, or a newer refresh is stale.
         guard reloadGeneration == inventoryReloadGeneration,
@@ -476,6 +664,9 @@ public final class ManagerSession: AuthSignInObserving {
 
     /// Clears token, identity, and inventory even if remote logout fails.
     public func signOut() async {
+        // Invalidate any in-flight authority check before awaiting remote or
+        // coordinator work, so it cannot re-enter sign-in during teardown.
+        _ = beginAuthorityCheck()
         signOutError = nil
         authCode = ""
         password = ""
@@ -491,10 +682,7 @@ public final class ManagerSession: AuthSignInObserving {
         clearSessionMaterial()
         bumpSessionGeneration()
         presentationPreferenceScope = nil
-        if isFixturesMode {
-            isFixturesMode = false
-            showDevelopmentBanner = false
-        }
+        showDevelopmentBanner = false
         phase = .notConfigured
         screen = .connect
     }
@@ -517,6 +705,9 @@ public final class ManagerSession: AuthSignInObserving {
     @discardableResult
     public func openRemoteView(for id: ComputerID) -> ComputerViewWindowKey? {
         guard isFixturesMode || phase == .signedIn else { return nil }
+        if sessionMode == .production, authCoordinator?.session == nil {
+            return nil
+        }
         guard computer(with: id) != nil else { return nil }
         if !openRemoteWindows.contains(id) {
             openRemoteWindows.append(id)
@@ -648,11 +839,23 @@ public final class ManagerSession: AuthSignInObserving {
         return PresentationPreferenceScope(deploymentID: deploymentID, accountID: accountID)
     }
 
+    /// Start a new authority-check operation and return its fence token.
+    private func beginAuthorityCheck() -> UInt64 {
+        authorityCheckGeneration &+= 1
+        return authorityCheckGeneration
+    }
+
+    /// True only while no newer connect, sign-in, or session teardown occurred.
+    private func isCurrentAuthorityCheck(_ token: UInt64) -> Bool {
+        token == authorityCheckGeneration
+    }
+
     private func bumpSessionGeneration() {
         sessionGeneration &+= 1
-        // Session change invalidates every view-only demand and any in-flight
-        // inventory refresh from the previous session.
+        // Session change invalidates every view-only demand, in-flight
+        // inventory refresh, and authority-check result from the prior state.
         inventoryReloadGeneration &+= 1
+        authorityCheckGeneration &+= 1
         isReloadingInventory = false
         inventoryReloadError = nil
         openRemoteWindows = []

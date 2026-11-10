@@ -225,6 +225,43 @@ persisted deployment trust. Production v2 sign-in is available only when a
 production Connect stays explicitly unavailable. Actual-server integration
 against the built Rust server remains a coordinator gate.
 
+**Manager authority checkpoint (source only):** `DeploymentAuthorityCheckpoint`
+accepts only the server's `dep_<32 lowercase hex>` deployment ID, a canonical
+64-character lowercase Ed25519 grant-signing key, and a positive generation.
+`NativeV2AuthClient.fetchDeploymentAuthority` observes
+`GET /v2/deployment/authority` over the pinned origin but never adopts it.
+`ManagerAuthorityTrustStore` persists one tuple per deployment in the unlocked,
+non-synchronizing login Keychain. Every read-check-write trust operation runs
+under one owner-only cross-process `flock` file lock, so all compliant Manager
+processes serialize generation checks and updates. The lock walks the trusted
+ancestor chain with `openat`/`O_NOFOLLOW` from a password-database home (not
+`HOME` or another process environment variable), rejects symlinked or
+group/other-writable ancestors, keeps the validated leaf descriptor open, and
+opens the lock file relative to that descriptor. Initial adoption and generation
+advances require a separate `ManagerAuthorityConfirmation`; rollback, a
+same-generation key change, malformed stored bytes, lock failures, and Keychain
+failures stay closed. Cancellation immediately before the write leaves the prior
+checkpoint intact.
+
+The confirmation type takes only explicit operator-entered values and has no
+initializer from an observed checkpoint. That is a policy boundary, not
+mechanically proven provenance: the UI/caller must not prefill the comparison
+from the reply being verified. `ManagerProductionConnection.makeVerifiedClient`
+returns a production client only after the exact checkpoint match. `ManagerSession`
+uses an immutable launch mode, requires an actual pinned production client plus a
+checkpoint store for every production connect/sign-in/inventory path, refuses
+generic `ConnectionClient` injection as a production substitute, rechecks the
+full checkpoint before required-MFA completion, and fences stale check results.
+A production client without a store is refused rather than silently admitted.
+
+Remaining setup is intentionally out of band: the app entry point still does not
+construct the store or present the deployment-ID/key-fingerprint/generation
+comparison, TLS CA/host inputs are still supplied separately, and there is no
+verified live-server adoption workflow. The lock cannot protect against a
+process that writes the Keychain item without using this store, so this source
+must remain the only authority-checkpoint writer. A missing checkpoint therefore
+blocks production connection rather than learning trust from the network.
+
 `AuthSignInCoordinator` owns causal generation fencing for sign-in, required
 code, inventory, and sign-out so stale completions cannot clear a newer
 challenge or re-install inventory after sign-out.

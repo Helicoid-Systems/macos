@@ -83,7 +83,6 @@ struct ManagerPresentationTests {
         let id = ComputerID("fixture-lab-01")
         let oldKey = try #require(session.openRemoteView(for: id))
         await session.signOut()
-        session.isFixturesMode = true
         session.phase = .signedIn
         session.overview = DevelopmentFixtures.overviewModel()
         let newKey = try #require(session.openRemoteView(for: id))
@@ -288,7 +287,10 @@ struct ManagerPresentationTests {
     @Test("Manual refresh shows progress and applies authorized inventory")
     func inventoryRefreshProgressAndSuccess() async {
         let client = ScriptedInventoryClient()
-        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        let session = ManagerSession(
+            configuration: ManagerLaunchConfiguration(useDevelopmentServer: true),
+            client: client
+        )
         session.phase = .signedIn
         session.screen = .computers
         let refreshed = Computer(id: ComputerID("refresh-1"), name: "Refresh One", isOnline: true)
@@ -309,7 +311,10 @@ struct ManagerPresentationTests {
     @Test("Failed refresh keeps last known inventory and exposes Retry")
     func inventoryRefreshFailurePreservesInventory() async {
         let client = ScriptedInventoryClient()
-        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        let session = ManagerSession(
+            configuration: ManagerLaunchConfiguration(useDevelopmentServer: true),
+            client: client
+        )
         session.phase = .signedIn
         session.screen = .computers
         let existing = Computer(id: ComputerID("known-1"), name: "Known One", isOnline: true)
@@ -328,7 +333,10 @@ struct ManagerPresentationTests {
     @Test("Permission loss during refresh ends the session instead of keeping stale access")
     func inventoryRefreshPermissionLoss() async {
         let client = ScriptedInventoryClient()
-        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        let session = ManagerSession(
+            configuration: ManagerLaunchConfiguration(useDevelopmentServer: true),
+            client: client
+        )
         session.phase = .signedIn
         session.screen = .computers
         session.overview.setInventory([
@@ -353,7 +361,10 @@ struct ManagerPresentationTests {
     )
     func inventoryRefreshCredentialLoss(error: HelicoidError) async {
         let client = ScriptedInventoryClient()
-        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        let session = ManagerSession(
+            configuration: ManagerLaunchConfiguration(useDevelopmentServer: true),
+            client: client
+        )
         session.phase = .signedIn
         session.screen = .computers
         let existing = Computer(id: ComputerID("known-1"), name: "Known One", isOnline: true)
@@ -375,7 +386,10 @@ struct ManagerPresentationTests {
     @Test("Failed refresh then successful retry clears the stale error")
     func inventoryRefreshRetryClearsError() async {
         let client = ScriptedInventoryClient()
-        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        let session = ManagerSession(
+            configuration: ManagerLaunchConfiguration(useDevelopmentServer: true),
+            client: client
+        )
         session.phase = .signedIn
         session.screen = .computers
         let existing = Computer(id: ComputerID("known-1"), name: "Known One", isOnline: true)
@@ -402,7 +416,10 @@ struct ManagerPresentationTests {
     @Test("Refresh response after sign-out cannot repopulate inventory")
     func staleRefreshAfterSignOut() async {
         let client = ScriptedInventoryClient()
-        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        let session = ManagerSession(
+            configuration: ManagerLaunchConfiguration(useDevelopmentServer: true),
+            client: client
+        )
         session.phase = .signedIn
         session.screen = .computers
 
@@ -426,7 +443,10 @@ struct ManagerPresentationTests {
     @Test("Newer refresh wins when an older response arrives later")
     func newerRefreshSupersedesOlderResponse() async {
         let client = ScriptedInventoryClient()
-        let session = ManagerSession(configuration: ManagerLaunchConfiguration(), client: client)
+        let session = ManagerSession(
+            configuration: ManagerLaunchConfiguration(useDevelopmentServer: true),
+            client: client
+        )
         session.phase = .signedIn
         session.screen = .computers
         let older = Computer(id: ComputerID("older-1"), name: "Older", isOnline: true)

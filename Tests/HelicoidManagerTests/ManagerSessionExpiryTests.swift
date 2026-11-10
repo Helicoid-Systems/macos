@@ -4,11 +4,46 @@ import Testing
 @testable import HelicoidCore
 @testable import HelicoidManager
 
+private actor GateAuthorityKeyStore: ManagerAuthorityKeyStoring {
+    private var values: [String: Data] = [:]
+
+    func read(account: String) -> Data? { values[account] }
+
+    func insertIfAbsent(_ bytes: Data, account: String) -> Bool {
+        guard values[account] == nil else { return false }
+        values[account] = bytes
+        return true
+    }
+
+    func update(_ bytes: Data, account: String) throws {
+        guard values[account] != nil else { throw HelicoidError.offline }
+        values[account] = bytes
+    }
+
+    func delete(account: String) { values.removeValue(forKey: account) }
+}
+
+private struct GateNoopAuthorityLock: ManagerAuthorityLocking {
+    func acquire() async throws -> any ManagerAuthorityLockReleasing {
+        GateNoopAuthorityLockHandle()
+    }
+}
+
+private struct GateNoopAuthorityLockHandle: ManagerAuthorityLockReleasing {
+    func release() {}
+}
+
 /// Actual ManagerSession facade: automatic expiry must update screen/phase/
 /// overview without a user action or coordinator helper call.
 @Suite("ManagerSession automatic expiry")
 @MainActor
 struct ManagerSessionExpiryTests {
+    private static let testDeploymentID = "dep_00000000000000000000000000000003"
+    private static let testAuthorityKeyHex = String(repeating: "a", count: 64)
+    private static let testAuthorityFingerprint =
+        "e0e77a507412b120f6ede61f62295b1a7b2ff19d3dcc8f7253e51663470c888e"
+    private static let testAuthorityGeneration: UInt64 = 1
+
     // MARK: - Test clock (test target only)
 
     final class Clock: SessionTimeSource, @unchecked Sendable {
@@ -92,6 +127,11 @@ struct ManagerSessionExpiryTests {
 
         private let lock = NSLock()
         private var items: [Item] = []
+        private let authorityBody: Data?
+
+        init(authorityBody: Data? = nil) {
+            self.authorityBody = authorityBody
+        }
 
         func enqueue(status: Int, body: Data) {
             lock.lock()
@@ -100,6 +140,18 @@ struct ManagerSessionExpiryTests {
         }
 
         func bytes(for request: URLRequest, maxBytes: Int) async throws -> (Data, URLResponse) {
+            if request.url?.path == "/v2/deployment/authority" {
+                guard let authorityBody else { throw HelicoidError.unreachable }
+                let url = request.url ?? URL(string: "https://server.test:8443/")!
+                let response = HTTPURLResponse(
+                    url: url,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                return (authorityBody, response)
+            }
+
             let item: Item? = lock.withLock {
                 guard !items.isEmpty else { return nil }
                 return items.removeFirst()
@@ -138,7 +190,7 @@ struct ManagerSessionExpiryTests {
         }
         let fingerprint = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
         return try DeploymentTLSIdentity(
-            deploymentID: "deploy-1",
+            deploymentID: Self.testDeploymentID,
             host: "server.test",
             port: 8443,
             caDER: bytes,
@@ -160,13 +212,40 @@ struct ManagerSessionExpiryTests {
         ])
     }
 
+    private func authorityJSON() -> Data {
+        json([
+            "deployment_id": Self.testDeploymentID,
+            "grant_signing_public_key": Self.testAuthorityKeyHex,
+            "authority_generation": Int(Self.testAuthorityGeneration),
+        ])
+    }
+
+    private func makeAuthorityStore() async throws -> ManagerAuthorityTrustStore {
+        let store = ManagerAuthorityTrustStore(
+            keyStore: GateAuthorityKeyStore(),
+            authorityLock: GateNoopAuthorityLock()
+        )
+        let checkpoint = try DeploymentAuthorityCheckpoint(
+            deploymentID: Self.testDeploymentID,
+            grantSigningPublicKeyHex: Self.testAuthorityKeyHex,
+            authorityGeneration: Self.testAuthorityGeneration
+        )
+        let confirmation = try ManagerAuthorityConfirmation(
+            operatorEnteredDeploymentID: Self.testDeploymentID,
+            operatorEnteredKeyFingerprintSHA256: Self.testAuthorityFingerprint,
+            operatorEnteredAuthorityGeneration: Self.testAuthorityGeneration
+        )
+        _ = try await store.adopt(checkpoint, confirmation: confirmation)
+        return store
+    }
+
     private func beginJSON(key: String, wall: Int) -> Data {
         json([
             "challenge_id": "ch-1",
             "challenge_token": "tok-1",
             "operation": "session",
             "manager_public_key": key,
-            "deployment_id": "deploy-1",
+            "deployment_id": Self.testDeploymentID,
             "expires_at_unix": wall + 60,
             "mfa_required": false,
         ])
@@ -212,7 +291,7 @@ struct ManagerSessionExpiryTests {
     @Test("Idle clock expiry clears actual ManagerSession facade without user action")
     func managerSessionExpiryClearsFacade() async throws {
         let clock = Clock()
-        let transport = Transport()
+        let transport = Transport(authorityBody: authorityJSON())
         let identity = try makeIdentity()
         let authority = try await makeAuthority()
         let key = AuthV2Canonical.lowercaseHex(identity.publicKey)
@@ -224,7 +303,8 @@ struct ManagerSessionExpiryTests {
         )
         let session = ManagerSession(
             configuration: ManagerLaunchConfiguration(),
-            productionAuthClient: client
+            productionAuthClient: client,
+            authorityTrust: try await makeAuthorityStore()
         )
 
         // connect: pinned health + configured trust identity
@@ -261,7 +341,7 @@ struct ManagerSessionExpiryTests {
 
     @Test("Refresh retry clears the stale facade refresh error")
     func managerSessionRefreshRetryClearsStaleError() async throws {
-        let transport = Transport()
+        let transport = Transport(authorityBody: authorityJSON())
         let identity = try makeIdentity()
         let authority = try await makeAuthority()
         let key = AuthV2Canonical.lowercaseHex(identity.publicKey)
@@ -272,7 +352,8 @@ struct ManagerSessionExpiryTests {
         )
         let session = ManagerSession(
             configuration: ManagerLaunchConfiguration(),
-            productionAuthClient: client
+            productionAuthClient: client,
+            authorityTrust: try await makeAuthorityStore()
         )
 
         transport.enqueue(status: 200, body: healthJSON())
@@ -311,7 +392,7 @@ struct ManagerSessionExpiryTests {
 
     @Test("Production inventory denial advances generation and clears windows")
     func managerSessionPermissionDenialTearsDownGeneration() async throws {
-        let transport = Transport()
+        let transport = Transport(authorityBody: authorityJSON())
         let identity = try makeIdentity()
         let authority = try await makeAuthority()
         let key = AuthV2Canonical.lowercaseHex(identity.publicKey)
@@ -322,7 +403,8 @@ struct ManagerSessionExpiryTests {
         )
         let session = ManagerSession(
             configuration: ManagerLaunchConfiguration(),
-            productionAuthClient: client
+            productionAuthClient: client,
+            authorityTrust: try await makeAuthorityStore()
         )
 
         transport.enqueue(status: 200, body: healthJSON())
@@ -366,7 +448,7 @@ struct ManagerSessionExpiryTests {
     @Test("Replacement after expiry can sign in again (fenced)")
     func managerSessionCanSignInAfterExpiry() async throws {
         let clock = Clock()
-        let transport = Transport()
+        let transport = Transport(authorityBody: authorityJSON())
         let identity = try makeIdentity()
         let authority = try await makeAuthority()
         let key = AuthV2Canonical.lowercaseHex(identity.publicKey)
@@ -378,7 +460,8 @@ struct ManagerSessionExpiryTests {
         )
         let session = ManagerSession(
             configuration: ManagerLaunchConfiguration(),
-            productionAuthClient: client
+            productionAuthClient: client,
+            authorityTrust: try await makeAuthorityStore()
         )
         transport.enqueue(status: 200, body: healthJSON())
         session.serverAddress = "https://server.test:8443"

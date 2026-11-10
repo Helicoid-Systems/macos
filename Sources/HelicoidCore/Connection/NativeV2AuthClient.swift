@@ -1021,6 +1021,44 @@ extension NativeV2AuthClient: ConnectionClient {
         return .success(identity)
     }
 
+    /// Read `GET /v2/deployment/authority` over the independently pinned origin.
+    ///
+    /// This only *observes* the published tuple. It never saves a checkpoint and
+    /// never treats the reply as trust: callers must compare the deployment ID,
+    /// key fingerprint, and generation through a separate trusted channel before
+    /// passing the tuple to `ManagerAuthorityTrustStore.adopt`.
+    public func fetchDeploymentAuthority() async throws -> DeploymentAuthorityCheckpoint {
+        let response = try await get(path: "/v2/deployment/authority", authorized: false)
+        guard response.statusCode == 200 else {
+            throw HelicoidError.serverContractUnavailable
+        }
+        let dto: ManagerDeploymentAuthorityResponseDTO = try decodeSuccess(response)
+        guard dto.authorityGeneration > 0,
+              let generation = UInt64(exactly: dto.authorityGeneration) else {
+            throw HelicoidError.invalidInput(
+                field: "authority_generation",
+                detail: "The deployment returned an invalid authority generation."
+            )
+        }
+        let observed: DeploymentAuthorityCheckpoint
+        do {
+            observed = try DeploymentAuthorityCheckpoint(
+                deploymentID: dto.deploymentID,
+                grantSigningPublicKeyHex: dto.grantSigningPublicKey,
+                authorityGeneration: generation
+            )
+        } catch {
+            throw HelicoidError.invalidInput(
+                field: "deployment_authority",
+                detail: "The deployment returned an invalid authority checkpoint."
+            )
+        }
+        guard observed.deploymentID == trustedDeploymentID else {
+            throw HelicoidError.identityMismatch
+        }
+        return observed
+    }
+
     public func trust(identity: ServerIdentity, address: String) async -> Result<Void, HelicoidError> {
         // No TOFU. Trust is configuration, not a runtime adoption step.
         _ = identity
@@ -1142,5 +1180,17 @@ extension NativeV2AuthClient: ConnectionClient {
             seen.insert(id)
         }
         return nil
+    }
+}
+
+private struct ManagerDeploymentAuthorityResponseDTO: Decodable {
+    let deploymentID: String
+    let grantSigningPublicKey: String
+    let authorityGeneration: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case deploymentID = "deployment_id"
+        case grantSigningPublicKey = "grant_signing_public_key"
+        case authorityGeneration = "authority_generation"
     }
 }
