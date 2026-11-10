@@ -1842,7 +1842,12 @@ struct EndpointEnrollmentClientTests {
         await transport.setPendingObservationGrantResponse(try Self.pendingObservationGrantBody([
             (grant.grantID, transport.computerID, now - 1, grant.token),
         ]))
-        await #expect(throws: HelicoidError.serverContractUnavailable) {
+        // The unsigned envelope says expired while the signed grant is still
+        // active. This is an inconsistent delivery, not a safely stale grant,
+        // so the credential check must reject it.
+        await #expect(throws: HelicoidError.authenticationFailed(
+            detail: "The endpoint observation grant is invalid or expired."
+        )) {
             try await client.fetchPendingObservationGrants(deploymentID: deploymentID)
         }
 
