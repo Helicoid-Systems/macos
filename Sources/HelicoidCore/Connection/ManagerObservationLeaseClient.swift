@@ -257,7 +257,7 @@ public actor ManagerObservationLeaseClient {
               expectation.managerPublicKeyHex == signingKeyHex else {
             throw HelicoidError.identityMismatch
         }
-        guard isCanonicalUUID(expectation.computerID) else {
+        guard Self.isCanonicalUUID(expectation.computerID) else {
             throw HelicoidError.invalidInput(
                 field: "computer_id",
                 detail: "The selected computer identifier is invalid."
