@@ -138,11 +138,13 @@ public actor NativeV2AuthClient {
     private let signingIdentity: ManagerSigningIdentity
     /// The complete pinned TLS identity supplied by the caller. Production
     /// gates compare this whole value against the persisted trust record.
-    public let trustedIdentity: DeploymentTLSIdentity
+    /// Immutable and Sendable, so the trust gates can read it synchronously.
+    public nonisolated let trustedIdentity: DeploymentTLSIdentity
     /// True only when the transport is the production `PinnedHTTPSTransport`
     /// and its full configured TLS identity equals `trustedIdentity`.
     /// A caller-supplied transport cannot silently become a production gate.
-    public let isProductionPinned: Bool
+    /// Immutable and Sendable, so the trust gates can read it synchronously.
+    public nonisolated let isProductionPinned: Bool
     private let trustedDeploymentID: String
     private let originURL: URL
     private let caFingerprintSHA256: String

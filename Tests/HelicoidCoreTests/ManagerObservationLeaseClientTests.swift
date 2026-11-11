@@ -83,15 +83,13 @@ private final class LeaseObservationExecutor: ManagerObservationHTTPExecutor, @u
         _ request: URLRequest,
         maxBytes: Int
     ) async throws -> ManagerObservationHTTPResult {
-        lock.lock()
-        recordedRequests.append(request)
-        guard !stubs.isEmpty else {
-            lock.unlock()
-            throw HelicoidError.offline
+        let (stub, hook) = try lock.withLock {
+            recordedRequests.append(request)
+            guard !stubs.isEmpty else {
+                throw HelicoidError.offline
+            }
+            return (stubs.removeFirst(), onRequest)
         }
-        let stub = stubs.removeFirst()
-        let hook = onRequest
-        lock.unlock()
         if let hook {
             try await hook(request)
         }
