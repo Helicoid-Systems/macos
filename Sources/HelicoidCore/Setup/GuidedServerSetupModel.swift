@@ -221,11 +221,16 @@ public final class GuidedServerSetupModel {
                 localClient: LocalMacSetupClient = LocalMacSetupClient(),
                 managerIdentityStore: ManagerIdentityStore = ManagerIdentityStore(),
                 demoMode: Bool = false) {
-        self.init(sshClient: sshClient,
-                  localClient: localClient,
-                  managerIdentityStore: managerIdentityStore,
-                  installService: BundledServerInstallService(),
-                  demoMode: demoMode)
+        self.isDemo = demoMode
+        if demoMode {
+            self.networkAddress = "127.0.0.1"
+            self.deploymentName = "My server"
+            self.administratorUsername = "admin"
+        }
+        self.sshClient = sshClient
+        self.localClient = localClient
+        self.managerIdentityStore = managerIdentityStore
+        self.installService = BundledServerInstallService()
     }
 
     init(sshClient: SSHSetupClient = SSHSetupClient(),
@@ -873,7 +878,7 @@ public final class GuidedServerSetupModel {
                 package: package)
             try Self.requireMatchingContract(preflight, configuration: configuration)
             guard preflight.ok else {
-                let details = preflight.hostChecks.blockingSummaries
+                let details = preflight.hostChecks.checks.blockingSummaries
                 let reason = details.isEmpty
                     ? "The installer preflight did not pass. No installation was attempted."
                     : details.joined(separator: " ")

@@ -736,7 +736,7 @@ enum ServerPackageVerifier {
             guard seenPaths.insert(artifact.path).inserted else {
                 throw LocalServerInstallError.commandRejected("The package declares a duplicate artifact path.")
             }
-            guard isHex32Bytes(artifact.sha256) else {
+            guard BundledServerPackageProvider.isHex32Bytes(artifact.sha256) else {
                 throw LocalServerInstallError.commandRejected(
                     "A package artifact digest is not a SHA-256 hex value.")
             }
