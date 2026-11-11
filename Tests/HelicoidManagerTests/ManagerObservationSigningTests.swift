@@ -141,7 +141,27 @@ struct ManagerObservationSigningTests {
             identity: managerIdentity,
             nowUnixSeconds: now
         )
-        #expect(proofHex == "c8d79dc7d43ca82a80baaf58f20ad5e3d1140f832c370dd6636b8df9f7b3a7da3e4c6684f60a00c261da63df5f250d36869e94c898ba67076e229dabe1c5e507")
+        // CryptoKit hedges Ed25519 nonces, so a fresh signature is valid but not
+        // byte-identical to this deterministic RFC 8032 vector. Verify both the
+        // fresh signature and the golden signature over the exact transcript.
+        let proofSignature = try #require(
+            ObservationAdmissionGrantVerifier.lowerHexBytes(proofHex)
+        )
+        #expect(grant.verifiesManagerProof(
+            endpointNonceHex: nonce,
+            channelBindingHex: channelBinding,
+            signature: proofSignature
+        ))
+        let goldenProofSignature = try #require(
+            ObservationAdmissionGrantVerifier.lowerHexBytes(
+                "c8d79dc7d43ca82a80baaf58f20ad5e3d1140f832c370dd6636b8df9f7b3a7da3e4c6684f60a00c261da63df5f250d36869e94c898ba67076e229dabe1c5e507"
+            )
+        )
+        #expect(grant.verifiesManagerProof(
+            endpointNonceHex: nonce,
+            channelBindingHex: channelBinding,
+            signature: goldenProofSignature
+        ))
 
         let certificatePEM = Data("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".utf8)
         let attestation = try grant.peerCertificateAttestationMessage(
@@ -158,7 +178,25 @@ struct ManagerObservationSigningTests {
             identity: managerIdentity,
             nowUnixSeconds: now
         )
-        #expect(lowerHex(certificateSignature) == "bac19a368ea97e5b61af61572692e3bf7c118337f485d7f68728d9cdd73426dd5df9a227fcd62fb90f8cf069bff60e91c4aa1eb9a9280feefb9d51c8b8ab4c0a")
+        #expect(grant.verifiesPeerCertificateAttestation(
+            certificatePEM: certificatePEM,
+            endpointNonceHex: nonce,
+            role: .manager,
+            signature: certificateSignature,
+            nowUnixSeconds: now
+        ))
+        let goldenCertificateSignature = try #require(
+            ObservationAdmissionGrantVerifier.lowerHexBytes(
+                "bac19a368ea97e5b61af61572692e3bf7c118337f485d7f68728d9cdd73426dd5df9a227fcd62fb90f8cf069bff60e91c4aa1eb9a9280feefb9d51c8b8ab4c0a"
+            )
+        )
+        #expect(grant.verifiesPeerCertificateAttestation(
+            certificatePEM: certificatePEM,
+            endpointNonceHex: nonce,
+            role: .manager,
+            signature: goldenCertificateSignature,
+            nowUnixSeconds: now
+        ))
 
         let zeroSignature = Data(repeating: 0, count: 64)
         let goldenSDP = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=hs-observation-cert-v1:LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUIKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo.\(String(repeating: "0", count: 128))\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
@@ -206,7 +244,20 @@ struct ManagerObservationSigningTests {
         #expect(object["grant_id"] as? String == fixture.grant.grantID)
         #expect(object["endpoint_nonce"] as? String == Self.nonce)
         #expect(object["channel_binding"] as? String == binding)
-        #expect(object["manager_proof"] as? String == proof)
+        // CryptoKit signs with a hedged nonce, so the relayed proof is not
+        // byte-identical to the earlier call. It must still verify against the
+        // same grant transcript and Manager identity.
+        let relayedProof = try #require(object["manager_proof"] as? String)
+        #expect(relayedProof.count == 128)
+        #expect(relayedProof == relayedProof.lowercased())
+        let relayedProofBytes = try #require(
+            ObservationAdmissionGrantVerifier.lowerHexBytes(relayedProof)
+        )
+        #expect(fixture.grant.verifiesManagerProof(
+            endpointNonceHex: Self.nonce,
+            channelBindingHex: binding,
+            signature: relayedProofBytes
+        ))
 
         let otherIdentity = try ManagerSigningIdentity(
             storedBytes: Data([1]) + Curve25519.Signing.PrivateKey().rawRepresentation
@@ -226,6 +277,40 @@ struct ManagerObservationSigningTests {
                 identity: fixture.identity,
                 nowUnixSeconds: fixture.grant.expiresAtUnix
             )
+        }
+    }
+
+    @Test("Repeated proofs over one transcript both verify")
+    func hedgedProofsBothVerify() throws {
+        let fixture = try makeFixture()
+        let binding = try channelBindingHex()
+        let first = try fixture.grant.signManagerProof(
+            endpointNonceHex: Self.nonce,
+            channelBindingHex: binding,
+            identity: fixture.identity,
+            nowUnixSeconds: Self.now
+        )
+        let second = try fixture.grant.signManagerProof(
+            endpointNonceHex: Self.nonce,
+            channelBindingHex: binding,
+            identity: fixture.identity,
+            nowUnixSeconds: Self.now
+        )
+
+        // CryptoKit documents that Ed25519 signing is hedged: it adds fresh
+        // randomness to every call. Byte equality between two valid signatures
+        // is therefore not part of the proof contract; verification is.
+        for proof in [first, second] {
+            #expect(proof.count == 128)
+            #expect(proof == proof.lowercased())
+            let signature = try #require(
+                ObservationAdmissionGrantVerifier.lowerHexBytes(proof)
+            )
+            #expect(fixture.grant.verifiesManagerProof(
+                endpointNonceHex: Self.nonce,
+                channelBindingHex: binding,
+                signature: signature
+            ))
         }
     }
 
