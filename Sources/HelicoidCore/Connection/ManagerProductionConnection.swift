@@ -3,14 +3,15 @@ import Foundation
 /// Production composition gate for one independently trusted deployment.
 ///
 /// The caller supplies the pinned TLS identity and the Keychain-backed authority
-/// store. `makeVerifiedClient` reads the authority over the pinned origin,
-/// requires an exact match with the saved checkpoint, and only then returns a
-/// client that can begin sign-in. A missing checkpoint, rollback, or
-/// same-generation key change keeps the connection closed.
+/// store. `makeVerifiedClient` requires an atomic config-bound production trust
+/// record, reads the authority over the pinned origin, requires an exact match
+/// with the saved checkpoint, and only then returns a client that can begin
+/// sign-in. A missing or checkpoint-only record, rollback, or same-generation
+/// key change keeps the connection closed.
 ///
 /// `observeAuthority` is deliberately unverified. Use it only to read the
-/// published tuple for out-of-band review before calling
-/// `ManagerAuthorityTrustStore.adopt` with a separate confirmation.
+/// published tuple for out-of-band review before committing a verified
+/// production trust record with a separate confirmation.
 public struct ManagerProductionConnection: Sendable {
     public let tlsIdentity: DeploymentTLSIdentity
     public let authorityTrust: ManagerAuthorityTrustStore
@@ -26,8 +27,8 @@ public struct ManagerProductionConnection: Sendable {
     /// Read the published tuple over the pinned origin for out-of-band review.
     ///
     /// This never saves or adopts a checkpoint. The returned value is an
-    /// observation only; compare it through a trusted channel and call
-    /// `ManagerAuthorityTrustStore.adopt` with a separate confirmation.
+    /// observation only; compare it through a trusted channel and commit an
+    /// atomic production trust record with a separate confirmation.
     public func observeAuthority(
         signingIdentity: ManagerSigningIdentity
     ) async throws -> DeploymentAuthorityCheckpoint {
@@ -44,14 +45,16 @@ public struct ManagerProductionConnection: Sendable {
     public func makeVerifiedClient(
         signingIdentity: ManagerSigningIdentity
     ) async throws -> NativeV2AuthClient {
-        let saved = try await authorityTrust.savedCheckpoint(
+        guard let saved = try await authorityTrust.productionTrustRecord(
             deploymentID: tlsIdentity.deploymentID
-        )
-        guard saved != nil else {
+        ) else {
             throw HelicoidError.authenticationFailed(
-                detail: "No independently verified deployment authority checkpoint is saved. Complete out-of-band trust setup before connecting."
+                detail: "No atomically bound deployment TLS trust record is saved. Complete out-of-band production trust setup before connecting."
             )
         }
+        // Core owns the typed comparison so a caller cannot substitute the
+        // origin, CA DER, or CA pin while reusing an unchanged checkpoint.
+        try saved.requireBoundTLSIdentity(tlsIdentity)
         let client = try makePinnedClient(signingIdentity: signingIdentity)
         let observed = try await client.fetchDeploymentAuthority()
         _ = try await authorityTrust.requireCurrent(observed)

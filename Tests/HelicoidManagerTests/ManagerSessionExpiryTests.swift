@@ -21,6 +21,8 @@ private actor GateAuthorityKeyStore: ManagerAuthorityKeyStoring {
     }
 
     func delete(account: String) { values.removeValue(forKey: account) }
+
+    func allAccounts() -> [String] { Array(values.keys) }
 }
 
 private struct GateNoopAuthorityLock: ManagerAuthorityLocking {
@@ -235,7 +237,18 @@ struct ManagerSessionExpiryTests {
             operatorEnteredKeyFingerprintSHA256: Self.testAuthorityFingerprint,
             operatorEnteredAuthorityGeneration: Self.testAuthorityGeneration
         )
-        _ = try await store.adopt(checkpoint, confirmation: confirmation)
+        let configuration = ManagerProductionTrustConfiguration(
+            tlsIdentity: try await makeAuthority()
+        )
+        let record = try ManagerAuthorityTrustRecord(
+            checkpoint: checkpoint,
+            configurationData: try configuration.encodedForTrustRecord()
+        )
+        _ = try await store.commitProductionTrustRecord(
+            record,
+            expected: nil,
+            confirmation: confirmation
+        )
         return store
     }
 
@@ -299,7 +312,8 @@ struct ManagerSessionExpiryTests {
             transport: transport,
             trustedAuthority: authority,
             signingIdentity: identity,
-            timeSource: clock
+            timeSource: clock,
+            productionPinnedForTesting: true
         )
         let session = ManagerSession(
             configuration: ManagerLaunchConfiguration(),
@@ -348,7 +362,9 @@ struct ManagerSessionExpiryTests {
         let client = NativeV2AuthClient(
             transport: transport,
             trustedAuthority: authority,
-            signingIdentity: identity
+            signingIdentity: identity,
+            timeSource: LiveSessionTimeSource(),
+            productionPinnedForTesting: true
         )
         let session = ManagerSession(
             configuration: ManagerLaunchConfiguration(),
@@ -399,7 +415,9 @@ struct ManagerSessionExpiryTests {
         let client = NativeV2AuthClient(
             transport: transport,
             trustedAuthority: authority,
-            signingIdentity: identity
+            signingIdentity: identity,
+            timeSource: LiveSessionTimeSource(),
+            productionPinnedForTesting: true
         )
         let session = ManagerSession(
             configuration: ManagerLaunchConfiguration(),
@@ -456,7 +474,8 @@ struct ManagerSessionExpiryTests {
             transport: transport,
             trustedAuthority: authority,
             signingIdentity: identity,
-            timeSource: clock
+            timeSource: clock,
+            productionPinnedForTesting: true
         )
         let session = ManagerSession(
             configuration: ManagerLaunchConfiguration(),

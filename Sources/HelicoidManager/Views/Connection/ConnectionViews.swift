@@ -66,7 +66,9 @@ struct ConnectView: View {
             HStack(spacing: 12) {
                 Button("Set Up Server") { session.screen = .guidedSetup }
                 Spacer()
-                if isConnecting { ProgressView().controlSize(.small) }
+                if isConnecting || session.phase == .connecting {
+                    ProgressView().controlSize(.small)
+                }
                 Button("Connect") {
                     isConnecting = true
                     Task {
@@ -75,7 +77,7 @@ struct ConnectView: View {
                     }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(isConnecting || !session.allowsConnect
+                .disabled(isConnecting || session.phase == .connecting || !session.allowsConnect
                     || session.serverAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .help("Connect to the server")
             }

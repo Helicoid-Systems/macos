@@ -19,7 +19,7 @@ struct HelicoidManagerApp: App {
                 .environment(session)
                 .disclosureGroupStyle(FullWidthDisclosureGroupStyle())
         }
-        .defaultSize(width: 620, height: 300)
+        .defaultSize(width: 640, height: 620)
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About Helicoid Manager") {
@@ -107,7 +107,11 @@ struct RootView: View {
         Group {
             switch session.screen {
             case .connect:
-                ConnectView()
+                if session.requiresProductionBootstrap {
+                    ProductionTrustView()
+                } else {
+                    ConnectView()
+                }
             case .verify:
                 VerifyServerView()
             case .signIn:
@@ -126,7 +130,11 @@ struct RootView: View {
             idealHeight: rootSize.idealHeight,
             maxHeight: .infinity
         )
-        .background(SetupWindowChrome(screen: session.screen, setupHeight: setupWindowHeight))
+        .background(SetupWindowChrome(
+            screen: session.screen,
+            setupHeight: setupWindowHeight,
+            showsProductionTrust: session.requiresProductionBootstrap
+        ))
         .onPreferenceChange(SetupWindowHeightKey.self) { height in
             if let height { setupWindowHeight = height }
         }
@@ -135,7 +143,9 @@ struct RootView: View {
     private var rootSize: (minWidth: CGFloat, idealWidth: CGFloat, minHeight: CGFloat, idealHeight: CGFloat) {
         switch session.screen {
         case .connect:
-            (620, 620, 300, 300)
+            session.requiresProductionBootstrap
+                ? (640, 680, 520, 680)
+                : (620, 620, 300, 300)
         case .signIn:
             (620, 620, 440, 440)
         case .verify:
@@ -202,6 +212,20 @@ struct SettingsView: View {
                         LabeledContent("Deployment", value: identity.deploymentName)
                     } else {
                         LabeledContent("Deployment", value: "Not verified")
+                    }
+                    if !session.isFixturesMode,
+                       !session.isDevelopmentServerMode,
+                       session.allowsConnect {
+                        Button("Review Production Trust…") {
+                            Task {
+                                if session.phase == .signedIn {
+                                    await session.signOut()
+                                }
+                                session.uninstallProductionConnection()
+                                session.screen = .connect
+                            }
+                        }
+                        .help("Return to production trust setup to review, replace, or clear saved trust.")
                     }
                 }
                 Section("Account") {

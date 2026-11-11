@@ -26,6 +26,8 @@ private actor GateAuthorityKeyStore: ManagerAuthorityKeyStoring {
     }
 
     func delete(account: String) { values.removeValue(forKey: account) }
+
+    func allAccounts() -> [String] { Array(values.keys) }
 }
 
 private struct GateNoopAuthorityLock: ManagerAuthorityLocking {
@@ -226,7 +228,18 @@ private func makeGateStore(seeded: Bool) async throws -> ManagerAuthorityTrustSt
         operatorEnteredKeyFingerprintSHA256: gateAuthorityFingerprint,
         operatorEnteredAuthorityGeneration: 1
     )
-    _ = try await store.adopt(checkpoint, confirmation: confirmation)
+    let configuration = ManagerProductionTrustConfiguration(
+        tlsIdentity: try makeGateTLSIdentity()
+    )
+    let record = try ManagerAuthorityTrustRecord(
+        checkpoint: checkpoint,
+        configurationData: try configuration.encodedForTrustRecord()
+    )
+    _ = try await store.commitProductionTrustRecord(
+        record,
+        expected: nil,
+        confirmation: confirmation
+    )
     return store
 }
 
@@ -244,7 +257,9 @@ private func makeGateClient(
     return NativeV2AuthClient(
         transport: transport,
         trustedAuthority: identity,
-        signingIdentity: signer
+        signingIdentity: signer,
+        timeSource: LiveSessionTimeSource(),
+        productionPinnedForTesting: true
     )
 }
 
@@ -381,6 +396,54 @@ struct ManagerAuthorityGateTests {
         #expect(session.screen == .signIn)
         #expect(await transport.authorityRequestCount == 1)
         #expect(await transport.healthRequestCount == 1)
+    }
+
+    @Test("Injected production client cannot use a substituted origin")
+    func injectedClientCannotUseSubstitutedOrigin() async throws {
+        let original = try makeGateTLSIdentity()
+        let substituted = try DeploymentTLSIdentity(
+            deploymentID: original.deploymentID,
+            host: "other.example",
+            port: original.port,
+            caDER: original.caDER,
+            caFingerprintSHA256: original.caFingerprintSHA256
+        )
+        let transport = GateTransport(authorityBody: gateAuthorityJSON())
+        let client = try makeGateClient(transport: transport, identity: substituted)
+        let session = ManagerSession(
+            configuration: ManagerLaunchConfiguration(),
+            productionAuthClient: client,
+            authorityTrust: try await makeGateStore(seeded: true)
+        )
+
+        #expect(session.allowsConnect)
+        session.serverAddress = "https://other.example:8443"
+        await session.connect()
+        #expect(session.phase == .failed(.identityChanged))
+        #expect(await transport.authorityRequestCount == 0)
+        #expect(await transport.healthRequestCount == 0)
+    }
+
+    @Test("Production session refuses an arbitrary transport")
+    func productionSessionRefusesArbitraryTransport() async throws {
+        let identity = try makeGateTLSIdentity()
+        let transport = GateTransport(authorityBody: gateAuthorityJSON())
+        let client = NativeV2AuthClient(
+            transport: transport,
+            trustedAuthority: identity,
+            signingIdentity: try makeGateSigningIdentity()
+        )
+        let session = ManagerSession(
+            configuration: ManagerLaunchConfiguration(),
+            productionAuthClient: client,
+            authorityTrust: try await makeGateStore(seeded: true)
+        )
+
+        #expect(!session.allowsConnect)
+        await session.connect()
+        #expect(session.phase == .failed(.identityUnverified))
+        #expect(await transport.authorityRequestCount == 0)
+        #expect(await transport.healthRequestCount == 0)
     }
 
     @Test("Rollback after connect fails sign-in before a challenge")

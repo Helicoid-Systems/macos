@@ -52,6 +52,9 @@ enum TLSTestHarness {
         let caFingerprint: String
         let leafDER: Data
         let noKeySignCADER: Data
+        /// DER of a second, independent CA. Used to prove that a substituted
+        /// CA cannot be paired with an unchanged trust checkpoint.
+        let foreignCADER: Data
     }
 
     /// Isolated owner for process-wide CA material. One generation flight;
@@ -97,7 +100,8 @@ enum TLSTestHarness {
             caDER: pki.caDER,
             caFingerprint: pki.caFingerprint,
             leafDER: pki.goodLeafDER,
-            noKeySignCADER: pki.noKeySignCADER
+            noKeySignCADER: pki.noKeySignCADER,
+            foreignCADER: pki.foreignCADER
         )
         // Material is pure bytes; the on-disk PKI is never needed again.
         pki.disposeFiles()
@@ -129,6 +133,8 @@ enum TLSTestHarness {
         let wrongHostKeyPEM: URL
         /// CA:TRUE but keyUsage without keyCertSign — invalid signing CA.
         let noKeySignCADER: Data
+        /// DER of the independent foreign CA.
+        let foreignCADER: Data
 
         var caFingerprintSHA256: String { caFingerprint }
 
@@ -346,6 +352,10 @@ enum TLSTestHarness {
             directory: directory
         )
         let foreignCAKey = directory.appendingPathComponent("foreign-ca.key")
+        let foreignCADer = directory.appendingPathComponent("foreign-ca.der")
+        try openssl([
+            "x509", "-in", foreignCACrt.path, "-outform", "DER", "-out", foreignCADer.path,
+        ])
 
         func signedServer(
             name: String,
@@ -529,7 +539,8 @@ enum TLSTestHarness {
             nonServerAuthKeyPEM: nonServerAuth.key,
             wrongHostCertPEM: wrongHost.cert,
             wrongHostKeyPEM: wrongHost.key,
-            noKeySignCADER: noKeySignDER
+            noKeySignCADER: noKeySignDER,
+            foreignCADER: try Data(contentsOf: foreignCADer)
         )
     }
 

@@ -136,6 +136,13 @@ public actor NativeV2AuthClient {
 
     private let transport: any HTTPTransport
     private let signingIdentity: ManagerSigningIdentity
+    /// The complete pinned TLS identity supplied by the caller. Production
+    /// gates compare this whole value against the persisted trust record.
+    public let trustedIdentity: DeploymentTLSIdentity
+    /// True only when the transport is the production `PinnedHTTPSTransport`
+    /// and its full configured TLS identity equals `trustedIdentity`.
+    /// A caller-supplied transport cannot silently become a production gate.
+    public let isProductionPinned: Bool
     private let trustedDeploymentID: String
     private let originURL: URL
     private let caFingerprintSHA256: String
@@ -190,6 +197,11 @@ public actor NativeV2AuthClient {
         tokenBox: TokenBox = TokenBox()
     ) {
         self.transport = transport
+        self.trustedIdentity = trustedAuthority
+        self.isProductionPinned = Self.transportPinsIdentity(
+            transport,
+            trustedAuthority: trustedAuthority
+        )
         self.trustedDeploymentID = trustedAuthority.deploymentID
         self.originURL = trustedAuthority.originURL
         self.caFingerprintSHA256 = trustedAuthority.caFingerprintSHA256
@@ -200,14 +212,23 @@ public actor NativeV2AuthClient {
     }
 
     /// Internal test seam. Production callers use the public initializer.
+    /// Tests that exercise production session gates must mark the client as
+    /// pinned explicitly; there is no public way to claim that state.
     init(
         transport: any HTTPTransport,
         trustedAuthority: DeploymentTLSIdentity,
         signingIdentity: ManagerSigningIdentity,
         tokenBox: TokenBox = TokenBox(),
-        timeSource: any SessionTimeSource
+        timeSource: any SessionTimeSource,
+        productionPinnedForTesting: Bool = false
     ) {
         self.transport = transport
+        self.trustedIdentity = trustedAuthority
+        self.isProductionPinned = productionPinnedForTesting
+            || Self.transportPinsIdentity(
+                transport,
+                trustedAuthority: trustedAuthority
+            )
         self.trustedDeploymentID = trustedAuthority.deploymentID
         self.originURL = trustedAuthority.originURL
         self.caFingerprintSHA256 = trustedAuthority.caFingerprintSHA256
@@ -215,6 +236,20 @@ public actor NativeV2AuthClient {
         self.expectedManagerPublicKeyHex = AuthV2Canonical.lowercaseHex(signingIdentity.publicKey)
         self.tokenBox = tokenBox
         self.timeSource = timeSource
+    }
+
+    /// Production pinning is a property of the *actual* transport configuration,
+    /// not merely its concrete type. A `PinnedHTTPSTransport` constructed for a
+    /// different host, CA pin, deployment, or port must never count as a
+    /// production gate for the declared trusted identity.
+    private static func transportPinsIdentity(
+        _ transport: any HTTPTransport,
+        trustedAuthority: DeploymentTLSIdentity
+    ) -> Bool {
+        guard let pinned = transport as? PinnedHTTPSTransport else {
+            return false
+        }
+        return pinned.pinnedIdentity == trustedAuthority
     }
 
     // MARK: Seams

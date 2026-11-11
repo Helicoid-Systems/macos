@@ -218,20 +218,24 @@ independently pinned HTTPS: `POST /v2/auth/challenge` then
 - Development loopback remains an explicit separate legacy option; the v2 client
   never falls back to v1/password-only/dev labels.
 
-**Injection seam only:** normal `HelicoidManager` construction does not yet load
-persisted deployment trust. Production v2 sign-in is available only when a
-`NativeV2AuthClient` is injected into `ManagerSession` with a genuine
-`DeploymentTLSIdentity` + `PinnedHTTPSTransport`. Without that configuration,
-production Connect stays explicitly unavailable. Actual-server integration
-against the built Rust server remains a coordinator gate.
+**Production entry:** a normal `HelicoidManager` launch presents the production
+trust screen when no saved deployment trust is installed. It loads the persisted
+CA/host/deployment configuration, creates the pinned HTTPS client only after the
+operator completes or re-verifies that trust, and then runs the same v2 sign-in
+flow. Source fixtures and the explicit loopback development server remain
+separate nonproduction paths. Actual-server integration against the built Rust
+server remains a coordinator gate.
 
 **Manager authority checkpoint (source only):** `DeploymentAuthorityCheckpoint`
 accepts only the server's `dep_<32 lowercase hex>` deployment ID, a canonical
 64-character lowercase Ed25519 grant-signing key, and a positive generation.
 `NativeV2AuthClient.fetchDeploymentAuthority` observes
 `GET /v2/deployment/authority` over the pinned origin but never adopts it.
-`ManagerAuthorityTrustStore` persists one tuple per deployment in the unlocked,
-non-synchronizing login Keychain. Every read-check-write trust operation runs
+`ManagerAuthorityTrustStore` persists one atomic `ManagerAuthorityTrustRecord`
+per deployment in the unlocked, non-synchronizing login Keychain. That single
+record contains both the authority checkpoint and the typed, independently
+supplied TLS configuration, so the two can never be read or written as a mixed
+pair. Every read-check-write trust operation runs
 under one owner-only cross-process `flock` file lock, so all compliant Manager
 processes serialize generation checks and updates. The lock walks the trusted
 ancestor chain with `openat`/`O_NOFOLLOW` from a password-database home (not
@@ -247,20 +251,80 @@ The confirmation type takes only explicit operator-entered values and has no
 initializer from an observed checkpoint. That is a policy boundary, not
 mechanically proven provenance: the UI/caller must not prefill the comparison
 from the reply being verified. `ManagerProductionConnection.makeVerifiedClient`
-returns a production client only after the exact checkpoint match. `ManagerSession`
+returns a production client only when an atomic config-bound record exists and
+the live authority exactly matches its checkpoint. Core also compares the full
+typed TLS binding — deployment ID, host, port, CA DER, and CA pin — at client
+creation, record commit, observation composition, session install, and every
+production connect/sign-in/MFA gate. `ManagerSession`
 uses an immutable launch mode, requires an actual pinned production client plus a
 checkpoint store for every production connect/sign-in/inventory path, refuses
 generic `ConnectionClient` injection as a production substitute, rechecks the
 full checkpoint before required-MFA completion, and fences stale check results.
-A production client without a store is refused rather than silently admitted.
+A production client without a store, or with only a legacy checkpoint-only
+record that has no atomically bound TLS configuration, is refused rather than
+silently admitted.
 
-Remaining setup is intentionally out of band: the app entry point still does not
-construct the store or present the deployment-ID/key-fingerprint/generation
-comparison, TLS CA/host inputs are still supplied separately, and there is no
-verified live-server adoption workflow. The lock cannot protect against a
-process that writes the Keychain item without using this store, so this source
-must remain the only authority-checkpoint writer. A missing checkpoint therefore
-blocks production connection rather than learning trust from the network.
+**Production bootstrap UI (source only):** normal `HelicoidManager` production
+launch now presents `ProductionTrustView`. The operator supplies the CA DER
+file, CA SHA-256 pin, hostname, port, deployment ID, grant-signing key SHA-256
+fingerprint, and authority generation. The CA pin is deliberately not filled
+from the selected file. The Manager observes
+`GET /v2/deployment/authority` through the pinned CA, requires the observed
+deployment ID, key fingerprint, and generation to match the operator-entered
+values, and only then calls `commitProductionTrustRecord`. The checkpoint and
+the TLS configuration are written together as one device-only, non-synchronizing
+Keychain record. Subsequent launches prefill the saved configuration and offer
+**Connect with Saved Trust**, which requires the form to match the exact saved
+host, port, CA, and pin before contacting the network, then verifies the live
+authority against the saved checkpoint. Editing any of those TLS fields or
+switching deployments requires **Replace saved trust checkpoint** plus explicit
+independent authority values; a substituted origin or deployment is never
+saved silently. A stale window whose loaded record no longer matches the store
+fails closed, clears its prefilled trust inputs, and demands explicit
+re-entry/reset. A network key that does not match the operator values is never
+adopted or connected. Record commits are compare-and-swap operations under the
+same cross-process authority lock: the exact pre-network record snapshot,
+including any other deployment named in that snapshot, is revalidated before the
+single record is written, and network observation is never performed while the
+lock is held. A concurrent reset or competing submission therefore fails closed
+instead of overwriting or resurrecting trust. Installation also re-reads the
+record and refuses a record that changed after verification. A legacy
+checkpoint-only record has no bound TLS configuration and is never combined
+with a new or substituted origin; the operator must reset or explicitly replace
+it. A separate legacy TLS configuration item from the earlier split-store
+implementation, if one is present, is left untouched: it is not read, migrated,
+or silently deleted. Migration is explicit reset/replacement into the single
+atomic record.
+
+The production screen also offers **Set Up Server** navigation and an
+always-visible **Reset Production Trust…** action. Reset is same-state checked
+under the shared lock: a stale window cannot delete a record that another
+window has replaced, and only the relevant or operator-typed deployment is
+targeted. A complete reset clears host/deployment/CA/pin/fingerprint/generation
+fields; a failed reset preserves the form/operator fields and the saved record
+so the reset can be inspected and retried. An unreadable record can be removed
+by an explicit reset when the target deployment is unambiguous; transient
+Keychain read failures fail closed without deleting anything. If multiple saved
+deployments exist and none is typed, reset refuses to guess and preserves all
+of them. Settings also offers **Review Production Trust…** to return to that
+screen after a successful setup.
+
+Remaining setup is intentionally out of band: the operator must obtain the CA,
+pin, hostname, deployment ID, key fingerprint, and generation through a trusted
+organization channel. There is still no automated CA comparison/cutover beyond
+the bootstrap screen and no verified live-server evidence in this checkpoint.
+Changing trust requires the explicit **Review Production Trust…** flow plus
+independent verification, replacement confirmation, or clearing saved trust; a
+future server-driven cutover workflow is still separate. The checkpoint and TLS
+configuration are one Keychain item, so there is no split write that can pair an
+old checkpoint with a new origin or vice versa. The shared lock makes
+concurrent record commits, replacements, and resets coherent. Crash and
+interrupted-write recovery, installed-app behavior, and live-server TLS evidence
+remain unverified in this source-only checkpoint. The lock cannot protect
+against a process that rewrites the Keychain item without using this store, so
+this source must remain the only production-trust record writer. A missing or
+legacy checkpoint-only record therefore blocks production connection rather than
+learning trust from the network.
 
 `AuthSignInCoordinator` owns causal generation fencing for sign-in, required
 code, inventory, and sign-out so stale completions cannot clear a newer

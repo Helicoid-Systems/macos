@@ -82,20 +82,31 @@ public final class ManagerSession: AuthSignInObserving {
         case .fixtures, .development:
             return true
         case .production:
-            return productionAuthClient != nil && authorityTrust != nil
+            return productionAuthClient?.isProductionPinned == true
+                && authorityTrust != nil
         }
+    }
+
+    /// True when the app must present the production trust setup screen.
+    public var requiresProductionBootstrap: Bool {
+        guard sessionMode == .production else { return false }
+        if !allowsConnect { return true }
+        return connectError == .identityChanged && authCoordinator?.session == nil
     }
 
     private let client: any ConnectionClient
     private let developmentClient: LoopbackDevelopmentClient?
-    private let productionAuthClient: NativeV2AuthClient?
+    private var productionAuthClient: NativeV2AuthClient?
     /// Persisted, independently confirmed deployment authority checkpoint.
     /// When supplied, production connect and sign-in require an exact match.
-    private let authorityTrust: ManagerAuthorityTrustStore?
+    private var authorityTrust: ManagerAuthorityTrustStore?
     /// Actual v2 sign-in state owner (causal generation fencing lives here).
     private var authCoordinator: AuthSignInCoordinator?
 
-    public init(
+    /// Internal seam for fixtures/previews/tests. Production launch uses the
+    /// checked `installProductionConnection` path; arbitrary injected clients do
+    /// not satisfy the production gates.
+    init(
         configuration: ManagerLaunchConfiguration = ManagerLaunchConfiguration(),
         client: (any ConnectionClient)? = nil,
         productionAuthClient: NativeV2AuthClient? = nil,
@@ -179,6 +190,87 @@ public final class ManagerSession: AuthSignInObserving {
             return "Production connection is closed until a saved deployment authority checkpoint is available."
         }
         return "Production connection is closed until a trusted server identity is available."
+    }
+
+    /// Install a verified production client and its saved authority checkpoint
+    /// store. The session must be on the immutable production path, and the
+    /// store must already contain a checkpoint for the client's deployment.
+    ///
+    /// This method does not fetch or adopt anything. The caller must complete the
+    /// independent CA/authority verification flow first and must build `client`
+    /// from the TLS identity bound in the same production trust record.
+    @discardableResult
+    public func installProductionConnection(
+        client: NativeV2AuthClient,
+        authorityTrust: ManagerAuthorityTrustStore,
+        serverAddress: String,
+        expectedRecord: ManagerAuthorityTrustRecord? = nil
+    ) async -> Bool {
+        guard sessionMode == .production,
+              self.productionAuthClient == nil,
+              self.authorityTrust == nil,
+              client.isProductionPinned else {
+            return false
+        }
+        let identity = client.trustedIdentity
+        guard !identity.deploymentID.isEmpty else { return false }
+        let saved: ManagerAuthorityTrustRecord?
+        do {
+            saved = try await authorityTrust.productionTrustRecord(
+                deploymentID: identity.deploymentID
+            )
+        } catch {
+            return false
+        }
+        // A legacy checkpoint-only record, a mixed record, or a record bound to
+        // a different host/port/CA/deployment must not install a production
+        // client. Core owns the full typed comparison.
+        guard let saved,
+              expectedRecord == nil || saved == expectedRecord else {
+            return false
+        }
+        do {
+            try saved.requireBoundTLSIdentity(identity)
+        } catch {
+            return false
+        }
+
+        self.productionAuthClient = client
+        self.authorityTrust = authorityTrust
+        self.authCoordinator = AuthSignInCoordinator(client: client)
+        self.authCoordinator?.observer = self
+        if !serverAddress.isEmpty {
+            self.serverAddress = serverAddress
+        }
+        presentationPreferenceScope = nil
+        connectError = nil
+        signInError = nil
+        authCodeError = nil
+        inventoryReloadError = nil
+        phase = .notConfigured
+        screen = .connect
+        bumpSessionGeneration()
+        return true
+    }
+
+    /// Detach a production client/store after a failed connect so the bootstrap
+    /// screen can review or replace trust. Never detaches a live session.
+    public func uninstallProductionConnection() {
+        guard sessionMode == .production,
+              authCoordinator?.session == nil,
+              productionAuthClient != nil,
+              authorityTrust != nil else {
+            return
+        }
+        productionAuthClient = nil
+        authorityTrust = nil
+        authCoordinator = nil
+        authCode = ""
+        password = ""
+        presentationPreferenceScope = nil
+        bumpSessionGeneration()
+        phase = .notConfigured
+        screen = .connect
     }
 
     /// Example edits exist only in the in-memory fixture session.
@@ -333,17 +425,24 @@ public final class ManagerSession: AuthSignInObserving {
                 detail: "No independently verified deployment authority checkpoint is saved. Complete out-of-band trust setup before connecting."
             )
         }
+        guard auth.isProductionPinned else {
+            return .authenticationFailed(
+                detail: "The production connection client is not pinned to the deployment CA. Complete production trust setup before connecting."
+            )
+        }
         do {
             // Fail before touching the authority endpoint when this deployment
-            // has no locally adopted checkpoint. Fetching alone would not adopt
-            // anything, but there is no reason to contact the server first.
-            let deploymentID = await auth.deploymentID
-            let saved = try await authorityTrust.savedCheckpoint(deploymentID: deploymentID)
-            guard saved != nil else {
+            // has no locally adopted checkpoint or no exact typed TLS binding.
+            // Fetching alone would not adopt anything, but there is no reason
+            // to contact the server first.
+            guard let record = try await authorityTrust.productionTrustRecord(
+                deploymentID: auth.trustedIdentity.deploymentID
+            ) else {
                 return .authenticationFailed(
-                    detail: "No independently verified deployment authority checkpoint is saved. Complete out-of-band trust setup before connecting."
+                    detail: "No atomically bound deployment TLS trust record is saved. Complete out-of-band production trust setup before connecting."
                 )
             }
+            try record.requireBoundTLSIdentity(auth.trustedIdentity)
             let observed = try await auth.fetchDeploymentAuthority()
             _ = try await authorityTrust.requireCurrent(observed)
             return nil

@@ -188,6 +188,11 @@ public final class PinnedHTTPSTransport: HTTPStatusTransport, @unchecked Sendabl
     /// Configured canonical origin. Only this origin may be addressed.
     public var originURL: URL { configuration.identity.originURL }
 
+    /// The complete TLS identity this transport actually pins. Callers that
+    /// accept a transport as a production gate must compare this whole value,
+    /// not merely the transport's type.
+    public var pinnedIdentity: DeploymentTLSIdentity { configuration.identity }
+
     /// Decoded body cap in force for this transport.
     public var maxResponseBytes: Int { configuration.maxResponseBytes }
 

@@ -94,6 +94,110 @@ public struct DeploymentAuthorityCheckpoint: Sendable, Hashable {
     }
 }
 
+/// One atomic production trust record: authority checkpoint plus the typed
+/// TLS configuration that was independently verified for that authority.
+///
+/// Both fields live in one Keychain item and are written together under the
+/// deployment authority lock. A checkpoint-only legacy record has
+/// `configurationData == nil` and must be reset rather than reused with a new
+/// or substituted origin.
+public struct ManagerAuthorityTrustRecord: Sendable, Equatable {
+    /// The encoded configuration is JSON containing a base64 CA DER, so leave
+    /// room for the 65,536-byte CA limit plus encoding overhead.
+    public static let maxConfigurationBytes = 131_072
+
+    public let checkpoint: DeploymentAuthorityCheckpoint
+    public let configurationData: Data?
+
+    public init(
+        checkpoint: DeploymentAuthorityCheckpoint,
+        configurationData: Data?
+    ) throws {
+        if let configurationData, configurationData.count > Self.maxConfigurationBytes {
+            throw HelicoidError.invalidInput(
+                field: "configuration_data",
+                detail: "The production trust configuration exceeded its size limit."
+            )
+        }
+        self.checkpoint = checkpoint
+        self.configurationData = configurationData
+    }
+}
+
+public enum ManagerTrustCommitResult: Sendable, Equatable {
+    case committed
+    case recordChanged
+    case confirmationMismatch
+    case transitionRefused
+}
+
+/// Raw state of one persisted production trust record. Used by explicit reset
+/// so an unreadable record can be deleted with a raw-byte compare-and-swap
+/// rather than an unconditional delete.
+public enum ManagerProductionTrustRecordState: Sendable, Equatable {
+    case absent
+    case present(ManagerAuthorityTrustRecord)
+    case unreadable(Data)
+}
+
+extension ManagerAuthorityTrustRecord {
+    /// Decode and validate the complete typed TLS binding stored in this record.
+    ///
+    /// A checkpoint-only record, a corrupt configuration, or a configuration
+    /// whose deployment does not match the checkpoint fails closed.
+    public func boundConfiguration() throws -> ManagerProductionTrustConfiguration {
+        guard let data = configurationData else {
+            throw HelicoidError.authenticationFailed(
+                detail: "The production trust record has no atomically bound TLS configuration. Reset production trust or explicitly replace it."
+            )
+        }
+        let configuration: ManagerProductionTrustConfiguration
+        do {
+            configuration = try ManagerProductionTrustConfiguration.decodeFromTrustRecord(data)
+        } catch {
+            throw HelicoidError.authenticationFailed(
+                detail: "The production trust record's TLS configuration could not be read. Reset production trust or explicitly replace it."
+            )
+        }
+        guard configuration.deploymentID == checkpoint.deploymentID else {
+            throw HelicoidError.authenticationFailed(
+                detail: "The saved production TLS configuration is not bound to the same deployment as its authority checkpoint. Reset production trust or explicitly replace it."
+            )
+        }
+        return configuration
+    }
+
+    /// Require this record to bind exactly the supplied pinned TLS identity,
+    /// including deployment ID, host, port, CA DER, and CA pin.
+    public func requireBoundTLSIdentity(_ identity: DeploymentTLSIdentity) throws {
+        guard try boundConfiguration().tlsIdentity == identity else {
+            throw HelicoidError.identityMismatch
+        }
+    }
+}
+
+/// An exact record expectation that a production trust commit must revalidate
+/// under the same lock as the proposed write. Callers use this to make a
+/// pre-network snapshot of several deployments coherent without gaining any
+/// general-purpose lock or write capability.
+public struct ManagerAuthorityTrustExpectation: Sendable, Equatable {
+    public let deploymentID: String
+    public let record: ManagerAuthorityTrustRecord?
+
+    public init(
+        deploymentID: String,
+        record: ManagerAuthorityTrustRecord?
+    ) throws {
+        self.deploymentID = try DeploymentAuthorityCheckpoint.canonicalDeploymentID(
+            deploymentID
+        )
+        if let record, record.checkpoint.deploymentID != self.deploymentID {
+            throw HelicoidError.identityMismatch
+        }
+        self.record = record
+    }
+}
+
 /// A separate, explicit operator confirmation of one authority tuple.
 ///
 /// Construct this only from values the operator entered or read through a
@@ -138,9 +242,10 @@ public struct ManagerAuthorityConfirmation: Sendable, Hashable {
     }
 }
 
-/// Durable, per-deployment Manager authority checkpoint.
+/// Durable, per-deployment Manager production trust record.
 ///
-/// The checkpoint is stored in the unlocked login Keychain with
+/// The checkpoint and its typed TLS configuration are stored together in one
+/// Keychain item. The item is stored in the unlocked login Keychain with
 /// `WhenUnlockedThisDeviceOnly` and is not synchronized. Every read, check, and
 /// write that participates in trust runs while holding one exclusive
 /// cross-process file lock. The lock file is in a private owner-only Manager
@@ -180,56 +285,59 @@ public actor ManagerAuthorityTrustStore {
     /// - Throws: `HelicoidError` when protected bytes are unreadable or invalid.
     ///   In that case the caller must not infer trust from the network.
     public func savedCheckpoint(deploymentID: String) async throws -> DeploymentAuthorityCheckpoint? {
+        try await productionTrustRecord(deploymentID: deploymentID)?.checkpoint
+    }
+
+    /// Read the single atomic production trust record for one deployment.
+    /// `configurationData == nil` denotes a legacy checkpoint-only record that
+    /// must not be reused with a substituted TLS configuration.
+    public func productionTrustRecord(
+        deploymentID: String
+    ) async throws -> ManagerAuthorityTrustRecord? {
         let account = try DeploymentAuthorityCheckpoint.canonicalDeploymentID(deploymentID)
         let lock = try await authorityLock.acquire()
         defer { lock.release() }
         try Self.throwIfCancelled()
-        return try await load(account: account)
+        return try await loadRecord(account: account)
     }
 
-    /// Adopt one observed tuple after a separate operator confirmation.
+    /// Read one record together with its raw bytes so an unreadable record can
+    /// later be deleted with an exact raw-byte compare-and-swap.
+    public func productionTrustRecordState(
+        deploymentID: String
+    ) async throws -> ManagerProductionTrustRecordState {
+        let account = try DeploymentAuthorityCheckpoint.canonicalDeploymentID(deploymentID)
+        let lock = try await authorityLock.acquire()
+        defer { lock.release() }
+        try Self.throwIfCancelled()
+        guard let data = try await keyStore.read(account: account) else {
+            return .absent
+        }
+        do {
+            return .present(try Self.decodeRecord(data, expectedDeploymentID: account))
+        } catch {
+            return .unreadable(data)
+        }
+    }
+
+    /// Adopt one checkpoint-only tuple after a separate operator confirmation.
     ///
-    /// The observed tuple must already have been read over the pinned deployment
-    /// origin. This method never fetches it, so an unauthenticated network reply
-    /// cannot create trust by itself.
-    ///
-    /// The whole read-check-write sequence is protected by the cross-process
-    /// lock. Additional writers that bypass this store are outside the threat
-    /// model; they are not made safe by a best-effort re-read.
-    ///
-    /// - Initial adoption: saves the tuple only when the confirmation matches all
-    ///   three fields.
-    /// - Existing checkpoint: a lower generation is refused, a same-generation
-    ///   key change is refused, and a higher generation replaces the tuple only
-    ///   with a fresh matching confirmation. An identical tuple is idempotent.
+    /// This compatibility API refuses config-bound production trust records;
+    /// those must be changed through `commitProductionTrustRecord` so the TLS
+    /// configuration cannot be separated from the checkpoint.
     @discardableResult
     public func adopt(
         _ observed: DeploymentAuthorityCheckpoint,
         confirmation: ManagerAuthorityConfirmation
     ) async throws -> DeploymentAuthorityCheckpoint {
-        try Self.requireConfirmation(confirmation, matches: observed)
-
         let lock = try await authorityLock.acquire()
         defer { lock.release() }
         try Self.throwIfCancelled()
-
-        if let current = try await load(account: observed.deploymentID) {
-            try Self.requireAllowedTransition(from: current, to: observed)
-            if current == observed {
-                return current
-            }
-        }
-        // Cancellation before the write must leave the old checkpoint intact.
-        try Self.throwIfCancelled()
-        try await write(observed)
-        return observed
+        return try await adoptLocked(observed, confirmation: confirmation)
     }
 
     /// Require the server's current authority to exactly match the saved
     /// checkpoint. Missing, rolled-back, or key-changed state fails closed.
-    ///
-    /// This is a point-in-time check. Callers should run it again before each
-    /// later protected operation rather than caching admission indefinitely.
     @discardableResult
     public func requireCurrent(
         _ observed: DeploymentAuthorityCheckpoint
@@ -237,66 +345,257 @@ public actor ManagerAuthorityTrustStore {
         let lock = try await authorityLock.acquire()
         defer { lock.release() }
         try Self.throwIfCancelled()
-        guard let saved = try await load(account: observed.deploymentID) else {
-            throw HelicoidError.identityMismatch
-        }
-        guard saved == observed else {
-            throw HelicoidError.identityMismatch
-        }
-        return saved
+        return try await requireCurrentLocked(observed)
     }
 
-    /// Remove local trust for one deployment. This is an explicit local recovery
-    /// action; it never substitutes network observation for a checkpoint.
-    public func clear(deploymentID: String) async throws {
+    /// Remove local trust for one deployment. Internal recovery only; production
+    /// reset goes through the same-state-checked delete APIs.
+    func clear(deploymentID: String) async throws {
+        let lock = try await authorityLock.acquire()
+        defer { lock.release() }
+        try Self.throwIfCancelled()
+        try await clearLocked(deploymentID: deploymentID)
+    }
+
+    /// Return every locally saved deployment checkpoint account. The caller can
+    /// use this to target recovery without deleting unrelated deployments.
+    public func savedDeploymentIDs() async throws -> [String] {
+        let lock = try await authorityLock.acquire()
+        defer { lock.release() }
+        try Self.throwIfCancelled()
+        // Ignore unrelated accounts that may have been placed under this
+        // Keychain service by an external writer or an older format.
+        return try await keyStore.allAccounts()
+            .filter {
+                (try? DeploymentAuthorityCheckpoint.canonicalDeploymentID($0)) != nil
+            }
+            .sorted()
+    }
+
+    /// Compare-and-swap one complete production trust record under the authority
+    /// lock. The checkpoint and typed TLS configuration are written as one
+    /// Keychain item; the store never persists them as two separately written
+    /// values.
+    ///
+    /// `alsoRequiring` lets a caller revalidate additional deployment records
+    /// that were part of the same pre-network snapshot. All checks and the write
+    /// happen under one lock; no lock object or unrestricted write capability is
+    /// exposed to the caller.
+    public func commitProductionTrustRecord(
+        _ proposed: ManagerAuthorityTrustRecord,
+        expected: ManagerAuthorityTrustRecord?,
+        alsoRequiring expectations: [ManagerAuthorityTrustExpectation] = [],
+        confirmation: ManagerAuthorityConfirmation?
+    ) async throws -> ManagerTrustCommitResult {
+        let account = try DeploymentAuthorityCheckpoint.canonicalDeploymentID(
+            proposed.checkpoint.deploymentID
+        )
+        guard account == proposed.checkpoint.deploymentID else {
+            return .recordChanged
+        }
+        // This is the atomic production trust writer. The typed TLS binding is
+        // validated in Core before anything is written: a checkpoint-only,
+        // corrupt, or mismatched configuration must never be persisted here.
+        do {
+            _ = try proposed.boundConfiguration()
+        } catch {
+            return .transitionRefused
+        }
+        if let expected,
+           expected.checkpoint.deploymentID != proposed.checkpoint.deploymentID {
+            return .recordChanged
+        }
+        for expectation in expectations
+        where expectation.deploymentID != account {
+            if let record = expectation.record,
+               record.checkpoint.deploymentID != expectation.deploymentID {
+                return .recordChanged
+            }
+        }
+
+        let lock = try await authorityLock.acquire()
+        defer { lock.release() }
+        try Self.throwIfCancelled()
+
+        let current = try await loadRecord(account: account)
+        guard current == expected else { return .recordChanged }
+
+        for expectation in expectations
+        where expectation.deploymentID != account {
+            let other = try await loadRecord(account: expectation.deploymentID)
+            guard other == expectation.record else { return .recordChanged }
+        }
+
+        if let confirmation {
+            do {
+                try Self.requireConfirmation(
+                    confirmation,
+                    matches: proposed.checkpoint
+                )
+            } catch {
+                return .confirmationMismatch
+            }
+            if let currentCheckpoint = current?.checkpoint {
+                do {
+                    try Self.requireAllowedTransition(
+                        from: currentCheckpoint,
+                        to: proposed.checkpoint
+                    )
+                } catch {
+                    return .transitionRefused
+                }
+            }
+        } else {
+            // Without a fresh confirmation the whole record, including the
+            // typed TLS configuration, must be unchanged. A caller may
+            // re-assert an already verified record but can never silently
+            // change the origin that is bound to an unchanged authority tuple.
+            guard current == proposed else {
+                return .transitionRefused
+            }
+        }
+
+        if current == proposed {
+            // A verified record can be re-asserted without an unnecessary
+            // Keychain write.
+            return .committed
+        }
+        try await writeRecord(proposed)
+        return .committed
+    }
+
+    /// Verify that the exact record still matches under the lock. No write.
+    public func verifyProductionTrustRecord(
+        _ expected: ManagerAuthorityTrustRecord?,
+        deploymentID: String
+    ) async throws -> Bool {
         let account = try DeploymentAuthorityCheckpoint.canonicalDeploymentID(deploymentID)
         let lock = try await authorityLock.acquire()
         defer { lock.release() }
         try Self.throwIfCancelled()
+        return try await loadRecord(account: account) == expected
+    }
+
+    /// Same-state-checked delete of one production trust record. Returns false
+    /// without deleting when the current record differs from `expected`.
+    public func deleteProductionTrustRecord(
+        deploymentID: String,
+        expected: ManagerAuthorityTrustRecord?
+    ) async throws -> Bool {
+        let account = try DeploymentAuthorityCheckpoint.canonicalDeploymentID(deploymentID)
+        let lock = try await authorityLock.acquire()
+        defer { lock.release() }
+        try Self.throwIfCancelled()
+        let current = try await loadRecord(account: account)
+        guard current == expected else { return false }
+        if current == nil { return true }
+        try await keyStore.delete(account: account)
+        return true
+    }
+
+    /// Delete one record only if its raw stored bytes still equal `expected`.
+    /// This is the recovery path for an unreadable record: it never deletes a
+    /// record that another process replaced after the state was observed.
+    public func deleteProductionTrustRecord(
+        deploymentID: String,
+        expectedRawBytes: Data?
+    ) async throws -> Bool {
+        let account = try DeploymentAuthorityCheckpoint.canonicalDeploymentID(deploymentID)
+        let lock = try await authorityLock.acquire()
+        defer { lock.release() }
+        try Self.throwIfCancelled()
+        let current = try await keyStore.read(account: account)
+        guard current == expectedRawBytes else { return false }
+        if current == nil { return true }
+        try await keyStore.delete(account: account)
+        return true
+    }
+
+    // MARK: - Locked helpers
+
+    private func adoptLocked(
+        _ observed: DeploymentAuthorityCheckpoint,
+        confirmation: ManagerAuthorityConfirmation
+    ) async throws -> DeploymentAuthorityCheckpoint {
+        try Self.requireConfirmation(confirmation, matches: observed)
+        if let current = try await loadRecord(account: observed.deploymentID) {
+            guard current.configurationData == nil else {
+                throw HelicoidError.authenticationFailed(
+                    detail: "This deployment has an atomic TLS-bound trust record. Use the atomic production trust record API to change it."
+                )
+            }
+            try Self.requireAllowedTransition(from: current.checkpoint, to: observed)
+            if current.checkpoint == observed {
+                return current.checkpoint
+            }
+        }
+        try Self.throwIfCancelled()
+        let record = try ManagerAuthorityTrustRecord(
+            checkpoint: observed,
+            configurationData: nil
+        )
+        try await writeRecord(record)
+        return observed
+    }
+
+    private func requireCurrentLocked(
+        _ observed: DeploymentAuthorityCheckpoint
+    ) async throws -> DeploymentAuthorityCheckpoint {
+        guard let saved = try await loadRecord(account: observed.deploymentID) else {
+            throw HelicoidError.identityMismatch
+        }
+        guard saved.checkpoint == observed else {
+            throw HelicoidError.identityMismatch
+        }
+        return saved.checkpoint
+    }
+
+    private func clearLocked(deploymentID: String) async throws {
+        let account = try DeploymentAuthorityCheckpoint.canonicalDeploymentID(deploymentID)
         try await keyStore.delete(account: account)
     }
 
-    // MARK: - Internal validation and persistence
-
-    private func load(account: String) async throws -> DeploymentAuthorityCheckpoint? {
+    private func loadRecord(account: String) async throws -> ManagerAuthorityTrustRecord? {
         guard let data = try await keyStore.read(account: account) else {
             return nil
         }
-        return try Self.decode(data, expectedDeploymentID: account)
+        return try Self.decodeRecord(data, expectedDeploymentID: account)
     }
 
-    /// Write only while the caller holds the authority lock. The caller has
-    /// already validated the transition against the current checkpoint.
-    private func write(_ checkpoint: DeploymentAuthorityCheckpoint) async throws {
+    private func writeRecord(_ record: ManagerAuthorityTrustRecord) async throws {
         let stored = StoredManagerAuthorityCheckpoint(
-            version: 1,
-            deploymentID: checkpoint.deploymentID,
-            grantSigningPublicKeyHex: checkpoint.grantSigningPublicKeyHex,
-            authorityGeneration: checkpoint.authorityGeneration
+            version: 2,
+            deploymentID: record.checkpoint.deploymentID,
+            grantSigningPublicKeyHex: record.checkpoint.grantSigningPublicKeyHex,
+            authorityGeneration: record.checkpoint.authorityGeneration,
+            configurationData: record.configurationData
         )
         let data: Data
         do {
             data = try JSONEncoder().encode(stored)
         } catch {
             throw HelicoidError.authenticationFailed(
-                detail: "The deployment authority checkpoint could not be encoded. It was not saved."
+                detail: "The production trust record could not be encoded. It was not saved."
             )
         }
 
-        let account = checkpoint.deploymentID
+        let account = record.checkpoint.deploymentID
         if try await keyStore.insertIfAbsent(data, account: account) {
             return
         }
         try await keyStore.update(data, account: account)
     }
 
-    private static func decode(
+    private static func decodeRecord(
         _ data: Data,
         expectedDeploymentID: String
-    ) throws -> DeploymentAuthorityCheckpoint {
-        guard let stored = try? JSONDecoder().decode(StoredManagerAuthorityCheckpoint.self, from: data),
-              stored.version == 1,
-              stored.deploymentID == expectedDeploymentID else {
+    ) throws -> ManagerAuthorityTrustRecord {
+        guard let stored = try? JSONDecoder().decode(
+            StoredManagerAuthorityCheckpoint.self,
+            from: data
+        ),
+        (stored.version == 1 || stored.version == 2),
+        stored.deploymentID == expectedDeploymentID else {
             throw HelicoidError.identityMismatch
         }
         do {
@@ -308,7 +607,10 @@ public actor ManagerAuthorityTrustStore {
             guard checkpoint.deploymentID == expectedDeploymentID else {
                 throw HelicoidError.identityMismatch
             }
-            return checkpoint
+            return try ManagerAuthorityTrustRecord(
+                checkpoint: checkpoint,
+                configurationData: stored.configurationData
+            )
         } catch {
             throw HelicoidError.identityMismatch
         }
@@ -627,6 +929,7 @@ protocol ManagerAuthorityKeyStoring: Sendable {
     func insertIfAbsent(_ bytes: Data, account: String) async throws -> Bool
     func update(_ bytes: Data, account: String) async throws
     func delete(account: String) async throws
+    func allAccounts() async throws -> [String]
 }
 
 private struct StoredManagerAuthorityCheckpoint: Codable {
@@ -634,6 +937,7 @@ private struct StoredManagerAuthorityCheckpoint: Codable {
     let deploymentID: String
     let grantSigningPublicKeyHex: String
     let authorityGeneration: UInt64
+    let configurationData: Data?
 }
 
 private actor KeychainManagerAuthorityKeyStore: ManagerAuthorityKeyStoring {
@@ -679,6 +983,30 @@ private actor KeychainManagerAuthorityKeyStore: ManagerAuthorityKeyStoring {
     func delete(account: String) throws {
         let status = SecItemDelete(query(account: account) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw failure() }
+    }
+
+    func allAccounts() throws -> [String] {
+        let request: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.service,
+            kSecAttrSynchronizable as String: false,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(request as CFDictionary, &item)
+        if status == errSecItemNotFound { return [] }
+        guard status == errSecSuccess, let item else { throw failure() }
+        if let rows = item as? [Any] {
+            return rows.compactMap { row in
+                (row as? [String: Any])?[kSecAttrAccount as String] as? String
+            }
+        }
+        if let row = item as? [String: Any],
+           let account = row[kSecAttrAccount as String] as? String {
+            return [account]
+        }
+        throw failure()
     }
 
     private func failure() -> HelicoidError {

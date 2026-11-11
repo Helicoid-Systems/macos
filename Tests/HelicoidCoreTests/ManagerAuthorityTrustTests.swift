@@ -81,6 +81,8 @@ private actor AuthorityKeyFixtureStore: ManagerAuthorityKeyStoring {
         deletions += 1
     }
 
+    func allAccounts() -> [String] { Array(values.keys) }
+
     func setFailReads(_ value: Bool) { failReads = value }
     func setFailWrites(_ value: Bool) { failWrites = value }
     func seed(_ bytes: Data, account: String) { values[account] = bytes }
@@ -134,6 +136,8 @@ private actor GatedAuthorityKeyStore: ManagerAuthorityKeyStoring {
     func delete(account: String) throws {
         values.removeValue(forKey: account)
     }
+
+    func allAccounts() -> [String] { Array(values.keys) }
 }
 
 private func makeCheckpoint(
@@ -814,6 +818,147 @@ struct DeploymentAuthorityObservationTests {
 
         await #expect(throws: HelicoidError.self) {
             try await client.fetchDeploymentAuthority()
+        }
+    }
+}
+
+@Suite("Production Core TLS binding gates")
+struct ManagerProductionTLSBindingTests {
+    private func makeStore() -> ManagerAuthorityTrustStore {
+        ManagerAuthorityTrustStore(
+            keyStore: AuthorityKeyFixtureStore(),
+            authorityLock: NoopAuthorityLock()
+        )
+    }
+
+    private func seedAtomicRecord(
+        _ store: ManagerAuthorityTrustStore,
+        identity: DeploymentTLSIdentity,
+        checkpoint: DeploymentAuthorityCheckpoint
+    ) async throws -> ManagerAuthorityTrustRecord {
+        let configuration = ManagerProductionTrustConfiguration(tlsIdentity: identity)
+        let record = try ManagerAuthorityTrustRecord(
+            checkpoint: checkpoint,
+            configurationData: try configuration.encodedForTrustRecord()
+        )
+        let result = try await store.commitProductionTrustRecord(
+            record,
+            expected: nil,
+            confirmation: try operatorConfirmation(
+                generation: checkpoint.authorityGeneration
+            )
+        )
+        #expect(result == .committed)
+        return record
+    }
+
+    @Test("makeVerifiedClient refuses a substituted TLS origin")
+    func makeVerifiedClientRefusesSubstitutedOrigin() async throws {
+        let store = makeStore()
+        let checkpoint = try makeCheckpoint(generation: 7)
+        let identity = try await makePinnedIdentity(deploymentID: authorityDeploymentID)
+        _ = try await seedAtomicRecord(store, identity: identity, checkpoint: checkpoint)
+        let substituted = try DeploymentTLSIdentity(
+            deploymentID: identity.deploymentID,
+            host: "other.example",
+            port: identity.port,
+            caDER: identity.caDER,
+            caFingerprintSHA256: identity.caFingerprintSHA256
+        )
+        let connection = ManagerProductionConnection(
+            tlsIdentity: substituted,
+            authorityTrust: store
+        )
+
+        await #expect(throws: HelicoidError.self) {
+            _ = try await connection.makeVerifiedClient(
+                signingIdentity: try makeManagerSigningIdentity()
+            )
+        }
+    }
+
+    @Test("makeVerifiedClient refuses a substituted deployment CA")
+    func makeVerifiedClientRefusesSubstitutedCA() async throws {
+        let store = makeStore()
+        let checkpoint = try makeCheckpoint(generation: 7)
+        let identity = try await makePinnedIdentity(deploymentID: authorityDeploymentID)
+        _ = try await seedAtomicRecord(store, identity: identity, checkpoint: checkpoint)
+        let material = try await TLSTestHarness.sharedMaterial()
+        let substituted = try DeploymentTLSIdentity(
+            deploymentID: identity.deploymentID,
+            host: identity.host,
+            port: identity.port,
+            caDER: material.foreignCADER,
+            caFingerprintSHA256: DeploymentTLSIdentity.sha256Hex(material.foreignCADER)
+        )
+        let connection = ManagerProductionConnection(
+            tlsIdentity: substituted,
+            authorityTrust: store
+        )
+
+        await #expect(throws: HelicoidError.self) {
+            _ = try await connection.makeVerifiedClient(
+                signingIdentity: try makeManagerSigningIdentity()
+            )
+        }
+    }
+
+    @Test("Observation factory refuses a genuine pinned transport for another identity")
+    func observationFactoryRefusesPinnedTransportIdentityMismatch() async throws {
+        let store = makeStore()
+        let checkpoint = try makeCheckpoint(generation: 7)
+        let pinned = try await makePinnedIdentity(deploymentID: authorityDeploymentID)
+        let claimed = try DeploymentTLSIdentity(
+            deploymentID: pinned.deploymentID,
+            host: "claimed.example",
+            port: pinned.port,
+            caDER: pinned.caDER,
+            caFingerprintSHA256: pinned.caFingerprintSHA256
+        )
+        _ = try await seedAtomicRecord(
+            store,
+            identity: claimed,
+            checkpoint: checkpoint
+        )
+        let configuration = try PinnedHTTPSConfiguration(identity: pinned)
+        let transport = try PinnedHTTPSTransport(configuration: configuration)
+        let signingIdentity = try makeManagerSigningIdentity()
+        let client = NativeV2AuthClient(
+            transport: transport,
+            trustedAuthority: claimed,
+            signingIdentity: signingIdentity
+        )
+        #expect(!client.isProductionPinned)
+
+        await #expect(throws: HelicoidError.self) {
+            _ = try await ManagerObservationLeaseClient.make(
+                authClient: client,
+                tlsIdentity: claimed,
+                authorityTrust: store,
+                signingIdentity: signingIdentity
+            )
+        }
+        #expect(transport.activeOperationCount == 0)
+    }
+
+    @Test("makeVerifiedClient refuses a checkpoint-only record")
+    func makeVerifiedClientRefusesCheckpointOnly() async throws {
+        let store = makeStore()
+        let checkpoint = try makeCheckpoint(generation: 7)
+        _ = try await store.adopt(
+            checkpoint,
+            confirmation: try operatorConfirmation(generation: 7)
+        )
+        let identity = try await makePinnedIdentity(deploymentID: authorityDeploymentID)
+        let connection = ManagerProductionConnection(
+            tlsIdentity: identity,
+            authorityTrust: store
+        )
+
+        await #expect(throws: HelicoidError.self) {
+            _ = try await connection.makeVerifiedClient(
+                signingIdentity: try makeManagerSigningIdentity()
+            )
         }
     }
 }

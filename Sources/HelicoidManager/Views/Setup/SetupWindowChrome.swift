@@ -5,17 +5,20 @@ import SwiftUI
 struct SetupWindowChrome: NSViewRepresentable {
     var screen: ManagerSession.Screen
     var setupHeight: CGFloat
+    var showsProductionTrust: Bool = false
 
     func makeNSView(context: Context) -> WindowChromeView {
         let view = WindowChromeView()
         view.screen = screen
         view.setupHeight = setupHeight
+        view.showsProductionTrust = showsProductionTrust
         return view
     }
 
     func updateNSView(_ nsView: WindowChromeView, context: Context) {
         nsView.screen = screen
         nsView.setupHeight = setupHeight
+        nsView.showsProductionTrust = showsProductionTrust
         nsView.applyChrome()
     }
 
@@ -41,9 +44,11 @@ enum WindowCentering {
 final class WindowChromeView: NSView {
     var screen: ManagerSession.Screen = .connect
     var setupHeight: CGFloat = 280
+    var showsProductionTrust = false
     private var appliedSetupHeight: CGFloat?
     private weak var styledWindow: NSWindow?
     private var appliedScreen: ManagerSession.Screen?
+    private var appliedShowsProductionTrust = false
     private var savedTitleVisibility: NSWindow.TitleVisibility = .visible
     private var savedTransparency = false
     private var savedFullSizeContent = false
@@ -66,9 +71,13 @@ final class WindowChromeView: NSView {
             savedSeparatorStyle = window.titlebarSeparatorStyle
             WindowCloseAnimator.attach(to: window)
         }
-        guard firstAppearance || appliedScreen != screen || appliedSetupHeight != setupHeight else { return }
+        guard firstAppearance
+            || appliedScreen != screen
+            || appliedSetupHeight != setupHeight
+            || appliedShowsProductionTrust != showsProductionTrust else { return }
         appliedScreen = screen
         appliedSetupHeight = setupHeight
+        appliedShowsProductionTrust = showsProductionTrust
 
         let inventory = screen == .computers
         window.titleVisibility = inventory ? .visible : .hidden
@@ -82,7 +91,14 @@ final class WindowChromeView: NSView {
 
         let size: NSSize
         switch screen {
-        case .connect: window.title = "Connect"; size = NSSize(width: 620, height: 300)
+        case .connect:
+            if showsProductionTrust {
+                window.title = "Production Connection"
+                size = NSSize(width: 640, height: 620)
+            } else {
+                window.title = "Connect"
+                size = NSSize(width: 620, height: 300)
+            }
         case .signIn: window.title = "Sign In"; size = NSSize(width: 620, height: 440)
         case .verify: window.title = "Verify Server"; size = NSSize(width: 680, height: 520)
         case .guidedSetup: window.title = "Server Setup"; size = NSSize(width: 680, height: setupHeight)
