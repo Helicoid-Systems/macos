@@ -9,6 +9,10 @@ set -euo pipefail
 HELPER_NAME="hs-server"
 HELPER_RELATIVE_PATH="Contents/Helpers/hs-server"
 EVIDENCE_RELATIVE_PATH="Contents/Resources/hs-server-development.json"
+RELEASE_EVIDENCE_RELATIVE_PATH="Contents/Resources/hs-server-release.json"
+RELEASE_PACKAGE_RELATIVE_PATH="Contents/Resources/ServerPackage"
+DEVELOPMENT_INSTALL_EVIDENCE_RELATIVE_PATH="Contents/Resources/hs-server-development-install.json"
+DEVELOPMENT_INSTALL_PACKAGE_RELATIVE_PATH="Contents/Resources/ServerPackage/development"
 MANAGER_RELATIVE_PATH="Contents/MacOS/HelicoidManager"
 SCHEMA_VERSION=1
 
@@ -34,8 +38,8 @@ source binary is never modified.
 VERSION is the Manager's minimum macOS version (for example 15.0); every helper
 slice must target that version or older. verify checks the staged evidence
 digest, architecture compatibility, ad-hoc signature, and the containing app's
-deep signature. assert-absent fails if either development-only artifact is
-present.
+deep signature. assert-absent fails if either development-only artifact, a
+release evidence/package payload, or a development install payload is present.
 USAGE
 }
 
@@ -122,14 +126,42 @@ evidence_path() { printf '%s/%s' "$1" "$EVIDENCE_RELATIVE_PATH"; }
 
 assert_absent_paths() {
   local app_path="$1"
-  local helper evidence
+  local helper evidence release_evidence release_package
+  local development_install_evidence development_install_package
   helper="$(helper_path "$app_path")"
   evidence="$(evidence_path "$app_path")"
+  release_evidence="$app_path/$RELEASE_EVIDENCE_RELATIVE_PATH"
+  release_package="$app_path/$RELEASE_PACKAGE_RELATIVE_PATH"
+  development_install_evidence="$app_path/$DEVELOPMENT_INSTALL_EVIDENCE_RELATIVE_PATH"
+  development_install_package="$app_path/$DEVELOPMENT_INSTALL_PACKAGE_RELATIVE_PATH"
   if [ -e "$helper" ] || [ -L "$helper" ]; then
     fail "refusing to overwrite existing helper: $helper (use a fresh HELICOID_DIST_DIR)"
   fi
   if [ -e "$evidence" ] || [ -L "$evidence" ]; then
     fail "refusing to overwrite existing evidence: $evidence (use a fresh HELICOID_DIST_DIR)"
+  fi
+  # A stale release payload would be trusted by the Manager if it survived a
+  # rebuild. Refuse it in the development packaging path instead of silently
+  # carrying it forward.
+  if [ -e "$release_evidence" ] || [ -L "$release_evidence" ]; then
+    fail "refusing pre-existing release helper evidence: $release_evidence (use a fresh HELICOID_DIST_DIR)"
+  fi
+  if [ -e "$release_package" ] || [ -L "$release_package" ]; then
+    fail "refusing pre-existing signed server package: $release_package (use a fresh HELICOID_DIST_DIR)"
+  fi
+  if [ -e "$development_install_evidence" ] || [ -L "$development_install_evidence" ]; then
+    fail "refusing pre-existing development install evidence: $development_install_evidence (use a fresh HELICOID_DIST_DIR)"
+  fi
+  if [ -e "$development_install_package" ] || [ -L "$development_install_package" ]; then
+    fail "refusing pre-existing development install package: $development_install_package (use a fresh HELICOID_DIST_DIR)"
+  fi
+  if [ -f "$app_path/Contents/Info.plist" ] \
+    && /usr/bin/plutil -extract HelicoidServerDevelopmentInstall raw "$app_path/Contents/Info.plist" >/dev/null 2>&1; then
+    fail "refusing pre-existing development install Info.plist pin: $app_path/Contents/Info.plist (use a fresh HELICOID_DIST_DIR)"
+  fi
+  if [ -f "$app_path/Contents/Info.plist" ] \
+    && /usr/bin/plutil -extract HelicoidServerDevelopmentTrustKey raw "$app_path/Contents/Info.plist" >/dev/null 2>&1; then
+    fail "refusing pre-existing development trust-key Info.plist pin: $app_path/Contents/Info.plist (use a fresh HELICOID_DIST_DIR)"
   fi
 }
 

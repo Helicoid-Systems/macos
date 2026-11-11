@@ -65,7 +65,7 @@ public enum HelicoidError: Error, Hashable, Sendable {
         case .hostIdentityUnverified:
             "Verify the SSH host identity before any write. A changed key or refusal performs no writes."
         case .installNotAvailable:
-            "Installation is not performed by this build. Server packages are not integrated, so setup will not claim a successful install."
+            "Installation is not performed until a signed server package and independent release trust root are present. Setup will not claim a successful install."
         case .unreachable:
             "The address did not answer. Check the server address and that the Helicoid server is running."
         case .cancelled:

@@ -38,6 +38,13 @@ jobs:
         run: |
           ./scripts/tests/hs-server-helper-tests.sh
 
+      - name: Validate development installer bundle scripts
+        run: |
+          bash -n scripts/build.sh
+          bash -n scripts/hs-server-helper.sh
+          bash -n scripts/hs-server-development-bundle.sh
+          bash -n scripts/tests/hs-server-helper-tests.sh
+
       - name: Build release
         run: |
           xcrun swift build -c release --package-path .

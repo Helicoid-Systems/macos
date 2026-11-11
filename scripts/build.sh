@@ -1,7 +1,13 @@
 #!/bin/bash
 # Build and package the legacy Helicoid Manager and retained Computer app.
-# Independent of sibling repositories: only reads under apps/macos, except for an
-# optional operator-supplied development hs-server helper path (see README).
+# Independent of sibling repositories: only reads under apps/macos, except for
+# optional operator-supplied development hs-server artifacts (see README).
+#
+# Development install bundle (disposable machines only):
+#   HELICOID_HS_SERVER_PATH=/abs/hs-server
+#   HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR=/abs/signed-macos-package
+#   HELICOID_MACOS_DEV_TRUST_KEY=<64-hex build-pinned key>
+# A helper without a package remains development packaging only.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,6 +34,34 @@ if [ -n "${HELICOID_HS_SERVER_PATH+x}" ]; then
       exit 1
       ;;
   esac
+fi
+
+HS_SERVER_DEVELOPMENT_PACKAGE_DIR=""
+HS_SERVER_DEVELOPMENT_TRUST_KEY=""
+if [ -n "${HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR+x}" ]; then
+  HS_SERVER_DEVELOPMENT_PACKAGE_DIR="${HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR:-}"
+  HS_SERVER_DEVELOPMENT_TRUST_KEY="${HELICOID_MACOS_DEV_TRUST_KEY:-}"
+  if [ -z "$HS_SERVER_DEVELOPMENT_PACKAGE_DIR" ] \
+    || [ -z "$HS_SERVER_DEVELOPMENT_TRUST_KEY" ]; then
+    echo "ERROR: development install requires both HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR and HELICOID_MACOS_DEV_TRUST_KEY." >&2
+    exit 1
+  fi
+  if [ -z "$HS_SERVER_HELPER_SOURCE" ]; then
+    echo "ERROR: development install requires HELICOID_HS_SERVER_PATH to the matching macos-dev-install helper." >&2
+    exit 1
+  fi
+  case "$HS_SERVER_DEVELOPMENT_PACKAGE_DIR" in
+    /*) ;;
+    *)
+      echo "ERROR: HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR must be an absolute path." >&2
+      exit 1
+      ;;
+  esac
+  if ! printf '%s' "$HS_SERVER_DEVELOPMENT_TRUST_KEY" \
+    | /usr/bin/grep -Eq '^[0-9a-fA-F]{64}$'; then
+    echo "ERROR: HELICOID_MACOS_DEV_TRUST_KEY must be 64 hex characters." >&2
+    exit 1
+  fi
 fi
 
 echo "== Helicoid macOS build =="
@@ -178,7 +212,14 @@ PLIST
   fi
   /usr/bin/plutil -replace CFBundleIconFile -string AppIcon "$app/Contents/Info.plist"
   if [ "$binary" = "HelicoidManager" ]; then
-    if [ -n "$helper_source" ]; then
+    if [ -n "$HS_SERVER_DEVELOPMENT_PACKAGE_DIR" ]; then
+      "$ROOT/scripts/hs-server-development-bundle.sh" package \
+        --helper "$helper_source" \
+        --package-dir "$HS_SERVER_DEVELOPMENT_PACKAGE_DIR" \
+        --trust-key "$HS_SERVER_DEVELOPMENT_TRUST_KEY" \
+        --app "$app" \
+        --minimum-macos "$minimum_system_version"
+    elif [ -n "$helper_source" ]; then
       "$ROOT/scripts/hs-server-helper.sh" package \
         --source "$helper_source" \
         --app "$app" \
@@ -189,7 +230,9 @@ PLIST
   /usr/bin/codesign --verify --deep --strict "$app"
 
   if [ "$binary" = "HelicoidManager" ]; then
-    if [ -n "$helper_source" ]; then
+    if [ -n "$HS_SERVER_DEVELOPMENT_PACKAGE_DIR" ]; then
+      "$ROOT/scripts/hs-server-development-bundle.sh" verify --app "$app"
+    elif [ -n "$helper_source" ]; then
       "$ROOT/scripts/hs-server-helper.sh" verify --app "$app"
     else
       "$ROOT/scripts/hs-server-helper.sh" assert-absent --app "$app"
@@ -211,7 +254,10 @@ package_app "Helicoid Computer" "HelicoidComputer" \
   "HS App icon.icon" \
   "$COMPUTER_BIN" "13.0"
 
-if [ -n "$HS_SERVER_HELPER_SOURCE" ]; then
-  echo "== Development hs-server helper included in Manager (not installed or launched) =="
+if [ -n "$HS_SERVER_DEVELOPMENT_PACKAGE_DIR" ]; then
+  echo "== DEVELOPMENT-ONLY pinned hs-server install payload included in Manager =="
+  echo "== Not a release trust root, notarization, or production acceptance =="
+elif [ -n "$HS_SERVER_HELPER_SOURCE" ]; then
+  echo "== Development hs-server helper included in Manager (install disabled) =="
 fi
 echo "== Done. Apps in $DIST_DIR =="

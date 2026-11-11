@@ -1,0 +1,745 @@
+# Development-only Manager + server helper/package build for macOS.
+#
+# This workflow builds, from source, an ad-hoc-signed Helicoid Manager app that
+# contains the server's `macos-dev-install` helper and its signed development
+# package. It is NOT a release pipeline: there is no release trust root,
+# Developer ID signature, notarization, or production acceptance here. Do not
+# distribute the resulting archive as a production build.
+#
+# Reproducibility: the server and core refs are pinned below, but the Manager
+# ref is the triggering ref. A dispatch from another Manager ref can still
+# produce a different archive, so this is not a reproducible release input.
+# The server CI/acceptance for the pinned SHA is tracked separately and is not
+# claimed by this workflow.
+#
+# The non-privileged server development-feature tests gate this build. The
+# privileged install/rollback acceptance remains in the server repository's
+# separate `macos-installer-acceptance` workflow and is not run here.
+#
+# A new workflow file cannot be dispatched from the default branch before it is
+# merged. The narrow push trigger below makes the first branch-only run
+# possible without widening the workflow to pull requests or other branches.
+# `workflow_dispatch` remains available once this file reaches the default
+# branch.
+#
+# Builds and tests run only in GitHub Actions. Never run the development
+# installer/acceptance paths on a developer machine.
+
+name: Development Manager (macOS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/macos-native-combined
+    paths:
+      - '.github/workflows/development-manager.yml'
+      - 'scripts/build.sh'
+      - 'scripts/hs-server-helper.sh'
+      - 'scripts/hs-server-development-bundle.sh'
+      - 'Sources/HelicoidCore/Setup/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: development-manager-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-development-manager:
+    name: Build development Manager and hs-server package
+    # Development artifacts only for the canonical repository on github.com.
+    if: ${{ github.repository == 'Helicoid-Systems/macos' && github.server_url == 'https://github.com' && github.event.repository.fork == false }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Require GitHub-hosted macOS runner
+        run: |
+          set -euo pipefail
+          test "${RUNNER_ENVIRONMENT:-}" = "github-hosted" || {
+            echo "::error::This development build requires a GitHub-hosted runner."
+            exit 1
+          }
+          test "$(uname -s)" = "Darwin" || {
+            echo "::error::This development build requires macOS."
+            exit 1
+          }
+
+      - name: Checkout Manager (macos)
+        uses: actions/checkout@v4
+        with:
+          path: macos
+          persist-credentials: false
+
+      # Pinned server commit. Do not replace this with a branch: the server ref
+      # must move only by an explicit commit change so the archive remains
+      # traceable. The prior candidate's first acceptance run failed before
+      # checkout on a guard/cleanup working-directory issue; this pin is the
+      # fixed successor and is binary-identical to the prior server commit.
+      # No server CI/acceptance success is claimed by this workflow.
+      - name: Checkout pinned server
+        uses: actions/checkout@v4
+        with:
+          repository: Helicoid-Systems/server
+          ref: 520d1b00c19bbbc4177d06c26f1e7e6e4651ec85
+          path: server
+          persist-credentials: false
+
+      - name: Checkout pinned core
+        uses: actions/checkout@v4
+        with:
+          repository: Helicoid-Systems/core
+          ref: 5d3f98eaad86330010e1bdaf4731189b286e0dbe
+          path: core
+          persist-credentials: false
+
+      - name: Verify pinned server and core commits
+        run: |
+          set -euo pipefail
+          server_sha="$(git -C server rev-parse HEAD)"
+          core_sha="$(git -C core rev-parse HEAD)"
+          test "$server_sha" = "520d1b00c19bbbc4177d06c26f1e7e6e4651ec85" || {
+            echo "::error::Server checkout is $server_sha, not the pinned commit."
+            exit 1
+          }
+          test "$core_sha" = "5d3f98eaad86330010e1bdaf4731189b286e0dbe" || {
+            echo "::error::Core checkout is $core_sha, not the pinned commit."
+            exit 1
+          }
+          echo "Server commit: $server_sha"
+          echo "Core commit: $core_sha"
+
+      - name: Select Xcode with Swift 6.2+
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_26.4.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.4.app/Contents/Developer
+          elif [ -d /Applications/Xcode_26.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+          else
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          fi
+          xcodebuild -version
+          swift --version > "$RUNNER_TEMP/swift-version.txt"
+          cat "$RUNNER_TEMP/swift-version.txt"
+
+          swift_version="$(python3 - "$RUNNER_TEMP/swift-version.txt" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          match = re.search(r"Swift version ([0-9]+)\.([0-9]+)", text)
+          if match is None:
+              raise SystemExit("could not determine the Swift version")
+          print(f"{match.group(1)}.{match.group(2)}")
+          PY
+          )"
+          test -n "$swift_version" || {
+            echo "::error::Could not determine the Swift version."
+            exit 1
+          }
+          python3 - "$swift_version" <<'PY'
+          import sys
+
+          major, minor = map(int, sys.argv[1].split("."))
+          if (major, minor) < (6, 2):
+              raise SystemExit(f"Swift 6.2+ is required; found {sys.argv[1]}")
+          print(f"Swift {sys.argv[1]} satisfies the >= 6.2 requirement")
+          PY
+
+          (cd macos && swift package dump-package >/dev/null)
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install OpenSSL 3 with Ed25519 support
+        run: |
+          set -euo pipefail
+          brew install openssl@3
+          openssl_prefix="$(brew --prefix openssl@3)"
+          test -x "$openssl_prefix/bin/openssl"
+          "$openssl_prefix/bin/openssl" version
+          "$openssl_prefix/bin/openssl" pkeyutl -help 2>&1 | grep -a -- '-rawin' >/dev/null
+          echo "HELICOID_OPENSSL=$openssl_prefix/bin/openssl" >> "$GITHUB_ENV"
+
+      - name: Generate ephemeral pinned development Ed25519 key
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          work="$RUNNER_TEMP/helicoid-development"
+          key_dir="$work/key"
+          mkdir -m 0700 -p "$work" "$key_dir"
+          chmod 0700 "$work" "$key_dir"
+
+          key="$key_dir/signing-key.pem"
+          der="$key_dir/public-key.der"
+
+          "$HELICOID_OPENSSL" genpkey -algorithm ED25519 -out "$key"
+          chmod 0600 "$key"
+          test -f "$key"
+          test ! -L "$key"
+          test "$(stat -f '%Lp' "$key")" = "600"
+          test "$(stat -f '%l' "$key" | tr -d ' ')" = "1"
+
+          "$HELICOID_OPENSSL" pkey -in "$key" -pubout -outform DER -out "$der"
+          chmod 0600 "$der"
+          test "$(wc -c < "$der" | tr -d ' ')" = "44"
+
+          key_hex="$(python3 - "$der" <<'PY'
+          import sys
+          from pathlib import Path
+
+          raw = Path(sys.argv[1]).read_bytes()
+          if len(raw) != 44 or raw[:12] != bytes.fromhex("302a300506032b6570032100"):
+              raise SystemExit("unexpected Ed25519 SubjectPublicKeyInfo")
+          print(raw[-32:].hex())
+          PY
+          )"
+          [[ "$key_hex" =~ ^[0-9a-f]{64}$ ]]
+          rm -f -- "$der"
+
+          # Only the public key is exported. The private key stays at the fixed
+          # RUNNER_TEMP path and is removed immediately after the package
+          # manifest is signed; the always-run cleanup step is only a fallback.
+          echo "HELICOID_DEVELOPMENT_WORK=$work" >> "$GITHUB_ENV"
+          echo "HELICOID_MACOS_DEV_TRUST_KEY=$key_hex" >> "$GITHUB_ENV"
+
+          echo "Generated development Ed25519 key at the fixed RUNNER_TEMP path (public key pinned for this run)."
+
+      - name: Validate packaging scripts (syntax only)
+        run: |
+          set -euo pipefail
+          bash -n macos/scripts/build.sh
+          bash -n macos/scripts/hs-server-helper.sh
+          bash -n macos/scripts/hs-server-development-bundle.sh
+          bash -n server/scripts/package-macos-development.sh
+
+      # Non-privileged development-feature tests, mirroring the server's own
+      # macOS CI selection. These gate the build before any app is packaged.
+      # The privileged install/rollback acceptance is a separate server workflow.
+      - name: Gate server development-feature tests
+        working-directory: server
+        run: |
+          set -euo pipefail
+          test -n "${HELICOID_MACOS_DEV_TRUST_KEY:-}"
+          HELICOID_MACOS_DEV_TRUST_KEY="$HELICOID_MACOS_DEV_TRUST_KEY" \
+            cargo test --locked \
+              --features macos-dev-install \
+              --lib \
+              --test installer_macos_plan \
+              --test installer_macos_capabilities \
+              --test installer_macos_launchd \
+              --test installer_macos_dev_install
+
+      - name: Build and ad-hoc sign development hs-server
+        working-directory: server
+        run: |
+          set -euo pipefail
+          test -n "${HELICOID_MACOS_DEV_TRUST_KEY:-}"
+          test -n "${HELICOID_DEVELOPMENT_WORK:-}"
+
+          HELICOID_MACOS_DEV_TRUST_KEY="$HELICOID_MACOS_DEV_TRUST_KEY" \
+            cargo build --locked --release --features macos-dev-install
+
+          server_bin="target/release/hs-server"
+          test -x "$server_bin"
+          /usr/bin/codesign --force --sign - "$server_bin"
+          /usr/bin/codesign --verify --strict "$server_bin"
+
+          # Gate on the compile feature being active. This is a capability
+          # check, not a claim that the privileged install/rollback acceptance
+          # has run; that remains a separate server workflow.
+          "$server_bin" installer capabilities-v2 \
+            > "$HELICOID_DEVELOPMENT_WORK/hs-server-capabilities.json"
+
+          python3 - "$HELICOID_DEVELOPMENT_WORK/hs-server-capabilities.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              capabilities = json.load(handle)
+
+          if capabilities.get("contract_version") != 2:
+              raise SystemExit("installer capabilities contract_version is not 2")
+          actions = capabilities.get("supported_actions")
+          if not isinstance(actions, list) or "install" not in actions or "cancel" not in actions:
+              raise SystemExit(f"macos-dev-install feature is not active: {actions!r}")
+          if "macos_launchd" not in capabilities.get("supported_deployment_kinds", []):
+              raise SystemExit("installer does not advertise macos_launchd")
+          if "loopback_development" not in capabilities.get("supported_network_scopes", []):
+              raise SystemExit("installer does not advertise loopback_development")
+          if capabilities.get("durable_operation_journal") is not True:
+              raise SystemExit("macos-dev-install did not enable the durable operation journal")
+          if capabilities.get("cancellation") is not True:
+              raise SystemExit("macos-dev-install did not enable cancellation")
+          reason = capabilities.get("reasons_unavailable", {}).get("macos_launchd", "")
+          if "development-only" not in reason:
+              raise SystemExit("capabilities do not identify the development-only install path")
+          print("Validated macos-dev-install capabilities:", ", ".join(actions))
+          PY
+
+      - name: Package and sign exact development hs-server package
+        run: |
+          set -euo pipefail
+          work="$HELICOID_DEVELOPMENT_WORK"
+          key_path="$RUNNER_TEMP/helicoid-development/key/signing-key.pem"
+          key_dir="$(dirname "$key_path")"
+          server_bin="$GITHUB_WORKSPACE/server/target/release/hs-server"
+          package_dir="$work/hs-server-package"
+          test ! -e "$package_dir"
+          test -f "$key_path"
+          test ! -L "$key_path"
+          test "$(stat -f '%Lp' "$key_path")" = "600"
+
+          cleanup_signing_key() {
+            rm -f -- "$key_path" "$key_dir/public-key.der"
+            rmdir "$key_dir" 2>/dev/null || true
+          }
+          trap cleanup_signing_key EXIT
+
+          version="$(python3 - "$GITHUB_WORKSPACE/server/Cargo.toml" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          match = re.search(r'(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', text)
+          if match is None:
+              raise SystemExit("cannot read the server package version from Cargo.toml")
+          print(match.group(1))
+          PY
+          )"
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+
+          case "$(uname -m)" in
+            arm64) platform="macos-arm64" ;;
+            x86_64) platform="macos-x86_64" ;;
+            *) echo "::error::unsupported macOS runner architecture"; exit 1 ;;
+          esac
+
+          HELICOID_OPENSSL="$HELICOID_OPENSSL" \
+            "$GITHUB_WORKSPACE/server/scripts/package-macos-development.sh" \
+            "$server_bin" "$version" "$platform" \
+            "$key_path" "$package_dir" \
+            | tee "$work/package.out"
+
+          # The private key has served its only purpose. Remove it before the
+          # Manager build and before any artifact scan.
+          cleanup_signing_key
+          trap - EXIT
+
+          packaged_hex="$(sed -n 's/^verification_key_hex=//p' "$work/package.out")"
+          test "$packaged_hex" = "$HELICOID_MACOS_DEV_TRUST_KEY"
+
+          test -d "$package_dir"
+          test ! -L "$package_dir"
+          test -f "$package_dir/manifest.json"
+          test -f "$package_dir/manifest.sig"
+          test -x "$package_dir/artifacts/hs-server"
+
+          echo "HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR=$package_dir" >> "$GITHUB_ENV"
+          echo "HELICOID_DEVELOPMENT_PLATFORM=$platform" >> "$GITHUB_ENV"
+          echo "Packaged development hs-server $version for $platform."
+
+      - name: Build full development Manager app
+        working-directory: macos
+        env:
+          HELICOID_HS_SERVER_PATH: ${{ github.workspace }}/server/target/release/hs-server
+          HELICOID_DIST_DIR: ${{ github.workspace }}/macos/dist
+        run: |
+          set -euo pipefail
+          test -n "${HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR:-}"
+          test -n "${HELICOID_MACOS_DEV_TRUST_KEY:-}"
+          # The private key was removed immediately after package signing; only
+          # the public build pin remains for the Manager.
+          if [ -e "$RUNNER_TEMP/helicoid-development/key/signing-key.pem" ]; then
+            echo "::error::Private signing key still present before the Manager build."
+            exit 1
+          fi
+          # Pin the helper, its exact signed package, and the Manager Info.plist
+          # trust key to the key generated for this run.
+          export HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR
+          export HELICOID_MACOS_DEV_TRUST_KEY
+          ./scripts/build.sh
+
+      - name: Validate exact helper, package, feature pin, and app output
+        working-directory: macos
+        run: |
+          set -euo pipefail
+
+          app="$PWD/dist/Helicoid Manager.app"
+          helper="$app/Contents/Helpers/hs-server"
+          package="$app/Contents/Resources/ServerPackage/development/package"
+          server_bin="$GITHUB_WORKSPACE/server/target/release/hs-server"
+
+          test -d "$app"
+          test -x "$app/Contents/MacOS/HelicoidManager"
+          test -f "$helper"
+          test -x "$helper"
+          test -x "$server_bin"
+
+          if [ ! -d "$package" ]; then
+            echo "::error::Manager development package is missing at $package."
+            echo "::error::Expected exactly Contents/Resources/ServerPackage/development/package (Manager contract)."
+            if [ -d "$app/Contents/Resources/ServerPackage/development" ]; then
+              echo "::error::Found a package at Contents/Resources/ServerPackage/development instead; the packaging step must create the nested package directory."
+            fi
+            exit 1
+          fi
+
+          # Re-run the repository's development-only bundle verifier.
+          ./scripts/hs-server-development-bundle.sh verify --app "$app"
+
+          # Independently verify the signed package manifest using only the
+          # public build pin. The private key was already removed.
+          verify_dir="$(mktemp -d "$HELICOID_DEVELOPMENT_WORK/verify.XXXXXX")"
+          python3 - "$HELICOID_MACOS_DEV_TRUST_KEY" "$verify_dir/public.pem" <<'PY'
+          import base64
+          import sys
+          import textwrap
+          from pathlib import Path
+
+          key_hex = sys.argv[1]
+          if len(bytes.fromhex(key_hex)) != 32:
+              raise SystemExit("development trust key is not 32 bytes")
+          der = bytes.fromhex("302a300506032b6570032100" + key_hex)
+          body = "\n".join(textwrap.wrap(base64.b64encode(der).decode("ascii"), 64))
+          pem = "-----BEGIN PUBLIC KEY-----\n" + body + "\n-----END PUBLIC KEY-----\n"
+          Path(sys.argv[2]).write_text(pem, encoding="ascii")
+          PY
+          "$HELICOID_OPENSSL" pkeyutl -verify -pubin -inkey "$verify_dir/public.pem" \
+            -rawin -in "$package/manifest.json" -sigfile "$package/manifest.sig"
+
+          /usr/bin/codesign --verify --deep --strict "$app"
+
+          python3 - \
+            "$app" "$helper" "$package" "$server_bin" \
+            "$HELICOID_MACOS_DEV_TRUST_KEY" "$HELICOID_DEVELOPMENT_PLATFORM" \
+            "$GITHUB_WORKSPACE/server/Cargo.toml" <<'PY'
+          import hashlib
+          import json
+          import os
+          import plistlib
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          app = Path(sys.argv[1])
+          helper = Path(sys.argv[2])
+          package = Path(sys.argv[3])
+          server_bin = Path(sys.argv[4])
+          trust_key = sys.argv[5].lower()
+          platform = sys.argv[6]
+          cargo_toml = Path(sys.argv[7])
+
+          def fail(message):
+              raise SystemExit(f"development Manager validation failed: {message}")
+
+          def regular_file(path, label, executable=False):
+              try:
+                  info = path.lstat()
+              except OSError as error:
+                  fail(f"{label} is unavailable: {path}: {error}")
+              if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                  fail(f"{label} is not a regular non-symlink file: {path}")
+              if info.st_nlink != 1:
+                  fail(f"{label} must have exactly one link: {path}")
+              if executable and not os.access(path, os.X_OK):
+                  fail(f"{label} is not executable: {path}")
+              return info
+
+          def directory(path, label):
+              try:
+                  info = path.lstat()
+              except OSError as error:
+                  fail(f"{label} is unavailable: {path}: {error}")
+              if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                  fail(f"{label} is not a non-symlink directory: {path}")
+              return info
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with open(path, "rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def strict_version(value):
+              parts = str(value).split(".")
+              return (len(parts) == 3
+                      and all(part.isdigit() and (part == "0" or not part.startswith("0"))
+                              for part in parts))
+
+          if len(bytes.fromhex(trust_key)) != 32:
+              fail("trust key is not a 32-byte Ed25519 key")
+          key_sha = hashlib.sha256(bytes.fromhex(trust_key)).hexdigest()
+
+          # Exact signed package shape and content.
+          directory(package, "development package")
+          if sorted(os.listdir(package)) != ["artifacts", "manifest.json", "manifest.sig"]:
+              fail("development package root is not exactly artifacts, manifest.json, manifest.sig")
+          artifacts = package / "artifacts"
+          directory(artifacts, "development package artifacts")
+          if sorted(os.listdir(artifacts)) != ["hs-server"]:
+              fail("development package artifacts must contain exactly hs-server")
+
+          manifest_path = package / "manifest.json"
+          signature_path = package / "manifest.sig"
+          regular_file(manifest_path, "manifest.json")
+          sig_info = regular_file(signature_path, "manifest.sig")
+          if sig_info.st_size != 64:
+              fail("manifest.sig is not exactly 64 bytes")
+
+          manifest_bytes = manifest_path.read_bytes()
+          try:
+              manifest = json.loads(manifest_bytes)
+          except Exception as error:
+              fail(f"manifest.json is not valid JSON: {error}")
+
+          if manifest.get("format_version") != 1:
+              fail("manifest format_version is not 1")
+          if manifest.get("product") != "hs-server":
+              fail("manifest product is not hs-server")
+          if not strict_version(manifest.get("version")):
+              fail("manifest version is not strict major.minor.patch")
+          if not strict_version(manifest.get("min_installer_version")):
+              fail("manifest min_installer_version is not strict major.minor.patch")
+          if not isinstance(manifest.get("min_schema_version"), int) \
+                  or not 1 <= manifest["min_schema_version"] <= 1_000_000:
+              fail("manifest min_schema_version is invalid")
+          if manifest.get("platform") != platform:
+              fail(f"manifest platform {manifest.get('platform')!r} is not {platform!r}")
+
+          artifact = manifest.get("artifacts")
+          if not isinstance(artifact, list) or len(artifact) != 1:
+              fail("manifest must declare exactly one artifact")
+          artifact = artifact[0]
+          if artifact.get("path") != "artifacts/hs-server":
+              fail("manifest artifact path is not artifacts/hs-server")
+
+          artifact_path = artifacts / "hs-server"
+          artifact_info = regular_file(artifact_path, "package artifact", executable=True)
+          artifact_sha = sha256(artifact_path)
+          if artifact_sha != str(artifact.get("sha256", "")).lower():
+              fail("package artifact digest does not match the signed manifest")
+          if artifact_info.st_size != artifact.get("size_bytes"):
+              fail("package artifact size does not match the signed manifest")
+
+          # The package artifact is the exact ad-hoc-signed server binary that
+          # was built in this run.
+          server_info = regular_file(server_bin, "server binary", executable=True)
+          if artifact_sha != sha256(server_bin):
+              fail("package artifact is not the server binary built in this run")
+          if artifact_info.st_size != server_info.st_size:
+              fail("package artifact size does not match the built server binary")
+
+          cargo_text = cargo_toml.read_text(encoding="utf-8")
+          cargo_version = re.search(
+              r'(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', cargo_text)
+          if cargo_version is None:
+              fail("cannot read the server package version from Cargo.toml")
+          if manifest["version"] != cargo_version.group(1):
+              fail("manifest version does not match the server Cargo.toml version")
+
+          manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+
+          # The packaged helper must be exactly the helper the evidence binds.
+          regular_file(helper, "packaged helper", executable=True)
+
+          # Build-time development pin in the Manager itself.
+          with open(app / "Contents/Info.plist", "rb") as handle:
+              info = plistlib.load(handle)
+          if info.get("HelicoidServerDevelopmentInstall") is not True:
+              fail("Manager Info.plist does not request the development install path")
+          if str(info.get("HelicoidServerDevelopmentTrustKey", "")).lower() != trust_key:
+              fail("Manager Info.plist trust key does not equal the build pin")
+          if info.get("CFBundleIdentifier") != "systems.helicoid.manager.dev":
+              fail("Manager bundle identifier is not the development identifier")
+
+          # Development evidence binds the exact helper, package, manifest, and
+          # pinned key.
+          evidence_path = app / "Contents/Resources/hs-server-development-install.json"
+          regular_file(evidence_path, "development install evidence")
+          evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+          expected_values = {
+              "schema": 1,
+              "mode": "development-install",
+              "developmentOnly": True,
+              "distributionSigned": False,
+              "installationEnabled": True,
+              "helperPath": "Contents/Helpers/hs-server",
+              "packageDirectory": "Contents/Resources/ServerPackage/development/package",
+              "packageArtifactPath": "artifacts/hs-server",
+              "packageProduct": "hs-server",
+              "packageVersion": manifest["version"],
+              "packageTarget": platform,
+          }
+          for name, expected in expected_values.items():
+              if evidence.get(name) != expected:
+                  fail(f"development evidence {name} is {evidence.get(name)!r}, expected {expected!r}")
+          if evidence.get("helperSha256") != sha256(helper):
+              fail("development evidence helper digest does not match the packaged helper")
+          if evidence.get("packageManifestSha256") != manifest_sha:
+              fail("development evidence manifest digest does not match the signed manifest")
+          if evidence.get("packageArtifactSha256") != artifact_sha:
+              fail("development evidence artifact digest does not match the package")
+          if evidence.get("packageArtifactSizeBytes") != artifact_info.st_size:
+              fail("development evidence artifact size does not match the package")
+          if str(evidence.get("verificationKeyHex", "")).lower() != trust_key:
+              fail("development evidence key does not equal the build pin")
+          if str(evidence.get("verificationKeySha256", "")).lower() != key_sha:
+              fail("development evidence key fingerprint is incorrect")
+
+          # Exact helper evidence: the packaged helper is the signed copy of
+          # this run's server binary.
+          helper_evidence_path = app / "Contents/Resources/hs-server-development.json"
+          regular_file(helper_evidence_path, "helper evidence")
+          helper_evidence = json.loads(helper_evidence_path.read_text(encoding="utf-8"))
+          if helper_evidence.get("path") != "Contents/Helpers/hs-server":
+              fail("helper evidence names an unexpected path")
+          if helper_evidence.get("developmentOnly") is not True:
+              fail("helper evidence is not development-only")
+          if helper_evidence.get("installationEnabled") is not False:
+              fail("helper evidence incorrectly enables installation")
+          if helper_evidence.get("serviceEnabled") is not False:
+              fail("helper evidence incorrectly enables the service")
+          if helper_evidence.get("signature") != "ad-hoc":
+              fail("helper evidence does not record the ad-hoc signature")
+          if helper_evidence.get("sourceSHA256") != sha256(server_bin):
+              fail("helper evidence source digest is not this run's server binary")
+          if helper_evidence.get("includedSHA256") != sha256(helper):
+              fail("helper evidence digest does not match the packaged helper")
+
+          # The development payload must be clearly separated from release
+          # payloads. The Manager prefers release evidence when it exists.
+          for release_path in (
+              app / "Contents/Resources/hs-server-release.json",
+              app / "Contents/Resources/ServerPackage/package",
+          ):
+              if release_path.exists() or release_path.is_symlink():
+                  fail(f"release payload unexpectedly present: {release_path}")
+
+          # Manager contract: the exact signed package lives at
+          # Contents/Resources/ServerPackage/development/package. Do not weaken
+          # this to accept a package directly at .../development.
+          server_package_root = app / "Contents/Resources/ServerPackage"
+          directory(server_package_root, "ServerPackage root")
+          if sorted(os.listdir(server_package_root)) != ["development"]:
+              fail("ServerPackage root must contain only the development directory")
+          if sorted(os.listdir(server_package_root / "development")) != ["package"]:
+              fail("development payload must be exactly ServerPackage/development/package")
+
+          print(f"Validated development helper sha256={sha256(helper)}")
+          print(f"Validated development package manifest sha256={manifest_sha}")
+          print(f"Validated development artifact sha256={artifact_sha}")
+          print(f"Validated pinned development key fingerprint sha256={key_sha}")
+          PY
+
+      - name: Create development Manager zip archive preserving modes
+        working-directory: macos
+        run: |
+          set -euo pipefail
+          app="$PWD/dist/Helicoid Manager.app"
+          archive="$PWD/dist/Helicoid-Manager-development.zip"
+          extract="$(mktemp -d "$HELICOID_DEVELOPMENT_WORK/zip-check.XXXXXX")"
+
+          rm -f "$archive"
+
+          # ditto preserves executable modes and bundle structure. The archive
+          # is deliberately named as a development build.
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
+          test -s "$archive"
+          /usr/bin/unzip -t "$archive" >/dev/null
+
+          /usr/bin/ditto -x -k "$archive" "$extract"
+          test -x "$extract/Helicoid Manager.app/Contents/MacOS/HelicoidManager"
+          test -x "$extract/Helicoid Manager.app/Contents/Helpers/hs-server"
+          test -x "$extract/Helicoid Manager.app/Contents/Resources/ServerPackage/development/package/artifacts/hs-server"
+          /usr/bin/codesign --verify --deep --strict "$extract/Helicoid Manager.app"
+
+          # The archive must never contain the ephemeral private key or its PEM
+          # representation. The key was already removed before this point.
+          for marker in \
+            '-----BEGIN PRIVATE KEY-----' \
+            '-----BEGIN ENCRYPTED PRIVATE KEY-----' \
+            '-----BEGIN RSA PRIVATE KEY-----' \
+            '-----BEGIN EC PRIVATE KEY-----' \
+            '-----BEGIN OPENSSH PRIVATE KEY-----'; do
+            if matches="$(grep -R -a -l -F -- "$marker" "$extract/Helicoid Manager.app")"; then
+              echo "::error::Private key marker found in the Manager app: $matches"
+              exit 1
+            fi
+          done
+          key_file="$(find "$extract/Helicoid Manager.app" -type f -name 'signing-key.pem' -print -quit)"
+          if [ -n "$key_file" ]; then
+            echo "::error::The ephemeral private key file is present in the Manager app: $key_file"
+            exit 1
+          fi
+          if /usr/bin/unzip -p "$archive" \
+              | grep -a -E -- '-----BEGIN (ENCRYPTED |RSA |EC |OPENSSH )?PRIVATE KEY-----' >/dev/null; then
+            echo "::error::Private key marker found in the development Manager archive."
+            exit 1
+          fi
+
+          echo "Created $archive."
+          shasum -a 256 "$archive"
+
+      - name: Upload development Manager archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: helicoid-manager-development-macos
+          path: macos/dist/Helicoid-Manager-development.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record development-only artifact label
+        if: always()
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/macos/dist/Helicoid-Manager-development.zip"
+          if [ ! -f "$archive" ]; then
+            echo "No development Manager archive was produced; skipping the development-only summary."
+            exit 0
+          fi
+
+          {
+            echo "## DEVELOPMENT ONLY — Helicoid Manager"
+            echo ""
+            echo "This artifact is an ad-hoc-signed development build containing the"
+            echo "\`macos-dev-install\` server helper and signed development package."
+            echo "It is **not** a release, not notarized, and not for distribution."
+            echo ""
+            echo "- Manager ref: \`${GITHUB_REF_NAME}\` at \`${GITHUB_SHA}\`"
+            echo "- Server commit: \`520d1b00c19bbbc4177d06c26f1e7e6e4651ec85\`"
+            echo "- Server CI/acceptance for that commit: not claimed by this workflow."
+            if [ -d core/.git ]; then
+              echo "- Core commit: \`$(git -C core rev-parse HEAD)\`"
+            fi
+            echo "- Reproducibility: server and core are pinned, but the Manager ref is the triggering ref; this archive is not a reproducible release input."
+            echo "- Gates: non-privileged server development-feature tests and Manager Swift tests. Privileged install/rollback acceptance is a separate server workflow."
+            echo "- Feature probe: \`installer capabilities-v2\` asserted install/cancel, macos_launchd, loopback_development, the durable journal, and cancellation; full acceptance is not claimed."
+            echo "- Archive: \`Helicoid-Manager-development.zip\`"
+            echo "- Archive SHA-256: \`$(shasum -a 256 "$archive" | awk '{print $1}')\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::DEVELOPMENT ONLY: ad-hoc-signed Manager with macos-dev-install helper/package; not a release or notarized build."
+
+      - name: Remove ephemeral development signing key
+        if: always()
+        run: |
+          set -euo pipefail
+          # Predictable fixed path only. The package step removes the key
+          # immediately after signing; this is the fallback for an early
+          # failure during key generation.
+          key_dir="$RUNNER_TEMP/helicoid-development/key"
+          rm -f -- "$key_dir/signing-key.pem" "$key_dir/public-key.der"
+          rmdir "$key_dir" 2>/dev/null || true
+          test ! -e "$key_dir/signing-key.pem" || {
+            echo "::error::Failed to remove the ephemeral private key."
+            exit 1
+          }
+          echo "Removed ephemeral development signing key material (if present)."

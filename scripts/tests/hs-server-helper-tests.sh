@@ -8,6 +8,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HELPER_SCRIPT="$ROOT/scripts/hs-server-helper.sh"
+DEVELOPMENT_BUNDLE_SCRIPT="$ROOT/scripts/hs-server-development-bundle.sh"
 SCRATCH="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/helicoid-helper-tests.XXXXXX")"
 LOG="$SCRATCH/last-command.log"
 PASS_COUNT=0
@@ -79,6 +80,34 @@ printf '#!/bin/sh\nexit 0\n' > "$SCRATCH/script"
 /usr/bin/xcrun vtool -arch "$OTHER_ARCH" -set-build-version macos 16.0 26.0 \
   -replace -output "$SCRATCH/universal-too-new" "$SCRATCH/universal-bad"
 
+# A capabilities-only Mach-O fixture for the development install packager.
+/bin/cat > "$SCRATCH/hs-server-dev.c" <<'C_EOF'
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv) {
+  if (argc == 3 && strcmp(argv[1], "installer") == 0 &&
+      strcmp(argv[2], "capabilities-v2") == 0) {
+    puts("{\"contract_version\":2,"
+         "\"supported_deployment_kinds\":[\"macos_launchd\"],"
+         "\"supported_network_scopes\":[\"loopback_development\"],"
+         "\"supported_actions\":[\"preflight\",\"plan\",\"install\"],"
+         "\"custom_storage_directories\":false,"
+         "\"durable_operation_journal\":true,"
+         "\"cancellation\":true,"
+         "\"online_update\":false,"
+         "\"backup_and_restore\":false,"
+         "\"public_edge_integration\":false,"
+         "\"reasons_unavailable\":{}}");
+    return 0;
+  }
+  return 0;
+}
+C_EOF
+/usr/bin/xcrun clang -mmacosx-version-min=15.0 -arch "$HOST_ARCH" \
+  "$SCRATCH/hs-server-dev.c" -o "$SCRATCH/hs-server-dev" \
+  || fail_test "could not build capabilities fixture"
+/bin/chmod 755 "$SCRATCH/hs-server-dev"
+
 new_app() {
   local app_path="$1"
   /bin/mkdir -p "$app_path/Contents/MacOS" "$app_path/Contents/Resources"
@@ -113,6 +142,38 @@ check_file() {
 
 sha_of() { /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'; }
 
+case "$HOST_ARCH" in
+  arm64) DEV_PLATFORM="macos-arm64" ;;
+  x86_64) DEV_PLATFORM="macos-x86_64" ;;
+  *) fail_test "unsupported host architecture for development fixture" ;;
+esac
+DEV_PACKAGE="$SCRATCH/dev-package"
+/bin/mkdir -p "$DEV_PACKAGE/artifacts"
+/bin/cp "$SCRATCH/valid-host" "$DEV_PACKAGE/artifacts/hs-server"
+/bin/chmod 755 "$DEV_PACKAGE/artifacts/hs-server"
+DEV_ARTIFACT_SIZE="$(/usr/bin/stat -f '%z' "$DEV_PACKAGE/artifacts/hs-server")"
+DEV_ARTIFACT_SHA="$(sha_of "$DEV_PACKAGE/artifacts/hs-server")"
+/bin/cat > "$DEV_PACKAGE/manifest.json" <<EOF
+{
+  "format_version": 1,
+  "product": "hs-server",
+  "version": "0.1.0",
+  "platform": "$DEV_PLATFORM",
+  "min_schema_version": 1,
+  "min_installer_version": "0.1.0",
+  "artifacts": [
+    {
+      "path": "artifacts/hs-server",
+      "sha256": "$DEV_ARTIFACT_SHA",
+      "size_bytes": $DEV_ARTIFACT_SIZE
+    }
+  ]
+}
+EOF
+/bin/chmod 644 "$DEV_PACKAGE/manifest.json"
+/usr/bin/dd if=/dev/zero of="$DEV_PACKAGE/manifest.sig" bs=64 count=1 2>/dev/null
+/bin/chmod 644 "$DEV_PACKAGE/manifest.sig"
+
 assert_evidence() {
   local app_path="$1" source_path="$2"
   local evidence="$app_path/Contents/Resources/hs-server-development.json"
@@ -139,6 +200,34 @@ expect_success "default app has no helper" \
   "$HELPER_SCRIPT" assert-absent --app "$APP"
 expect_success "assert-absent accepts a not-yet-created app path" \
   "$HELPER_SCRIPT" assert-absent --app "$SCRATCH/Fresh.app"
+expect_success "development bundle assert-absent accepts a fresh app path" \
+  "$DEVELOPMENT_BUNDLE_SCRIPT" assert-absent --app "$SCRATCH/FreshBundle.app"
+
+DEVELOPMENT_APP="$SCRATCH/DevelopmentBundle.app"
+new_app "$DEVELOPMENT_APP"
+DEV_KEY_HEX="$(printf 'a%.0s' {1..64})"
+expect_success "packages development install bundle at the exact package path" \
+  "$DEVELOPMENT_BUNDLE_SCRIPT" package \
+  --helper "$SCRATCH/hs-server-dev" \
+  --package-dir "$DEV_PACKAGE" \
+  --trust-key "$DEV_KEY_HEX" \
+  --app "$DEVELOPMENT_APP" \
+  --minimum-macos 15.0
+DEV_EVIDENCE="$DEVELOPMENT_APP/Contents/Resources/hs-server-development-install.json"
+[ -f "$DEVELOPMENT_APP/Contents/Resources/ServerPackage/development/package/manifest.json" ] \
+  || fail_test "development package was not placed at ServerPackage/development/package"
+[ -f "$DEVELOPMENT_APP/Contents/Resources/ServerPackage/development/package/artifacts/hs-server" ] \
+  || fail_test "development package artifact missing from exact path"
+[ ! -e "$DEVELOPMENT_APP/Contents/Resources/ServerPackage/development/manifest.json" ] \
+  || fail_test "development package was incorrectly placed directly under development"
+[ "$(/usr/bin/plutil -extract packageDirectory raw "$DEV_EVIDENCE")" = \
+  "Contents/Resources/ServerPackage/development/package" ] \
+  || fail_test "development evidence packageDirectory is not the exact runtime path"
+[ "$(/usr/bin/plutil -extract HelicoidServerDevelopmentInstall raw "$DEVELOPMENT_APP/Contents/Info.plist")" = "true" ] \
+  || fail_test "development Info.plist install pin missing"
+[ "$(/usr/bin/plutil -extract HelicoidServerDevelopmentTrustKey raw "$DEVELOPMENT_APP/Contents/Info.plist")" = "$DEV_KEY_HEX" ] \
+  || fail_test "development Info.plist trust key missing or wrong"
+pass "development bundle uses the exact ServerPackage/development/package path"
 expect_success "check-source accepts a valid helper" \
   check_file "$SCRATCH/valid-host" "$APP"
 expect_failure "check-source rejects a missing helper" \
@@ -249,6 +338,45 @@ expect_failure "assert-absent refuses pre-existing evidence" \
 [ "$EVIDENCE_SHA" = "$(sha_of "$EVIDENCE_APP/Contents/Resources/hs-server-development.json")" ] \
   || fail_test "assert-absent changed pre-existing evidence"
 pass "assert-absent does not change pre-existing evidence"
+
+# A stale release payload must not survive development repackaging.
+RELEASE_APP="$SCRATCH/Release.app"
+new_app "$RELEASE_APP"
+printf '{"schema":1}\n' > "$RELEASE_APP/Contents/Resources/hs-server-release.json"
+expect_failure "package refuses pre-existing release evidence" \
+  package_file "$SCRATCH/valid-host" "$RELEASE_APP"
+expect_failure "assert-absent refuses pre-existing release evidence" \
+  "$HELPER_SCRIPT" assert-absent --app "$RELEASE_APP"
+[ ! -e "$RELEASE_APP/Contents/Helpers/hs-server" ] \
+  || fail_test "partially packaged helper was left behind with release evidence"
+[ -f "$RELEASE_APP/Contents/Resources/hs-server-release.json" ] \
+  || fail_test "pre-existing release evidence was deleted"
+/bin/rm -f "$RELEASE_APP/Contents/Resources/hs-server-release.json"
+/bin/mkdir -p "$RELEASE_APP/Contents/Resources/ServerPackage"
+expect_failure "package refuses pre-existing signed server package" \
+  package_file "$SCRATCH/valid-host" "$RELEASE_APP"
+expect_failure "assert-absent refuses pre-existing signed server package" \
+  "$HELPER_SCRIPT" assert-absent --app "$RELEASE_APP"
+[ ! -e "$RELEASE_APP/Contents/Helpers/hs-server" ] \
+  || fail_test "partially packaged helper was left behind with release package"
+[ -d "$RELEASE_APP/Contents/Resources/ServerPackage" ] \
+  || fail_test "pre-existing signed package directory was deleted"
+pass "stale release payload is refused and preserved"
+
+# Development install payloads are also refused on a repackage.
+DEV_INSTALL_APP="$SCRATCH/DevelopmentInstall.app"
+new_app "$DEV_INSTALL_APP"
+/bin/mkdir -p "$DEV_INSTALL_APP/Contents/Resources/ServerPackage/development"
+/usr/bin/plutil -insert HelicoidServerDevelopmentInstall -bool YES \
+  "$DEV_INSTALL_APP/Contents/Info.plist" >/dev/null 2>&1 \
+  || fail_test "could not add development install fixture pin"
+expect_failure "assert-absent refuses a development install payload" \
+  "$HELPER_SCRIPT" assert-absent --app "$DEV_INSTALL_APP"
+expect_failure "development bundle assert-absent refuses the same payload" \
+  "$DEVELOPMENT_BUNDLE_SCRIPT" assert-absent --app "$DEV_INSTALL_APP"
+[ -d "$DEV_INSTALL_APP/Contents/Resources/ServerPackage/development" ] \
+  || fail_test "assert-absent deleted the development install fixture"
+pass "development install payload is refused and preserved"
 
 # A symlinked bundle directory is refused instead of writing through it.
 SYMLINK_APP="$SCRATCH/Symlink.app"

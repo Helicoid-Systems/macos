@@ -29,6 +29,14 @@ struct GuidedSetupView: View {
                     .padding(8)
                     .background(.yellow.opacity(0.25))
             }
+            if model.isDevelopmentInstall {
+                Label("DEVELOPMENT ONLY — build-pinned dev key and disposable self-signed TLS; not a production release trust root",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.callout.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(8)
+                    .background(.orange.opacity(0.20))
+            }
             if session.showDevelopmentBanner {
                 DevelopmentBanner()
             }
@@ -56,22 +64,25 @@ struct GuidedSetupView: View {
             HStack(spacing: 12) {
                 Button("Cancel") {
                     model.reset()
-                    withAnimation(.easeOut(duration: 0.22)) {
-                        session.screen = .connect
+                    if !model.isInstalling {
+                        withAnimation(.easeOut(duration: 0.22)) {
+                            session.screen = .connect
+                        }
                     }
                 }
                 .keyboardShortcut(.cancelAction)
+                .disabled(model.isInstalling)
 
                 Spacer()
 
                 if model.phase != .chooseHosting && model.phase != .connect {
                     Button("Back", action: goBack)
+                        .disabled(model.isInstalling)
                 }
 
                 Button(nextButtonTitle, action: continueSetup)
                 .keyboardShortcut(.defaultAction)
-                .disabled(model.isCheckingHost || (!isHostCheck && !model.canContinueFromCurrentPhase)
-                    || (model.isDemo && model.phase == .install && demoVerificationCode != "123456"))
+                .disabled(nextButtonDisabled)
                 .help(model.canContinueFromCurrentPhase ? nextButtonTitle : continueDisabledReason)
             }
             .padding(.horizontal, 24)
@@ -94,41 +105,57 @@ struct GuidedSetupView: View {
 
     private var phaseTitle: String {
         switch model.phase {
-        case .chooseHosting: "Set Up Server"
-        case .connect: "Connect to Linux Server"
-        case .hostIdentity, .checkHost: model.route == .thisMac ? "Check This Mac" : "Check Server"
-        case .network: "Network"
-        case .deploymentIdentity: "Deployment Identity"
-        case .administrator: "Administrator"
-        case .storage: "Storage and Backups"
-        case .review: "Review Installation"
-        case .install: "Installation"
-        case .ready: "Server Ready"
+        case .chooseHosting:
+            return "Set Up Server"
+        case .connect:
+            return "Connect to Linux Server"
+        case .hostIdentity, .checkHost:
+            return model.route == .thisMac ? "Check This Mac" : "Check Server"
+        case .network:
+            return "Network"
+        case .deploymentIdentity:
+            return "Deployment Identity"
+        case .administrator:
+            return "Administrator"
+        case .storage:
+            return "Storage and Backups"
+        case .review:
+            return "Review Installation"
+        case .install:
+            return "Installation"
+        case .ready:
+            if model.isDemo || model.isServerReadyForEnrollment {
+                return "Server Ready"
+            }
+            return "Server Installed"
         }
     }
 
     private var continueDisabledReason: String {
         switch model.phase {
         case .chooseHosting:
-            "Choose a hosting route before continuing."
+            return "Choose a hosting route before continuing."
         case .connect:
-            "Enter a valid SSH address and use key authentication."
+            return "Enter a valid SSH address and use key authentication."
         case .hostIdentity:
-            "Verify the SSH host identity before continuing. A changed key or refusal performs no writes."
+            return "Verify the SSH host identity before continuing. A changed key or refusal performs no writes."
         case .checkHost:
-            "Every required check must pass before continuing. Unknown checks block."
+            return "Every required check must pass before continuing. Unknown checks block."
         case .network:
-            "Enter the server address and a valid product port."
+            return "Enter the server address and a valid product port."
         case .deploymentIdentity:
-            "Enter a deployment display name."
+            return "Enter a deployment display name."
         case .administrator:
-            "Enter an administrator username."
+            return "Enter an administrator username."
         case .storage:
-            "Enter a storage path."
+            return "Enter a storage path."
         case .install:
-            "Installation is not available in this build. Setup will not claim success."
+            if !model.installPackageAvailable {
+                return model.installUnavailableNotice
+            }
+            return model.installProgressExplanation
         default:
-            "Complete the required fields before continuing."
+            return "Complete the required fields before continuing."
         }
     }
 
@@ -152,22 +179,106 @@ struct GuidedSetupView: View {
 
     private var nextButtonTitle: String {
         switch model.phase {
-        case .connect: "Check Server"
+        case .connect:
+            return "Check Server"
         case .hostIdentity, .checkHost:
             if model.isCheckingHost {
-                "Checking"
+                return "Checking"
             } else if hostChecksPassed {
-                "Continue"
+                return "Continue"
             } else if model.hostChecks.isEmpty {
-                model.route == .thisMac ? "Check This Mac" : "Check Server"
+                return model.route == .thisMac ? "Check This Mac" : "Check Server"
             } else {
-                "Check Again"
+                return "Check Again"
             }
-        case .review: model.isDemo ? "Preview Installation" : "Install"
-        case .install: model.isDemo ? "Simulate Installation" : "Install Unavailable"
-        case .ready: "Done"
-        default: "Continue"
+        case .review:
+            return model.isDemo ? "Preview Installation" : "Install"
+        case .install:
+            if model.isDemo { return "Simulate Installation" }
+            if model.isInstalling { return "Installing…" }
+            if model.installStatusReportsReady { return "Continue" }
+            switch model.installAction {
+            case .start: return "Install"
+            case .refreshStatus: return "Refresh Status"
+            case .unavailable: return "Install Unavailable"
+            case .none: return "Install Unavailable"
+            }
+        case .ready:
+            if model.isDemo || model.isServerReadyForEnrollment {
+                return "Done"
+            }
+            return "Not Ready"
+        default:
+            return "Continue"
         }
+    }
+
+    private var reviewNotice: String {
+        if model.isDemo {
+            return "Demo only — these changes will not be applied."
+        }
+        guard model.installPackageAvailable else {
+            return model.installUnavailableNotice
+        }
+        if model.isDevelopmentInstall {
+            return "DEVELOPMENT ONLY: the installer will generate disposable self-signed TLS for 127.0.0.1 if absent, then request macOS administrator authorization. Installed is not production readiness."
+        }
+        return "The installer will request macOS administrator authorization. No success is shown until the helper returns a verified operation status."
+    }
+
+    private var installHeadline: String {
+        if model.isInstalling { return "Installing Local Server" }
+        switch model.installProgress {
+        case .installedUnverified(_):
+            return model.installStatusReportsReady ? "Server Ready for Enrollment" : "Server Installed — Readiness Unverified"
+        case .attentionRequired(_):
+            return "Installation Requires Attention"
+        case .cancelled(_):
+            return "Installation Cancelled"
+        case .failed(_), .outcomeUnknown(_):
+            return "Installation Did Not Complete"
+        case .refused(_):
+            return "Installation Unavailable"
+        case .notStarted:
+            return "Install Local Server"
+        default:
+            return "Installing Local Server"
+        }
+    }
+
+    private var installSymbol: String {
+        if model.isInstalling { return "gearshape.2" }
+        switch model.installProgress {
+        case .installedUnverified(_):
+            return model.installStatusReportsReady ? "checkmark.circle" : "externaldrive.badge.checkmark"
+        case .attentionRequired(_):
+            return "exclamationmark.triangle"
+        case .cancelled(_):
+            return "xmark.circle"
+        case .failed(_), .outcomeUnknown(_):
+            return "xmark.octagon"
+        case .refused(_):
+            return "lock.shield"
+        default:
+            return "arrow.down.circle"
+        }
+    }
+
+    private var nextButtonDisabled: Bool {
+        if model.isCheckingHost || model.isInstalling { return true }
+        if model.phase == .connect || model.phase == .hostIdentity || model.phase == .checkHost {
+            return !model.canContinueFromCurrentPhase
+        }
+        if model.phase == .install {
+            if model.isDemo {
+                return demoVerificationCode != "123456"
+            }
+            return model.installAction == .unavailable || model.installAction == .none
+        }
+        if model.phase == .ready {
+            return !model.isDemo && !model.isServerReadyForEnrollment
+        }
+        return !model.canContinueFromCurrentPhase
     }
 
     private func continueSetup() {
@@ -183,6 +294,19 @@ struct GuidedSetupView: View {
                 model.advance()
             } else {
                 model.startHostCheck()
+            }
+        } else if model.phase == .install && !model.isDemo {
+            if model.installStatusReportsReady {
+                model.advance()
+                return
+            }
+            switch model.installAction {
+            case .start:
+                Task { await model.startInstallation() }
+            case .refreshStatus:
+                Task { await model.refreshInstallStatus() }
+            case .unavailable, .none:
+                break
             }
         } else if model.phase == .ready && model.isDemo {
             model.reset()
@@ -216,8 +340,8 @@ struct GuidedSetupView: View {
                 .labelsHidden()
                 .accessibilityLabel("Hosting route")
 
-                if !GuidedServerSetupModel.isServerPackageAvailable && !model.isDemo {
-                    Text(GuidedServerSetupModel.packageUnavailableNotice)
+                if !model.installPackageAvailable && !model.isDemo {
+                    Text(model.installUnavailableNotice)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -325,21 +449,29 @@ struct GuidedSetupView: View {
         case .network:
             Form {
                 Section {
-                    TextField("Server address", text: Binding(
-                        get: { model.networkAddress },
-                        set: { model.setNetworkAddress($0) }
-                    ))
-                    .focused($focusedField, equals: .networkAddress)
+                    if model.route == .thisMac && model.isRealInstallPathEnabled {
+                        Text("Local server address")
+                        Text("127.0.0.1 (literal loopback only)")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        TextField("Server address", text: Binding(
+                            get: { model.networkAddress },
+                            set: { model.setNetworkAddress($0) }
+                        ))
+                        .focused($focusedField, equals: .networkAddress)
+                    }
                     DisclosureGroup("Advanced") {
                         TextField("Connection port", text: Binding(
                             get: { model.productPort },
                             set: { model.setProductPort($0) }
                         ))
-                        TextField("LAN scope (optional)", text: Binding(
-                            get: { model.lanScope },
-                            set: { model.setLanScope($0) }
-                        ))
-                        Text("Default: 8920.")
+                        if !(model.route == .thisMac && model.isRealInstallPathEnabled) {
+                            TextField("LAN scope (optional)", text: Binding(
+                                get: { model.lanScope },
+                                set: { model.setLanScope($0) }
+                            ))
+                        }
+                        Text("Default: 8920. This Mac installs the literal loopback listener only.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -364,7 +496,9 @@ struct GuidedSetupView: View {
                             Text(model.generatedTrustIdentityNote)
                                 .font(.caption.monospaced())
                                 .textSelection(.enabled)
-                            Text("The server will create its own trust identity during installation.")
+                            Text(model.isRealInstallPathEnabled
+                                ? "The server service initializes its deployment identity when it starts. This installer does not bootstrap an administrator."
+                                : "The server will create its own trust identity during installation.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -388,7 +522,9 @@ struct GuidedSetupView: View {
                         set: { model.setAdministratorUsername($0) }
                     ))
                     .focused($focusedField, equals: .administratorUsername)
-                    Text("You’ll add an authenticator app during installation. Viewing permissions are assigned separately.")
+                    Text(model.isRealInstallPathEnabled
+                        ? "The local installer creates only the server service. First-administrator bootstrap and MFA remain a separate, not-yet-integrated step."
+                        : "You’ll add an authenticator app during installation. Viewing permissions are assigned separately.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -404,6 +540,12 @@ struct GuidedSetupView: View {
                         set: { model.setStoragePath($0) }
                     ), prompt: Text(model.route.defaultStoragePath))
                     .focused($focusedField, equals: .storagePath)
+                    .disabled(model.route == .thisMac && model.isRealInstallPathEnabled)
+                    if model.route == .thisMac && model.isRealInstallPathEnabled {
+                        Text("The macOS installer uses the fixed product-owned data path \(LocalHostingOwnershipPlan.current.dataPath).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     DisclosureGroup("Backup location (optional)") {
                         TextField("Encrypted backup folder", text: Binding(
                             get: { model.backupDestination },
@@ -422,22 +564,22 @@ struct GuidedSetupView: View {
                         Text(line)
                             .font(.callout)
                     }
-                    Text(model.isDemo ? "Demo only — these changes will not be applied." : GuidedServerSetupModel.packageUnavailableNotice)
+                    Text(reviewNotice)
                         .font(.caption)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(model.installPackageAvailable ? Color.gray : Color.orange)
                 }
             }
             .formStyle(.grouped)
 
         case .install:
-            VStack(alignment: .leading, spacing: 12) {
-                Label(model.isDemo ? "Ready to simulate installation" : "Install Not Performed", systemImage: model.isDemo ? "play.circle" : "xmark.octagon")
-                    .font(.headline)
-                Text(model.isDemo ? "Demo authenticator: enter the example code 123456. Do not enter a real password or authenticator code." : model.installProgressExplanation)
-                    .font(.body)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                if model.isDemo {
+            if model.isDemo {
+                VStack(alignment: .leading, spacing: 12) {
+                    Label("Ready to simulate installation", systemImage: "play.circle")
+                        .font(.headline)
+                    Text("Demo authenticator: enter the example code 123456. Do not enter a real password or authenticator code.")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                     TextField("Example code: 123456", text: $demoVerificationCode)
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: 220)
@@ -445,14 +587,96 @@ struct GuidedSetupView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+            } else if !model.installPackageAvailable {
+                VStack(alignment: .leading, spacing: 12) {
+                    Label(model.route == .existingLinuxSSH
+                        ? "Remote Installation Unavailable"
+                        : "Signed Server Package Required",
+                        systemImage: "lock.shield")
+                        .font(.headline)
+                    Text(model.installUnavailableNotice)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Text("Only a payload that passed the independent release trust root, or a development build with the matching build-time pinned key, can enable installation. Nothing is installed from an unverified bundle.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("The server helper must also advertise the install capability. A helper that reports only preflight and plan is refused before any privileged install call.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 14) {
+                    Label(installHeadline, systemImage: installSymbol)
+                        .font(.headline)
+                    Text(model.installProgressExplanation)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    if model.isInstalling {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Privileged installer running")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if let summary = model.installStatusSummary {
+                        Text(summary)
+                            .font(.callout)
+                            .textSelection(.enabled)
+                    }
+                    if let tlsNotice = model.developmentTLSNotice {
+                        Text(tlsNotice)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    if case .installedUnverified = model.installProgress {
+                        Text("Installation succeeded, but this server does not expose enrollment readiness. No Continue/Done step is offered.")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    if model.installStatusHasAttention {
+                        Label("The operation requires inspection. Do not retry blindly.", systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    HStack(spacing: 12) {
+                        if model.canCancelInstallation {
+                            Button("Cancel Incomplete Install", role: .destructive) {
+                                Task { await model.cancelInstallation() }
+                            }
+                        }
+                        if model.installAction == .refreshStatus && !model.isInstalling {
+                            Button("Refresh Status") {
+                                Task { await model.refreshInstallStatus() }
+                            }
+                        }
+                    }
+                    Text("Installed is not the same as ready for enrollment. Readiness is shown only when the installer reports verified server evidence.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
         case .ready:
             VStack(alignment: .leading, spacing: 12) {
-                Label(model.isDemo ? "Demo setup complete" : "Server Ready for Enrollment", systemImage: "checkmark.circle")
-                    .font(.headline)
-                Text(model.isDemo ? "No server was installed, and no computer can be enrolled from this demo." : "Next, enroll a computer.")
-                    .foregroundStyle(.secondary)
+                if model.isDemo {
+                    Label("Demo setup complete", systemImage: "checkmark.circle")
+                        .font(.headline)
+                    Text("No server was installed, and no computer can be enrolled from this demo.")
+                        .foregroundStyle(.secondary)
+                } else if model.isServerReadyForEnrollment {
+                    Label("Server Ready for Enrollment", systemImage: "checkmark.circle")
+                        .font(.headline)
+                    Text("The installed server explicitly reported readiness. Next, enroll a computer.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Label("Readiness Not Exposed", systemImage: "exclamationmark.triangle")
+                        .font(.headline)
+                    Text("The installer completed, but the server did not expose enrollment readiness. No Done step is offered.")
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }

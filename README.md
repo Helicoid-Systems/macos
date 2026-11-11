@@ -69,9 +69,11 @@ never modified.
 The validated copy is ad-hoc signed and placed at
 `Contents/Helpers/hs-server`; a digest and validation record tied to the included
 bytes is placed at `Contents/Resources/hs-server-development.json`. Packaging
-refuses to replace an existing helper or evidence file: use a fresh
-`HELICOID_DIST_DIR` (or remove the output app yourself) when switching or
-repeating builds. The build never deletes pre-existing helper artifacts.
+refuses to replace an existing helper or evidence file, and also refuses a
+pre-existing `hs-server-release.json` or `ServerPackage` directory so a stale
+release payload cannot survive a rebuild: use a fresh `HELICOID_DIST_DIR` (or
+remove the output app yourself) when switching or repeating builds. The build
+never deletes pre-existing helper artifacts.
 
 This is development packaging only: the helper is not installed or launched, and
 it does not enable local hosting, launchd, TLS trust, deployment identity, service
@@ -83,6 +85,147 @@ Packaging tests use disposable scratch app bundles and fixture Mach-O files:
 ```bash
 ./scripts/tests/hs-server-helper-tests.sh
 ```
+
+### Signed local server install path (gated)
+
+The This Mac release installer path is implemented end-to-end but remains
+disabled unless the Manager bundle contains an actual release payload. The
+development-only helper flow packaged without a package is never used for
+installation. The separately labeled pinned development bundle below is the
+only non-release install path, and it never creates release evidence or trust
+roots.
+
+Required bundle payload:
+
+- `Contents/Helpers/hs-server` — release-signed helper, executable.
+- `Contents/Resources/hs-server-release.json` — release evidence with
+  `schema: 1`, `helper: "hs-server"`, `path: "Contents/Helpers/hs-server"`,
+  `developmentOnly: false`, `distributionSigned: true`,
+  `installationEnabled: true`, `serviceEnabled: true`, a non-ad-hoc
+  `signature`, `includedSHA256`, and the contained `architectures`.
+- `Contents/Resources/ServerPackage/trust-roots.json` —
+  `{"schema": 1, "releaseKeys": ["<64-hex Ed25519 public key>"]}`. This is the
+  Manager's independent release root, not a key supplied by the package.
+- `Contents/Resources/ServerPackage/package/` — `manifest.json`,
+  `manifest.sig`, and `artifacts/hs-server` exactly, matching the server's
+  `installer-package-targets-v1` contract. The manifest must be signed by a
+  packaged trust root, use product `hs-server`, target `macos-arm64` or
+  `macos-x86_64` for this Mac, and contain exactly one
+  `artifacts/hs-server` artifact.
+
+Before any privileged call, the Manager verifies the release evidence, helper
+digest, trust root, exact package shape, Ed25519 manifest signature, platform,
+artifact size, and artifact SHA-256. It then asks the helper for
+`installer capabilities-v2` and refuses unless the helper advertises
+`macos_launchd`, `loopback_development`, and `install`. The current gated
+server source advertises only preflight and plan because no independently
+trusted release root is configured, so the Manager refuses honestly even if a
+hand-built payload is present. Passing the Manager's checks is not installation
+authority: the helper independently re-verifies the package against its own
+compiled trusted release root before any host effect.
+
+The install flow is capabilities → privileged `preflight-v2` → privileged
+`plan-v2` → privileged `apply-v2`, followed by `status-v2`. Every privileged
+command is handed to `/usr/bin/osascript` with `do shell script … with
+administrator privileges`; the request is bounded JSON on stdin and the helper
+is addressed by its absolute bundle path. macOS may ask for administrator
+authorization. A dismissed prompt is reported as a cancellation, not a
+success. A timeout or lost helper response after apply may have started is
+reported as an unknown outcome; the Manager never retries automatically and
+offers `status-v2` plus `cancel-v2` for an incomplete operation.
+
+Operator prerequisites, supplied outside the Manager:
+
+- `/etc/helicoid/tls/fullchain.pem` and `/etc/helicoid/tls/private-key.pem`
+  must already exist, be root-owned private (`0700`-class directory,
+  `0600`-class regular files), and cover literal `127.0.0.1`.
+- The helper creates the fixed `_helicoid` service account/group, product
+  paths, executable, configuration, copied TLS material, install receipt, and
+  launchd daemon at the paths frozen by `installer-lifecycle-v2`.
+
+Installed is not the same as ready. The macOS helper's status never infers
+bootstrap or enrollment readiness from launchd or file presence. Setup reaches
+**Server Ready for Enrollment** only when the helper explicitly reports both
+`service_installed: true` and `server_ready_for_enrollment: true`.
+
+Unit coverage includes strict package verification, development pin/evidence
+binding, development TLS provisioning command construction, bounded osascript
+request construction, capability gating, dismissed authorization, timeout and
+unknown outcomes, and status/cancel binding. No test claims a successful
+install from fake files or a helper that does not advertise install.
+
+### Development-only pinned bundle (disposable machines only)
+
+A separate development path can exercise the real privileged installer without
+weakening the release gate. It requires a helper built by the server with
+`--features macos-dev-install` and the same `HELICOID_MACOS_DEV_TRUST_KEY` used
+to sign the package. The Manager build records that key in Info.plist at build
+time; the helper embeds the same key at compile time. Neither side accepts an
+arbitrary runtime key.
+
+The server side must produce both artifacts (read the server checkout's
+`scripts/package-macos-development.sh` and acceptance workflow for the exact
+commands):
+
+1. generate an Ed25519 signing key outside the package;
+2. `cargo build --locked --release --features macos-dev-install` with
+   `HELICOID_MACOS_DEV_TRUST_KEY` set to its public key hex;
+3. ad-hoc sign the development helper for Apple silicon execution; and
+4. run `scripts/package-macos-development.sh BINARY 0.1.0 macos-arm64|macos-x86_64 SIGNING_KEY OUTPUT_DIR`.
+
+Use the printed `verification_key_hex` as `HELICOID_MACOS_DEV_TRUST_KEY` for the
+Manager build. A helper built with a different key will be refused by the
+helper at apply time; the Manager never substitutes a package-local key. This
+Manager checkout does not build the server binary or package; those artifacts
+must come from the server's development-feature build.
+
+```bash
+HELICOID_HS_SERVER_PATH=/absolute/path/to/dev-feature/hs-server \
+HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR=/absolute/path/to/signed-macos-package \
+HELICOID_MACOS_DEV_TRUST_KEY=<64-hex key printed by package-macos-development.sh> \
+./scripts/build.sh
+```
+
+`scripts/hs-server-development-bundle.sh` first runs the helper's
+`installer capabilities-v2` and refuses a helper that does not advertise
+`install`, `macos_launchd`, and `loopback_development`. It then:
+
+- validates the helper through the existing development helper packager;
+- copies the exact signed macOS package to
+  `Contents/Resources/ServerPackage/development/package`;
+- writes `Contents/Resources/hs-server-development-install.json` binding the
+  helper SHA-256, manifest SHA-256, artifact path/size/SHA-256, target, version,
+  and pinned key;
+- writes `HelicoidServerDevelopmentInstall` and
+  `HelicoidServerDevelopmentTrustKey` to Info.plist; and
+- refuses any pre-existing development install payload or release payload.
+
+The Manager recognizes this payload only when the build pin is present, the
+evidence key equals that pin, the helper bytes match the evidence, and the
+package verifies against the pinned Ed25519 key. Release evidence always takes
+precedence; a broken or missing release payload never falls back to development.
+The helper still re-verifies the package against its own compile-time pin before
+any effect. The UI displays a persistent **DEVELOPMENT ONLY** warning.
+
+At execution time the privileged wrapper stages the helper and exact package
+into a fresh root-owned `0700` directory, re-computes their SHA-256 digests, and
+refuses before running anything if the bytes differ from the UI-verified
+payload. The helper then re-verifies the package manifest signature with the
+build pin. This closes replacement between the UI check and the administrator
+prompt. It is still a development build: an unsigned/ad-hoc Manager cannot
+defend against an attacker who can replace the entire app and its Info.plist.
+Do not represent this as a signed release or production trust.
+
+For development installs, the Manager generates disposable self-signed TLS for
+literal `127.0.0.1`, copies it into a root-owned staging directory, pins the
+certificate/key SHA-256 digests in the privileged script, and installs it
+root-owned `0600` under a root-owned `0700` `/etc/helicoid/tls`. Existing TLS
+material is never overwritten: material without the development marker is left
+untouched (exit 42) and the reviewed plan validates it. A failure removes only
+files/directories created by that run, using a marker to recognize its own prior
+dev material. This is not production or public PKI material. Disposable
+machines only: the installer creates a system account/group, product paths, and
+a LaunchDaemon, and it does not establish production readiness or enrollment.
 
 ## Launch modes
 
@@ -137,7 +280,7 @@ Fixture mode and development-server mode are independent and must not be conflat
 
 ### Guided server setup
 
-Mac manager offers **This Mac** read-only preflight and **Existing Linux Server** via verified SSH. Install never claims success without integrated server packages.
+Mac manager offers **This Mac** read-only preflight and **Existing Linux Server** via verified SSH. A real local install runs only from a verified signed payload; install never claims success from files, launchd, or an unavailable package.
 
 Setup opens directly to the SSH address in a compact custom native dialog.
 Its title is **Server Setup · Helicoid Manager**, with no navigation bar,
@@ -158,12 +301,14 @@ privileges, disk, product path, launchd service, ports). The system hostname is
 informational display text (shown truncated in the UI) and is not a product
 identity; legitimate long hostnames validate. Without elevation, listener
 inspection is explicitly incomplete and Product ports cannot pass. Installation
-stays unavailable in this build.
+stays unavailable unless the signed release payload described above is packaged.
 
 Opening setup creates or loads the initiating Manager's Ed25519 identity through
-macOS Keychain. Only its public key is shown. Corrupt or inaccessible stored
-identities are refused rather than silently replaced. Package apply and MFA
-bootstrap are still pending integration; this build cannot reach Ready.
+macOS Keychain only after the signed package verifies and the helper advertises
+install. Only its public key is shown. Corrupt or inaccessible stored identities
+are refused rather than silently replaced. Package apply is implemented behind
+those gates; MFA bootstrap remains pending, so the default build cannot reach
+Ready.
 
 An optional read-only host regression is enabled explicitly:
 
@@ -193,9 +338,9 @@ Independent copies (build does not read a sibling checkout):
 
 ## Local hosting prerequisite (10 October 2026)
 
-Guided setup offers **This Mac** and **Existing Linux Server**. This Mac performs bounded, read-only OS/architecture, privilege, disk, product-path, launchd-service and listener checks. Unknown facts block progress. Unprivileged listener inspection is explicitly incomplete; this checkpoint does not install or register a launchd service or claim Server Ready for Enrollment. Windows local hosting is offered by the Windows app.
+Guided setup offers **This Mac** and **Existing Linux Server**. This Mac performs bounded, read-only OS/architecture, privilege, disk, product-path, launchd-service and listener checks. Unknown facts block progress. Unprivileged listener inspection is explicitly incomplete; the default no-payload checkpoint does not install or register a launchd service or claim Server Ready for Enrollment. Windows local hosting is offered by the Windows app.
 
-Fresh coordinator verification: 122 Swift tests in 19 suites, both release app bundles, the supplied layered icons, and deep strict ad-hoc signature checks passed. The packaged Manager was exercised through This Mac → Check This Mac and refused incomplete listener inspection. Intel runtime, privileged installation, live preview/control and production signing remain Not Verified.
+Fresh coordinator verification: 122 Swift tests in 19 suites, both release app bundles, the supplied layered icons, and deep strict ad-hoc signature checks passed. The packaged Manager was exercised through This Mac → Check This Mac and refused incomplete listener inspection. Intel runtime, live privileged installation execution (no signed payload is present in this checkout), live preview/control and production signing remain Not Verified.
 
 
 ## Native v2 device-key sign-in (13–15 October 2026)
