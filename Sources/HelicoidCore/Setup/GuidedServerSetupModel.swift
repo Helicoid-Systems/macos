@@ -213,6 +213,7 @@ public final class GuidedServerSetupModel {
     private let localClient: LocalMacSetupClient
     private let managerIdentityStore: ManagerIdentityStore
     private let installService: any ServerInstallServicing
+    private let configurationStore: any ServerInstallConfigurationStoring
     private var managerIdentity: ManagerSigningIdentity?
     private var verificationTask: Task<Void, Never>?
     private var verificationGeneration = UUID()
@@ -231,12 +232,14 @@ public final class GuidedServerSetupModel {
         self.localClient = localClient
         self.managerIdentityStore = managerIdentityStore
         self.installService = BundledServerInstallService()
+        self.configurationStore = FileServerInstallConfigurationStore()
     }
 
     init(sshClient: SSHSetupClient = SSHSetupClient(),
          localClient: LocalMacSetupClient = LocalMacSetupClient(),
          managerIdentityStore: ManagerIdentityStore = ManagerIdentityStore(),
          installService: any ServerInstallServicing,
+         configurationStore: any ServerInstallConfigurationStoring = FileServerInstallConfigurationStore(),
          demoMode: Bool = false) {
         self.isDemo = demoMode
         if demoMode {
@@ -248,6 +251,7 @@ public final class GuidedServerSetupModel {
         self.localClient = localClient
         self.managerIdentityStore = managerIdentityStore
         self.installService = installService
+        self.configurationStore = configurationStore
     }
 
     /// True only for a This Mac walk whose bundle contains a release payload.
@@ -282,6 +286,19 @@ public final class GuidedServerSetupModel {
 
     public var isInstalling: Bool {
         installProgress.isWorking
+    }
+
+    /// Read-only status is always reachable when a verified payload is present,
+    /// including on a fresh launch or after a failed attempt. It never requires
+    /// a prior in-memory operation.
+    public var canCheckInstallStatus: Bool {
+        !isDemo && route == .thisMac && isRealInstallPathEnabled && !isInstalling
+    }
+
+    /// True only when the wizard reached Ready and the server reported
+    /// enrollment readiness (or this is the demo walk).
+    public var isSetupFinished: Bool {
+        phase == .ready && (isDemo || isServerReadyForEnrollment)
     }
 
     public var canCancelInstallation: Bool {
@@ -654,7 +671,6 @@ public final class GuidedServerSetupModel {
                     return
                 }
             }
-            installStatus = nil
             installPlan = nil
             installStatusSummary = nil
             installPackageNotice = nil
@@ -833,7 +849,6 @@ public final class GuidedServerSetupModel {
         }
 
         blocker = nil
-        installStatus = nil
         installPlan = nil
         installStatusSummary = nil
         installPackageNotice = nil
@@ -872,6 +887,14 @@ public final class GuidedServerSetupModel {
                 return
             }
             installOperationConfiguration = configuration
+            do {
+                try configurationStore.save(configuration)
+            } catch {
+                let message = "The exact installer configuration could not be saved, so restart recovery cannot be guaranteed. Nothing was installed."
+                installProgress = .failed(reason: message)
+                blocker = message
+                return
+            }
             installProgress = .preflighting
             let preflight = try await installService.preflight(
                 configuration: configuration,
@@ -995,12 +1018,28 @@ public final class GuidedServerSetupModel {
             configuration = installOperationConfiguration
         } else {
             do {
-                configuration = try installerConfiguration()
-                installOperationConfiguration = configuration
+                if let persisted = configurationStore.load() {
+                    configuration = persisted
+                    installOperationConfiguration = persisted
+                } else if let fetched = try? await installService.storedConfiguration(package: package),
+                          let stored = fetched {
+                    // Server-authoritative recovery for installations created
+                    // before this Manager persisted the configuration locally.
+                    _ = try? configurationStore.save(stored)
+                    configuration = stored
+                    installOperationConfiguration = stored
+                } else {
+                    // No durable v2 operation is recorded. Ask status with the
+                    // current valid configuration; the server reports
+                    // `not_installed` rather than inventing an identity.
+                    configuration = try installerConfiguration()
+                    installOperationConfiguration = configuration
+                }
             } catch {
                 let message = Self.installMessage(error)
-                installProgress = .failed(reason: message)
-                blocker = message
+                installProgress = .attentionRequired(
+                    summary: "The installer's recorded configuration could not be read. \(message)")
+                blocker = installProgressExplanation
                 return
             }
         }
@@ -1011,15 +1050,47 @@ public final class GuidedServerSetupModel {
                 configuration: configuration,
                 package: package)
             try Self.requireMatchingContract(status, configuration: configuration)
+            _ = try? configurationStore.save(configuration)
             applyInstallStatus(status)
-        } catch {
-            let message = Self.installMessage(error)
+        } catch let statusError {
+            // A stale local copy can make status-v2 reject the configuration.
+            // Ask the durable record for the exact configuration and retry
+            // once, so the operation identity is never abandoned.
+            if let recovered = await recoveredConfigurationForStatusRetry(
+                    package: package,
+                    current: configuration) {
+                do {
+                    let status = try await installService.status(
+                        configuration: recovered,
+                        package: package)
+                    try Self.requireMatchingContract(status, configuration: recovered)
+                    installOperationConfiguration = recovered
+                    _ = try? configurationStore.save(recovered)
+                    applyInstallStatus(status)
+                    return
+                } catch {
+                    // Fall through to the attention state below.
+                }
+            }
+            let message = Self.installMessage(statusError)
             // Keep the last known operation identity and configuration. A
             // failed read must not erase the ability to cancel or retry.
             installProgress = .attentionRequired(
                 summary: "Installer status could not be read. \(message)")
             blocker = installProgressExplanation
         }
+    }
+
+    private func recoveredConfigurationForStatusRetry(
+        package: TrustedServerPackage,
+        current: InstallerDeploymentConfiguration
+    ) async -> InstallerDeploymentConfiguration? {
+        guard let fetched = try? await installService.storedConfiguration(package: package),
+              let recovered = fetched,
+              recovered != current else {
+            return nil
+        }
+        return recovered
     }
 
     /// Requests the helper's rollback for an incomplete operation. This is a
@@ -1092,7 +1163,7 @@ public final class GuidedServerSetupModel {
             let summary = status.result.summary.isEmpty
                 ? "No installation operation is recorded."
                 : status.result.summary
-            installProgress = .failed(reason: summary)
+            installProgress = .notStarted
             blocker = summary
         default:
             let summary = status.result.summary.isEmpty

@@ -27,6 +27,15 @@ enum ServerInstallContract {
     static let developmentTrustKeyInfoKey = "HelicoidServerDevelopmentTrustKey"
     static let developmentInstallEvidenceMode = "development-install"
 
+    /// Release installation is authorized only when the Manager is signed with
+    /// an independently verified Apple Developer ID identity and its packaged
+    /// release trust roots exactly match these keys compiled into the binary.
+    /// They are empty by default: an unpopulated build fails closed and never
+    /// enables the release privileged path. A release pipeline populates them
+    /// in a generated source file at build time.
+    static let compiledReleaseTrustKeyHexes: [String] = []
+    static let releaseManagerTeamIdentifier: String = ""
+
     static let installerStateDirectory = "/Library/Application Support/Helicoid-Installer"
     /// Root-owned staging parent for a verified helper/package copy. The
     /// privileged wrapper creates one fresh child per invocation, verifies its

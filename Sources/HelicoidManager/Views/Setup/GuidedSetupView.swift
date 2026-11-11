@@ -308,9 +308,11 @@ struct GuidedSetupView: View {
             case .unavailable, .none:
                 break
             }
-        } else if model.phase == .ready && model.isDemo {
-            model.reset()
-            session.screen = .connect
+        } else if model.phase == .ready {
+            if model.isSetupFinished {
+                model.reset()
+                session.screen = .connect
+            }
         } else {
             model.advance()
         }
@@ -647,8 +649,8 @@ struct GuidedSetupView: View {
                                 Task { await model.cancelInstallation() }
                             }
                         }
-                        if model.installAction == .refreshStatus && !model.isInstalling {
-                            Button("Refresh Status") {
+                        if model.canCheckInstallStatus {
+                            Button(model.installAction == .refreshStatus ? "Refresh Status" : "Check Status") {
                                 Task { await model.refreshInstallStatus() }
                             }
                         }

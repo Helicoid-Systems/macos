@@ -7,6 +7,18 @@ enum ServerInstallTestSupport {
         data.map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Test-only release policy seam. It authorizes the release path without
+    /// an Apple-signed test runner; production defaults to fail-closed.
+    static func authorizedReleaseTrust(keys: [String]) -> ServerReleaseTrustPolicy {
+        ServerReleaseTrustPolicy(
+            compiledTrustKeyHexes: keys,
+            managerIdentityIsTrusted: { true })
+    }
+
+    static let failClosedReleaseTrust = ServerReleaseTrustPolicy(
+        compiledTrustKeyHexes: [],
+        managerIdentityIsTrusted: { true })
+
     static func jsonData(_ object: [String: Any]) throws -> Data {
         try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
@@ -325,6 +337,12 @@ struct TestPackageFixture {
         ServerDevelopmentBuild(isRequested: true, pinnedTrustKeyHex: pinnedKeyHex)
     }
 
+    /// Test-only policy that authorizes the release path with the fixture's
+    /// key. Production uses an Apple-signed Manager and compiled keys.
+    var releaseTrust: ServerReleaseTrustPolicy {
+        ServerInstallTestSupport.authorizedReleaseTrust(keys: [pinnedKeyHex])
+    }
+
     func remove() {
         try? FileManager.default.removeItem(at: root)
     }
@@ -345,6 +363,9 @@ actor FakeInstallService: ServerInstallServicing {
     private let planError: LocalServerInstallError?
     private let applyError: LocalServerInstallError?
     private let statusError: LocalServerInstallError?
+    private let storedConfigurationValue: InstallerDeploymentConfiguration?
+    private let storedConfigurationError: LocalServerInstallError?
+    private let statusRejectsOtherConfigurations: Bool
     private let tlsProvisionError: LocalServerInstallError?
     private let tlsProvisionResult: DevelopmentTLSProvisioningResult
     private(set) var calls: [String] = []
@@ -371,6 +392,9 @@ actor FakeInstallService: ServerInstallServicing {
         planError: LocalServerInstallError? = nil,
         applyError: LocalServerInstallError? = nil,
         statusError: LocalServerInstallError? = nil,
+        storedConfiguration: InstallerDeploymentConfiguration? = nil,
+        storedConfigurationError: LocalServerInstallError? = nil,
+        statusRejectsOtherConfigurations: Bool = false,
         tlsProvisionError: LocalServerInstallError? = nil,
         tlsProvisionResult: DevelopmentTLSProvisioningResult = .provisioned
     ) {
@@ -388,6 +412,9 @@ actor FakeInstallService: ServerInstallServicing {
         self.planError = planError
         self.applyError = applyError
         self.statusError = statusError
+        self.storedConfigurationValue = storedConfiguration
+        self.storedConfigurationError = storedConfigurationError
+        self.statusRejectsOtherConfigurations = statusRejectsOtherConfigurations
         self.tlsProvisionError = tlsProvisionError
         self.tlsProvisionResult = tlsProvisionResult
     }
@@ -443,7 +470,20 @@ actor FakeInstallService: ServerInstallServicing {
         calls.append("status")
         statusConfigurations.append(configuration)
         if let statusError { throw statusError }
+        if statusRejectsOtherConfigurations && configuration != statusValue.configuration {
+            throw .helperFailed(
+                status: 1,
+                detail: "operation record does not match the requested deployment configuration")
+        }
         return statusValue
+    }
+
+    func storedConfiguration(
+        package: TrustedServerPackage
+    ) async throws -> InstallerDeploymentConfiguration? {
+        calls.append("storedConfiguration")
+        if let storedConfigurationError { throw storedConfigurationError }
+        return storedConfigurationValue
     }
 
     func cancel(
@@ -478,11 +518,42 @@ actor InMemoryIdentityKeyStore: ManagerIdentityKeyStoring {
     }
 }
 
+final class InMemoryInstallConfigurationStore: ServerInstallConfigurationStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: InstallerDeploymentConfiguration?
+
+    init(_ value: InstallerDeploymentConfiguration? = nil) {
+        self.value = value
+    }
+
+    func load() -> InstallerDeploymentConfiguration? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func save(_ configuration: InstallerDeploymentConfiguration) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        value = configuration
+    }
+}
+
+struct FailingInstallConfigurationStore: ServerInstallConfigurationStoring {
+    struct Failure: Error {}
+    func load() -> InstallerDeploymentConfiguration? { nil }
+    func save(_ configuration: InstallerDeploymentConfiguration) throws { throw Failure() }
+}
+
 @MainActor
-func makeGuidedInstallModel(service: FakeInstallService) -> GuidedServerSetupModel {
+func makeGuidedInstallModel(
+    service: FakeInstallService,
+    configurationStore: any ServerInstallConfigurationStoring = InMemoryInstallConfigurationStore()
+) -> GuidedServerSetupModel {
     GuidedServerSetupModel(
         managerIdentityStore: ManagerIdentityStore(keyStore: InMemoryIdentityKeyStore()),
         installService: service,
+        configurationStore: configurationStore,
         demoMode: false)
 }
 

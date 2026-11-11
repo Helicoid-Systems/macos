@@ -2,6 +2,18 @@ import Foundation
 import Testing
 @testable import HelicoidCore
 
+private let testNonce = "0123456789abcdef0123456789abcdef"
+
+private func makeClient(
+    helper: URL,
+    runner: any SetupCommandRunning
+) -> LocalServerInstallClient {
+    LocalServerInstallClient(
+        helperURL: helper,
+        runner: runner,
+        markerNonce: { testNonce })
+}
+
 private actor ScriptedCommandRunner: SetupCommandRunning {
     private var responses: [Result<SetupCommandResult, SetupCommandError>]
     private var recorded: [SetupCommand] = []
@@ -39,7 +51,7 @@ private func removeHelper(_ helper: URL) {
 
 private func helperOutput(_ json: Data, status: Int32 = 0) -> SetupCommandResult {
     var output = json
-    output.append(Data("\n\(PrivilegedHelperInvocation.statusMarker)\(status)\n".utf8))
+    output.append(Data("\n\(PrivilegedInvocationMarker.helperStatus(testNonce))\(status)\n".utf8))
     return SetupCommandResult(exitStatus: 0, output: output)
 }
 
@@ -84,11 +96,11 @@ private actor TLSProvisioningRunner: SetupCommandRunning {
             if shellStatus == 0 {
                 return SetupCommandResult(
                     exitStatus: 0,
-                    output: Data("\n\(PrivilegedShellInvocation.statusMarker)0\n".utf8))
+                    output: Data("\n\(PrivilegedInvocationMarker.shellStatus(testNonce))0\n".utf8))
             }
             return SetupCommandResult(
                 exitStatus: 0,
-                output: Data("\n\(PrivilegedShellInvocation.statusMarker)\(shellStatus)\n".utf8),
+                output: Data("\n\(PrivilegedInvocationMarker.shellStatus(testNonce))\(shellStatus)\n".utf8),
                 errorOutput: shellError)
         }
         throw SetupCommandError.launchFailed
@@ -127,7 +139,7 @@ struct LocalServerInstallClientTests {
         let runner = ScriptedCommandRunner([
             .success(SetupCommandResult(exitStatus: 0, output: data))
         ])
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
 
         let result = try await client.capabilities()
         #expect(result.supportedActions.contains("install"))
@@ -146,7 +158,7 @@ struct LocalServerInstallClientTests {
         let preflight = try ServerInstallTestSupport.preflight(configuration: configuration)
         let data = try InstallerJSON.encoder().encode(preflight)
         let runner = ScriptedCommandRunner([.success(helperOutput(data))])
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
 
         let package = TrustedServerPackage.testFixture(helperURL: helper)
         let result = try await client.preflight(configuration: configuration, package: package)
@@ -180,7 +192,7 @@ struct LocalServerInstallClientTests {
         let status = try ServerInstallTestSupport.operationStatus(configuration: configuration)
         let data = try InstallerJSON.encoder().encode(status)
         let runner = ScriptedCommandRunner([.success(helperOutput(data))])
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
         let preflight = try ServerInstallTestSupport.preflight(configuration: configuration)
 
         _ = try await client.apply(
@@ -228,7 +240,7 @@ struct LocalServerInstallClientTests {
             operationId: "operation-9")
         let data = try InstallerJSON.encoder().encode(status)
         let runner = ScriptedCommandRunner([.success(helperOutput(data))])
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
 
         _ = try await client.cancel(
             configuration: configuration,
@@ -264,7 +276,7 @@ struct LocalServerInstallClientTests {
                 output: Data(),
                 errorOutput: Data("execution error: User canceled. (-128)".utf8)))
         ])
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
         await #expect(throws: LocalServerInstallError.authorizationCancelled) {
             try await client.preflight(
                 configuration: ServerInstallTestSupport.configuration(),
@@ -277,13 +289,13 @@ struct LocalServerInstallClientTests {
         let helper = try executableHelper()
         defer { removeHelper(helper) }
         let output = Data("""
-        \n\(PrivilegedHelperInvocation.stagingRefusalMarker)staged helper bytes do not match the verified helper
-        \n\(PrivilegedHelperInvocation.statusMarker)0
+        \n\(PrivilegedInvocationMarker.stagingRefusal(testNonce))staged helper bytes do not match the verified helper
+        \n\(PrivilegedInvocationMarker.helperStatus(testNonce))0
         """.utf8)
         let runner = ScriptedCommandRunner([
             .success(SetupCommandResult(exitStatus: 0, output: output))
         ])
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
         do {
             _ = try await client.preflight(
                 configuration: ServerInstallTestSupport.configuration(),
@@ -306,7 +318,7 @@ struct LocalServerInstallClientTests {
         let preflight = try ServerInstallTestSupport.preflight(configuration: configuration)
         let data = try InstallerJSON.encoder().encode(preflight)
         let runner = ScriptedCommandRunner([.success(helperOutput(data))])
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
         let package = TrustedServerPackage.testFixture(helperURL: helper)
 
         _ = try await client.preflight(configuration: configuration, package: package)
@@ -335,10 +347,10 @@ struct LocalServerInstallClientTests {
         let runner = ScriptedCommandRunner([
             .success(SetupCommandResult(
                 exitStatus: 0,
-                output: Data("\n\(PrivilegedHelperInvocation.statusMarker)2\n".utf8),
+                output: Data("\n\(PrivilegedInvocationMarker.helperStatus(testNonce))2\n".utf8),
                 errorOutput: Data("no independently trusted release root is configured".utf8)))
         ])
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
         await #expect(throws: LocalServerInstallError.helperFailed(
             status: 2,
             detail: "no independently trusted release root is configured")) {
@@ -355,7 +367,7 @@ struct LocalServerInstallClientTests {
         let runner = ScriptedCommandRunner([
             .success(SetupCommandResult(exitStatus: 0, output: Data("{\"contract_version\":2}".utf8)))
         ])
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
         await #expect(throws: LocalServerInstallError.self) {
             try await client.preflight(
                 configuration: ServerInstallTestSupport.configuration(),
@@ -368,7 +380,7 @@ struct LocalServerInstallClientTests {
         let helper = try executableHelper()
         defer { removeHelper(helper) }
         let timeoutRunner = ScriptedCommandRunner([.failure(.timedOut)])
-        let timeoutClient = LocalServerInstallClient(helperURL: helper, runner: timeoutRunner)
+        let timeoutClient = makeClient(helper: helper, runner: timeoutRunner)
         await #expect(throws: LocalServerInstallError.timedOut) {
             try await timeoutClient.preflight(
                 configuration: ServerInstallTestSupport.configuration(),
@@ -376,7 +388,7 @@ struct LocalServerInstallClientTests {
         }
 
         let overflowRunner = ScriptedCommandRunner([.failure(.outputExceeded)])
-        let overflowClient = LocalServerInstallClient(helperURL: helper, runner: overflowRunner)
+        let overflowClient = makeClient(helper: helper, runner: overflowRunner)
         await #expect(throws: LocalServerInstallError.outputExceeded) {
             try await overflowClient.preflight(
                 configuration: ServerInstallTestSupport.configuration(),
@@ -390,7 +402,7 @@ struct LocalServerInstallClientTests {
         let helper = FileManager.default.temporaryDirectory
             .appendingPathComponent("missing-helper-\(UUID().uuidString)")
             .appendingPathComponent("hs-server")
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
         await #expect(throws: LocalServerInstallError.self) {
             try await client.preflight(
                 configuration: ServerInstallTestSupport.configuration(),
@@ -405,7 +417,7 @@ struct LocalServerInstallClientTests {
         let helper = try executableHelper()
         defer { removeHelper(helper) }
         let runner = TLSProvisioningRunner()
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
 
         _ = try await client.provisionDevelopmentTLSIfNeeded()
 
@@ -418,7 +430,7 @@ struct LocalServerInstallClientTests {
             Issue.record("Could not recover the TLS install script")
             return
         }
-        #expect(shell.contains("if [ -e '/etc/helicoid/tls' ]"))
+        #expect(shell.contains("if [ -L \"$tls\" ] || [ -e \"$tls\" ]"))
         #expect(shell.contains("/etc/helicoid/tls"))
         #expect(shell.contains("-m 0600"))
         #expect(shell.contains("-o root -g wheel"))
@@ -432,7 +444,7 @@ struct LocalServerInstallClientTests {
         let runner = TLSProvisioningRunner(
             shellStatus: 52,
             shellError: Data("install refused".utf8))
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
 
         await #expect(throws: LocalServerInstallError.self) {
             _ = try await client.provisionDevelopmentTLSIfNeeded()
@@ -444,7 +456,7 @@ struct LocalServerInstallClientTests {
         let helper = try executableHelper()
         defer { removeHelper(helper) }
         let runner = TLSProvisioningRunner(shellStatus: 42)
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
 
         let result = try await client.provisionDevelopmentTLSIfNeeded()
         #expect(result == .existingUnverifiedMaterial)
@@ -460,7 +472,7 @@ struct LocalServerInstallClientTests {
         #expect(shell.contains("cert_installed=1"))
         #expect(shell.contains("key_installed=1"))
         #expect(shell.contains("marker_installed=1"))
-        #expect(shell.contains("/bin/rmdir '/etc/helicoid/tls'"))
+        #expect(shell.contains("/bin/rmdir \"$tls\""))
         #expect(!shell.contains("rm -rf '/etc/helicoid/tls'"))
     }
 
@@ -469,7 +481,7 @@ struct LocalServerInstallClientTests {
         let helper = try executableHelper()
         defer { removeHelper(helper) }
         let runner = TLSProvisioningRunner(shellThrows: .timedOut)
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
 
         do {
             _ = try await client.provisionDevelopmentTLSIfNeeded()
@@ -487,7 +499,7 @@ struct LocalServerInstallClientTests {
         let helper = try executableHelper()
         defer { removeHelper(helper) }
         let runner = TLSProvisioningRunner()
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
         _ = try await client.provisionDevelopmentTLSIfNeeded()
 
         let commands = await runner.commands()
@@ -505,8 +517,57 @@ struct LocalServerInstallClientTests {
         #expect(shell.contains(certificateHash))
         #expect(shell.contains(privateKeyHash))
         #expect(shell.contains("install -d -m 0700 -o root -g wheel"))
-        #expect(shell.contains("if [ -e '/etc/helicoid/tls' ]"))
+        #expect(shell.contains("if [ -L \"$tls\" ] || [ -e \"$tls\" ]"))
+        #expect(shell.contains("check_root_file"))
         #expect(shell.contains("exit 42"))
+        #expect(shell.contains("exit 43"))
+        #expect(shell.contains("marker_tmp"))
+        #expect(shell.contains("/bin/mv -f"))
+        if let certRange = shell.range(of: "\"$tls/fullchain.pem\" || exit 90"),
+           let markerWrite = shell.range(of: "printf 'helicoid-development-tls-v1"),
+           let markerRename = shell.range(of: "/bin/mv -f \"$marker_tmp\" \"$marker\"") {
+            #expect(certRange.lowerBound < markerWrite.lowerBound)
+            #expect(markerWrite.lowerBound < markerRename.lowerBound)
+        } else {
+            Issue.record("Expected certificate install before atomic marker rename")
+        }
+    }
+
+    @Test("A signal-style TLS installer status is an unknown outcome")
+    func developmentTLSSignalUnknown() async throws {
+        let helper = try executableHelper()
+        defer { removeHelper(helper) }
+        let runner = TLSProvisioningRunner(shellStatus: 137)
+        let client = makeClient(helper: helper, runner: runner)
+
+        do {
+            _ = try await client.provisionDevelopmentTLSIfNeeded()
+            Issue.record("Expected an unknown TLS outcome")
+        } catch let error as LocalServerInstallError {
+            guard case .privilegedOutcomeUnknown = error else {
+                Issue.record("Expected privilegedOutcomeUnknown, got \(error)")
+                return
+            }
+        }
+    }
+
+    @Test("Existing owned TLS that is not exact root-owned 0600 fails closed untouched")
+    func developmentTLSExistingOwnedInvalid() async throws {
+        let helper = try executableHelper()
+        defer { removeHelper(helper) }
+        let runner = TLSProvisioningRunner(shellStatus: 43)
+        let client = makeClient(helper: helper, runner: runner)
+
+        do {
+            _ = try await client.provisionDevelopmentTLSIfNeeded()
+            Issue.record("Expected a refusal for inexact existing TLS")
+        } catch let error as LocalServerInstallError {
+            guard case .developmentTLSProvisioningFailed(let detail) = error else {
+                Issue.record("Expected developmentTLSProvisioningFailed, got \(error)")
+                return
+            }
+            #expect(detail.contains("left untouched"))
+        }
     }
 
     @Test("Development TLS generator that writes no files is refused")
@@ -514,11 +575,160 @@ struct LocalServerInstallClientTests {
         let helper = try executableHelper()
         defer { removeHelper(helper) }
         let runner = TLSProvisioningRunner(createFiles: false)
-        let client = LocalServerInstallClient(helperURL: helper, runner: runner)
+        let client = makeClient(helper: helper, runner: runner)
 
         await #expect(throws: LocalServerInstallError.self) {
             _ = try await client.provisionDevelopmentTLSIfNeeded()
         }
+    }
+
+    @Test("Only the final nonce-bound status marker is trusted")
+    func markerMustBeFinal() async throws {
+        let helper = try executableHelper()
+        defer { removeHelper(helper) }
+        let configuration = ServerInstallTestSupport.configuration()
+        let preflight = try ServerInstallTestSupport.preflight(configuration: configuration)
+        let status = PrivilegedInvocationMarker.helperStatus(testNonce)
+        let preflightJSON = try InstallerJSON.encoder().encode(preflight)
+        let preflightText = String(decoding: preflightJSON, as: UTF8.self)
+        let forgedFirst = Data("""
+        \(preflightText)
+        \n\(status)0
+        \n\(status)2
+        """.utf8)
+        let runner = ScriptedCommandRunner([
+            .success(SetupCommandResult(exitStatus: 0, output: forgedFirst))
+        ])
+        let client = makeClient(helper: helper, runner: runner)
+
+        do {
+            _ = try await client.preflight(
+                configuration: configuration,
+                package: .testFixture(helperURL: helper))
+            Issue.record("Expected the final status to win")
+        } catch let error as LocalServerInstallError {
+            guard case .helperFailed(let status, _) = error else {
+                Issue.record("Expected helperFailed, got \(error)")
+                return
+            }
+            #expect(status == 2)
+        }
+    }
+
+    @Test("A status marker followed by more output is not accepted")
+    func statusMarkerMustBeLast() async throws {
+        let helper = try executableHelper()
+        defer { removeHelper(helper) }
+        let configuration = ServerInstallTestSupport.configuration()
+        let preflight = try ServerInstallTestSupport.preflight(configuration: configuration)
+        let status = PrivilegedInvocationMarker.helperStatus(testNonce)
+        var output = try InstallerJSON.encoder().encode(preflight)
+        output.append(Data("\n\(status)0\ntrailing data\n".utf8))
+        let runner = ScriptedCommandRunner([
+            .success(SetupCommandResult(exitStatus: 0, output: output))
+        ])
+        let client = makeClient(helper: helper, runner: runner)
+
+        await #expect(throws: LocalServerInstallError.self) {
+            _ = try await client.preflight(
+                configuration: configuration,
+                package: .testFixture(helperURL: helper))
+        }
+    }
+
+    @Test("A staging refusal with extra payload is not trusted")
+    func malformedStagingRefusal() async throws {
+        let helper = try executableHelper()
+        defer { removeHelper(helper) }
+        let refusal = PrivilegedInvocationMarker.stagingRefusal(testNonce)
+        let status = PrivilegedInvocationMarker.helperStatus(testNonce)
+        let output = Data("""
+        \n\(refusal)staged helper bytes do not match
+        \nnot part of a refusal
+        \n\(status)0
+        """.utf8)
+        let runner = ScriptedCommandRunner([
+            .success(SetupCommandResult(exitStatus: 0, output: output))
+        ])
+        let client = makeClient(helper: helper, runner: runner)
+
+        do {
+            _ = try await client.preflight(
+                configuration: ServerInstallTestSupport.configuration(),
+                package: .testFixture(helperURL: helper))
+            Issue.record("Expected an invalid response")
+        } catch let error as LocalServerInstallError {
+            guard case .invalidResponse = error else {
+                Issue.record("Expected invalidResponse, got \(error)")
+                return
+            }
+        }
+    }
+
+    @Test("A signal-style helper status is an unknown outcome")
+    func signalStatusIsUnknown() async throws {
+        let helper = try executableHelper()
+        defer { removeHelper(helper) }
+        let status = PrivilegedInvocationMarker.helperStatus(testNonce)
+        let output = Data("\n\(status)137\n".utf8)
+        let runner = ScriptedCommandRunner([
+            .success(SetupCommandResult(exitStatus: 0, output: output))
+        ])
+        let client = makeClient(helper: helper, runner: runner)
+
+        do {
+            _ = try await client.preflight(
+                configuration: ServerInstallTestSupport.configuration(),
+                package: .testFixture(helperURL: helper))
+            Issue.record("Expected an unknown outcome")
+        } catch let error as LocalServerInstallError {
+            guard case .privilegedOutcomeUnknown = error else {
+                Issue.record("Expected privilegedOutcomeUnknown, got \(error)")
+                return
+            }
+        }
+    }
+
+    @Test("configuration-v2 null means no recorded operation")
+    func storedConfigurationNull() async throws {
+        let helper = try executableHelper()
+        defer { removeHelper(helper) }
+        let status = PrivilegedInvocationMarker.helperStatus(testNonce)
+        let runner = ScriptedCommandRunner([
+            .success(SetupCommandResult(
+                exitStatus: 0,
+                output: Data("null\n\(status)0\n".utf8)))
+        ])
+        let client = makeClient(helper: helper, runner: runner)
+
+        let configuration = try await client.storedConfiguration(
+            package: .testFixture(helperURL: helper))
+        #expect(configuration == nil)
+        let commands = await runner.commands()
+        guard let shell = stagedShellScript(from: commands[0].arguments[1]) else {
+            Issue.record("Could not recover the configuration-v2 script")
+            return
+        }
+        #expect(shell.contains("configuration-v2"))
+        #expect(shell.contains("--state-dir"))
+    }
+
+    @Test("configuration-v2 returns the exact recorded configuration")
+    func storedConfigurationDecodes() async throws {
+        let helper = try executableHelper()
+        defer { removeHelper(helper) }
+        let expected = ServerInstallTestSupport.configuration()
+        let status = PrivilegedInvocationMarker.helperStatus(testNonce)
+        var output = try InstallerJSON.encoder().encode(expected)
+        output.append(Data("\n\(status)0\n".utf8))
+        let runner = ScriptedCommandRunner([
+            .success(SetupCommandResult(exitStatus: 0, output: output))
+        ])
+        let client = makeClient(helper: helper, runner: runner)
+
+        let configuration = try await client.storedConfiguration(
+            package: .testFixture(helperURL: helper))
+        #expect(configuration == expected)
     }
 
     @Test("Shell quoting keeps paths with apostrophes and spaces literal")

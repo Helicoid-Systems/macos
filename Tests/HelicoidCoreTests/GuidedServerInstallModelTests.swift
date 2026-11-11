@@ -76,6 +76,7 @@ struct GuidedServerInstallModelTests {
         model.advance()
         #expect(model.phase == .ready)
         #expect(model.isServerReadyForEnrollment)
+        #expect(model.isSetupFinished)
     }
 
     @Test("Development package provisions TLS before plan and remains clearly labeled")
@@ -444,6 +445,200 @@ struct GuidedServerInstallModelTests {
         #expect(model.canCancelInstallation)
         guard case .attentionRequired = model.installProgress else {
             Issue.record("Expected attention-required after failed refresh, got \(model.installProgress)")
+            return
+        }
+    }
+
+    @Test("Status is reachable on a fresh launch and recovers the recorded configuration")
+    @MainActor
+    func statusRecoversRecordedConfiguration() async throws {
+        let recorded = InstallerDeploymentConfiguration.macos(
+            authorityPort: 8787,
+            backupDirectory: "/private/tmp/recorded-backups")
+        let completed = try ServerInstallTestSupport.operationStatus(
+            state: "completed",
+            serviceInstalled: true,
+            readyForEnrollment: false,
+            operationId: "operation-recorded",
+            configuration: recorded)
+        let service = FakeInstallService(
+            package: .testFixture(),
+            capabilities: try ServerInstallTestSupport.capabilities(),
+            preflight: try ServerInstallTestSupport.preflight(configuration: recorded),
+            plan: try ServerInstallTestSupport.planResult(configuration: recorded),
+            apply: completed,
+            status: completed,
+            cancel: completed,
+            storedConfiguration: recorded)
+        let model = makeGuidedInstallModel(service: service)
+        advanceToInstall(model)
+        #expect(model.canCheckInstallStatus)
+        #expect(model.installOperationConfiguration == nil)
+
+        await model.refreshInstallStatus()
+
+        let calls = await service.recordedCalls()
+        #expect(calls.contains("storedConfiguration"))
+        #expect(calls.contains("status"))
+        let statusConfigurations = await service.recordedStatusConfigurations()
+        #expect(statusConfigurations.last == recorded)
+        #expect(model.installOperationConfiguration == recorded)
+        #expect(model.installStatus?.operationId == "operation-recorded")
+        if case .installedUnverified = model.installProgress {
+        } else {
+            Issue.record("Expected installed-unverified, got \(model.installProgress)")
+        }
+    }
+
+    @Test("A restarted Manager recovers the exact persisted configuration")
+    @MainActor
+    func restartRecoversPersistedConfiguration() async throws {
+        let store = InMemoryInstallConfigurationStore()
+        let applied = try ServerInstallTestSupport.operationStatus()
+        let service = FakeInstallService(
+            package: .testFixture(),
+            capabilities: try ServerInstallTestSupport.capabilities(),
+            preflight: try ServerInstallTestSupport.preflight(),
+            plan: try ServerInstallTestSupport.planResult(),
+            apply: applied,
+            status: applied,
+            cancel: applied)
+        let first = makeGuidedInstallModel(service: service, configurationStore: store)
+        advanceToInstall(first)
+        let reviewed = try #require(first.reviewedInstallConfiguration)
+        await first.startInstallation()
+        #expect(store.load() == reviewed)
+
+        // Relaunch: a new model with the same durable store and no in-memory
+        // operation identity.
+        let second = makeGuidedInstallModel(service: service, configurationStore: store)
+        advanceToInstall(second)
+        #expect(second.installOperationConfiguration == nil)
+        await second.refreshInstallStatus()
+        #expect(second.installOperationConfiguration == reviewed)
+        #expect(second.installStatus != nil)
+        let calls = await service.recordedCalls()
+        // The persisted exact configuration avoids a server configuration-v2
+        // probe and keeps the operation reachable.
+        #expect(!calls.contains("storedConfiguration"))
+    }
+
+    @Test("A stale persisted configuration is replaced by the durable record on status")
+    @MainActor
+    func stalePersistedConfigurationRecovers() async throws {
+        let recorded = InstallerDeploymentConfiguration.macos(
+            authorityPort: 8787,
+            backupDirectory: "/private/tmp/recorded-backups")
+        let stale = ServerInstallTestSupport.configuration()
+        let completed = try ServerInstallTestSupport.operationStatus(
+            state: "completed",
+            serviceInstalled: true,
+            readyForEnrollment: false,
+            operationId: "operation-retry",
+            configuration: recorded)
+        let service = FakeInstallService(
+            package: .testFixture(),
+            capabilities: try ServerInstallTestSupport.capabilities(),
+            preflight: try ServerInstallTestSupport.preflight(configuration: recorded),
+            plan: try ServerInstallTestSupport.planResult(configuration: recorded),
+            apply: completed,
+            status: completed,
+            cancel: completed,
+            storedConfiguration: recorded,
+            statusRejectsOtherConfigurations: true)
+        let store = InMemoryInstallConfigurationStore(stale)
+        let model = makeGuidedInstallModel(service: service, configurationStore: store)
+        advanceToInstall(model)
+
+        await model.refreshInstallStatus()
+
+        #expect(model.installOperationConfiguration == recorded)
+        #expect(store.load() == recorded)
+        #expect(model.installStatus?.operationId == "operation-retry")
+        let calls = await service.recordedCalls()
+        #expect(calls.contains("storedConfiguration"))
+    }
+
+    @Test("A configuration that cannot be persisted fails closed before install")
+    @MainActor
+    func configurationSaveFailureStopsInstall() async throws {
+        let service = FakeInstallService(
+            package: .testFixture(),
+            capabilities: try ServerInstallTestSupport.capabilities(),
+            preflight: try ServerInstallTestSupport.preflight(),
+            plan: try ServerInstallTestSupport.planResult(),
+            apply: try ServerInstallTestSupport.operationStatus(),
+            status: try ServerInstallTestSupport.operationStatus(),
+            cancel: try ServerInstallTestSupport.operationStatus())
+        let model = makeGuidedInstallModel(
+            service: service,
+            configurationStore: FailingInstallConfigurationStore())
+        advanceToInstall(model)
+
+        await model.startInstallation()
+
+        guard case .failed(let reason) = model.installProgress else {
+            Issue.record("Expected a persistence failure, got \(model.installProgress)")
+            return
+        }
+        #expect(reason.contains("could not be saved"))
+        let calls = await service.recordedCalls()
+        #expect(!calls.contains("preflight"))
+        #expect(!calls.contains("apply"))
+    }
+
+    @Test("A fresh Mac with no durable operation reports not-installed, not failure")
+    @MainActor
+    func statusWithNoRecordedOperation() async throws {
+        let none = try ServerInstallTestSupport.operationStatus(
+            state: "not_installed",
+            serviceInstalled: false,
+            operationId: nil)
+        let service = FakeInstallService(
+            package: .testFixture(),
+            capabilities: try ServerInstallTestSupport.capabilities(),
+            preflight: try ServerInstallTestSupport.preflight(),
+            plan: try ServerInstallTestSupport.planResult(),
+            apply: none,
+            status: none,
+            cancel: none,
+            storedConfiguration: nil)
+        let model = makeGuidedInstallModel(service: service)
+        advanceToInstall(model)
+
+        await model.refreshInstallStatus()
+
+        let calls = await service.recordedCalls()
+        #expect(calls.contains("storedConfiguration"))
+        #expect(calls.contains("status"))
+        guard case .notStarted = model.installProgress else {
+            Issue.record("Expected not-started, got \(model.installProgress)")
+            return
+        }
+        #expect(model.canCheckInstallStatus)
+    }
+
+    @Test("Check status stays available after a failed attempt")
+    @MainActor
+    func checkStatusAfterFailure() async throws {
+        let service = FakeInstallService(
+            package: .testFixture(),
+            capabilities: try ServerInstallTestSupport.capabilities(),
+            preflight: try ServerInstallTestSupport.preflight(),
+            plan: try ServerInstallTestSupport.planResult(),
+            apply: try ServerInstallTestSupport.operationStatus(),
+            status: try ServerInstallTestSupport.operationStatus(),
+            cancel: try ServerInstallTestSupport.operationStatus(),
+            applyError: .invalidResponse("helper response was lost"))
+        let model = makeGuidedInstallModel(service: service)
+        advanceToInstall(model)
+
+        await model.startInstallation()
+
+        #expect(model.canCheckInstallStatus)
+        #expect(model.installOperationConfiguration != nil)
+        guard case .outcomeUnknown = model.installProgress else {
+            Issue.record("Expected an unknown outcome, got \(model.installProgress)")
             return
         }
     }

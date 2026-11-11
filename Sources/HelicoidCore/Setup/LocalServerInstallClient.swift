@@ -15,15 +15,20 @@ struct LocalServerInstallClient: Sendable {
     let helperURL: URL
     let stateDirectory: String
     let runner: any SetupCommandRunning
+    /// Unique per invocation. It binds wrapper control markers to this process
+    /// so helper stdout cannot spoof a completion or staging refusal.
+    let markerNonce: @Sendable () -> String
 
     init(
         helperURL: URL,
         stateDirectory: String = ServerInstallContract.installerStateDirectory,
-        runner: any SetupCommandRunning = SystemSetupCommandRunner()
+        runner: any SetupCommandRunning = SystemSetupCommandRunner(),
+        markerNonce: @escaping @Sendable () -> String = { PrivilegedInvocationMarker.randomNonce() }
     ) {
         self.helperURL = helperURL
         self.stateDirectory = stateDirectory
         self.runner = runner
+        self.markerNonce = markerNonce
     }
 
     func capabilities() async throws -> InstallerCapabilities {
@@ -227,6 +232,27 @@ struct LocalServerInstallClient: Sendable {
         return try decode(InstallerOperationStatus.self, from: data)
     }
 
+    /// Reads the exact configuration recorded by the durable v2 operation
+    /// record. `null` means no v2 operation is recorded. This is read-only and
+    /// lets a restarted Manager recover status/removal identity without local
+    /// persistence.
+    func storedConfiguration(package: TrustedServerPackage) async throws -> InstallerDeploymentConfiguration? {
+        let data = try await runPrivileged(
+            arguments: ["installer", "configuration-v2", "--state-dir", stateDirectory],
+            request: Data(),
+            package: package,
+            stagingName: UUID().uuidString,
+            stagePackage: false,
+            requireJSONObject: false,
+            timeout: Self.statusTimeLimit)
+        let text = String(decoding: data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if text == "null" {
+            return nil
+        }
+        return try decode(InstallerDeploymentConfiguration.self, from: data)
+    }
+
     /// Development-only convenience: create disposable self-signed TLS for
     /// literal 127.0.0.1 when the fixed operator TLS path is absent.
     ///
@@ -298,6 +324,7 @@ struct LocalServerInstallClient: Sendable {
                 "the generated TLS material could not be digested")
         }
 
+        let nonce = markerNonce()
         let installScript = DevelopmentTLSMaterial.installScript(
             stagingRoot: ServerInstallContract.payloadStagingRoot,
             stagingName: "tls-\(UUID().uuidString)",
@@ -307,7 +334,8 @@ struct LocalServerInstallClient: Sendable {
             privateKeySHA256: privateKeySHA256)
         let command = try PrivilegedShellInvocation.setupCommand(
             shellScript: installScript,
-            timeoutSeconds: ServerInstallContract.maximumTimeoutSeconds)
+            timeoutSeconds: ServerInstallContract.maximumTimeoutSeconds,
+            statusMarker: PrivilegedInvocationMarker.shellStatus(nonce))
 
         let installation: SetupCommandResult
         do {
@@ -330,12 +358,18 @@ struct LocalServerInstallClient: Sendable {
                 "The privileged development TLS installer was dispatched but its transport failed. Its outcome is unknown.")
         }
 
-        let status = try Self.shellStatus(installation, stage: "install")
+        let status = try Self.shellStatus(
+            installation,
+            stage: "install",
+            marker: PrivilegedInvocationMarker.shellStatus(nonce))
         switch status {
         case 0:
             return .provisioned
         case 42:
             return .existingUnverifiedMaterial
+        case 43:
+            throw LocalServerInstallError.developmentTLSProvisioningFailed(
+                "existing development TLS material is not the exact root-owned 0600 layout; it was left untouched")
         default:
             throw LocalServerInstallError.developmentTLSProvisioningFailed(
                 "the privileged development TLS installer returned exit \(status); it did not report success")
@@ -350,12 +384,14 @@ struct LocalServerInstallClient: Sendable {
         package: TrustedServerPackage,
         stagingName: String,
         stagePackage: Bool,
+        requireJSONObject: Bool = true,
         timeout: TimeInterval
     ) async throws -> Data {
         guard BundledServerPackageProvider.isExecutableFileWithoutSymlink(package.helperURL) else {
             throw LocalServerInstallError.helperUnavailable(
                 "The packaged helper is missing or not executable.")
         }
+        let nonce = markerNonce()
         let expectedHelper = try Self.expectedHelperDigest(for: package)
         let command = try PrivilegedHelperInvocation.setupCommand(
             helperURL: package.helperURL,
@@ -367,6 +403,7 @@ struct LocalServerInstallClient: Sendable {
             expectedPackageArtifactSHA256: stagePackage ? package.artifactSha256 : nil,
             expectedPackageArtifactSizeBytes: stagePackage ? package.artifactSizeBytes : nil,
             stagingName: stagingName,
+            nonce: nonce,
             timeoutSeconds: min(timeout, ServerInstallContract.maximumTimeoutSeconds))
         let result: SetupCommandResult
         do {
@@ -379,7 +416,10 @@ struct LocalServerInstallClient: Sendable {
             }
             throw LocalServerInstallError.helperUnavailable("The privileged helper could not be started.")
         }
-        return try Self.extractResponse(result)
+        return try Self.extractResponse(
+            result,
+            nonce: nonce,
+            requireJSONObject: requireJSONObject)
     }
 
     private func encode<T: Encodable>(_ value: T) throws -> Data {
@@ -431,9 +471,14 @@ struct LocalServerInstallClient: Sendable {
 
     private static func shellStatus(
         _ result: SetupCommandResult,
-        stage: String
+        stage: String,
+        marker: String
     ) throws -> Int32 {
         guard result.exitStatus == 0 else {
+            if result.exitStatus >= 128 {
+                throw LocalServerInstallError.privilegedOutcomeUnknown(
+                    "\(stage) ended without a normal exit status (\(result.exitStatus)); its outcome is unknown.")
+            }
             let detail = boundedCombinedDiagnostic(result)
             let lower = detail.lowercased()
             if lower.contains("user canceled") || lower.contains("user cancelled")
@@ -443,21 +488,16 @@ struct LocalServerInstallClient: Sendable {
             throw LocalServerInstallError.developmentTLSProvisioningFailed(
                 detail.isEmpty ? "\(stage) failed" : detail)
         }
-        let text = String(decoding: result.output, as: UTF8.self)
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-        guard let marker = text.range(
-            of: PrivilegedShellInvocation.statusMarker,
-            options: .backwards) else {
+        let text = normalizedOutput(result)
+        guard let parsed = finalStatus(in: text, marker: marker) else {
             throw LocalServerInstallError.privilegedOutcomeUnknown(
-                "\(stage) completed without a status marker; its outcome is unknown")
+                "\(stage) completed without a verifiable final status marker; its outcome is unknown")
         }
-        let statusText = String(text[marker.upperBound...].prefix(while: { $0.isNumber }))
-        guard let status = Int32(statusText) else {
+        guard parsed.status < 128 else {
             throw LocalServerInstallError.privilegedOutcomeUnknown(
-                "\(stage) reported an unreadable completion status")
+                "\(stage) ended with signal-style status \(parsed.status); its outcome is unknown")
         }
-        return status
+        return parsed.status
     }
 
     static func isNonemptyRegularFile(_ url: URL) -> Bool {
@@ -467,8 +507,54 @@ struct LocalServerInstallClient: Sendable {
             && info.st_size > 0
     }
 
-    private static func extractResponse(_ result: SetupCommandResult) throws -> Data {
+    /// Requires the nonce-bound marker to be the final non-empty line and
+    /// permits only whitespace after it. This prevents helper output from
+    /// spoofing a completion marker.
+    static func finalStatus(
+        in text: String,
+        marker: String
+    ) -> (payload: Substring, status: Int32)? {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let lastNonEmpty = lines.lastIndex(where: {
+            !$0.trimmingCharacters(in: .whitespaces).isEmpty
+        }) else {
+            return nil
+        }
+        let line = lines[lastNonEmpty].trimmingCharacters(in: .whitespaces)
+        guard line.hasPrefix(marker) else { return nil }
+        let digits = line.dropFirst(marker.count)
+        guard !digits.isEmpty,
+              digits.allSatisfy(\.isNumber),
+              let status = Int32(digits) else {
+            return nil
+        }
+        return (text[..<lines[lastNonEmpty].startIndex], status)
+    }
+
+    /// A staging refusal is trusted only when the entire payload before the
+    /// final status line is exactly one nonce-bound refusal line.
+    static func strictRefusalDetail(
+        payload: Substring,
+        marker: String
+    ) -> String? {
+        let lines = payload.split(separator: "\n", omittingEmptySubsequences: true)
+        guard lines.count == 1, lines[0].hasPrefix(marker) else { return nil }
+        return String(lines[0].dropFirst(marker.count))
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func extractResponse(
+        _ result: SetupCommandResult,
+        nonce: String,
+        requireJSONObject: Bool
+    ) throws -> Data {
+        let statusMarker = PrivilegedInvocationMarker.helperStatus(nonce)
+        let refusalMarker = PrivilegedInvocationMarker.stagingRefusal(nonce)
         guard result.exitStatus == 0 else {
+            if result.exitStatus >= 128 {
+                throw LocalServerInstallError.privilegedOutcomeUnknown(
+                    "The privileged installer ended without a normal exit status (\(result.exitStatus)). Its outcome is unknown.")
+            }
             let detail = boundedCombinedDiagnostic(result)
             let lower = detail.lowercased()
             if lower.contains("user canceled") || lower.contains("user cancelled")
@@ -479,37 +565,51 @@ struct LocalServerInstallClient: Sendable {
                 detail.isEmpty ? "macOS did not grant administrator authorization." : detail)
         }
 
-        let text = String(decoding: result.output, as: UTF8.self)
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-        if let refusal = text.range(of: PrivilegedHelperInvocation.stagingRefusalMarker) {
-            let detail = String(text[refusal.upperBound...].prefix(while: { $0 != "\n" }))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = normalizedOutput(result)
+        guard let parsed = finalStatus(in: text, marker: statusMarker) else {
+            if text.contains(refusalMarker) {
+                throw LocalServerInstallError.invalidResponse(
+                    "The privileged wrapper produced a malformed staging refusal.")
+            }
+            throw LocalServerInstallError.invalidResponse(
+                "The privileged installer did not report a final completion status.")
+        }
+        if let detail = strictRefusalDetail(payload: parsed.payload, marker: refusalMarker) {
+            guard parsed.status == 0 else {
+                throw LocalServerInstallError.invalidResponse(
+                    "The privileged wrapper reported a staging refusal with a non-zero status.")
+            }
             throw LocalServerInstallError.returnedRefusal(
                 detail.isEmpty
                     ? "The privileged wrapper refused the staged payload before running the helper."
                     : "The privileged wrapper refused the staged payload before running the helper: \(detail)")
         }
-        guard let marker = text.range(of: PrivilegedHelperInvocation.statusMarker, options: .backwards) else {
+        if String(parsed.payload).contains(refusalMarker) {
             throw LocalServerInstallError.invalidResponse(
-                "The privileged installer did not report a completion status.")
+                "The privileged wrapper produced an ambiguous staging refusal.")
         }
-        let statusText = String(text[marker.upperBound...].prefix(while: { $0.isNumber }))
-        guard let status = Int32(statusText) else {
-            throw LocalServerInstallError.invalidResponse(
-                "The privileged installer reported an unreadable completion status.")
+        guard parsed.status < 128 else {
+            throw LocalServerInstallError.privilegedOutcomeUnknown(
+                "The privileged installer ended with signal-style status \(parsed.status). Its outcome is unknown.")
         }
-        let payload = String(text[..<marker.lowerBound])
-        guard status == 0 else {
+        guard parsed.status == 0 else {
             throw LocalServerInstallError.helperFailed(
-                status: status,
+                status: parsed.status,
                 detail: boundedDiagnostic(result))
         }
-        guard let json = InstallerJSON.jsonObjectData(from: Data(payload.utf8)) else {
+        let payload = Data(parsed.payload.utf8)
+        guard requireJSONObject else { return payload }
+        guard let json = InstallerJSON.jsonObjectData(from: payload) else {
             throw LocalServerInstallError.invalidResponse(
                 "The privileged installer returned no JSON result.")
         }
         return json
+    }
+
+    private static func normalizedOutput(_ result: SetupCommandResult) -> String {
+        String(decoding: result.output, as: UTF8.self)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
     }
 
     private static func boundedDiagnostic(_ result: SetupCommandResult) -> String {
@@ -536,10 +636,28 @@ struct LocalServerInstallClient: Sendable {
 
 /// Builds the bounded AppleScript/shell invocation. Internal so tests can
 /// inspect exactly what is handed to `osascript`.
-enum PrivilegedHelperInvocation {
-    static let statusMarker = "__HELICOID_STATUS__:"
-    static let stagingRefusalMarker = "__HELICOID_STAGING_REFUSAL__:"
+/// Nonce-bound control markers. The nonce is generated by the Manager and is
+/// never passed to the helper, so helper output cannot forge a completion or
+/// staging-refusal marker.
+enum PrivilegedInvocationMarker {
+    static func randomNonce() -> String {
+        UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    }
 
+    static func helperStatus(_ nonce: String) -> String {
+        "__HELICOID_STATUS_\(nonce)__:"
+    }
+
+    static func stagingRefusal(_ nonce: String) -> String {
+        "__HELICOID_STAGING_REFUSAL_\(nonce)__:"
+    }
+
+    static func shellStatus(_ nonce: String) -> String {
+        "__HELICOID_SHELL_STATUS_\(nonce)__:"
+    }
+}
+
+enum PrivilegedHelperInvocation {
     static func setupCommand(
         helperURL: URL,
         expectedHelperSHA256: String,
@@ -550,6 +668,7 @@ enum PrivilegedHelperInvocation {
         expectedPackageArtifactSHA256: String?,
         expectedPackageArtifactSizeBytes: UInt64?,
         stagingName: String,
+        nonce: String,
         timeoutSeconds: TimeInterval
     ) throws -> SetupCommand {
         guard helperURL.path.hasPrefix("/"),
@@ -583,6 +702,8 @@ enum PrivilegedHelperInvocation {
         // the administrator prompt.
         let root = ServerInstallContract.payloadStagingRoot
         let stage = root + "/" + stagingName
+        let statusMarker = PrivilegedInvocationMarker.helperStatus(nonce)
+        let refusalMarker = PrivilegedInvocationMarker.stagingRefusal(nonce)
         var script = """
         umask 077
         root=\(shellQuote(root))
@@ -597,7 +718,7 @@ enum PrivilegedHelperInvocation {
         }
         trap cleanup 0 1 2 15
         stage_refuse() {
-          printf '\n\(stagingRefusalMarker)%s\n' "$1"
+          printf '\n\(refusalMarker)%s\n' "$1"
           printf '\n\(statusMarker)0\n'
           exit 0
         }
@@ -686,8 +807,8 @@ enum PrivilegedHelperInvocation {
         err=$(/usr/bin/mktemp /private/tmp/helicoid-installer.XXXXXX) \
           || stage_refuse "cannot create a diagnostic staging file"
         \(invocation)
+        /bin/cat "$err" >&2
         printf '\n\(statusMarker)%d\n' "$status"
-        /bin/cat "$err"
         exit 0
         """
 
@@ -723,13 +844,12 @@ enum PrivilegedHelperInvocation {
 /// Runs one bounded shell script as root. Used only for development-only TLS
 /// material installation, never for package or helper trust decisions.
 enum PrivilegedShellInvocation {
-    static let statusMarker = "__HELICOID_SHELL_STATUS__:"
-
     static func setupCommand(
         shellScript: String,
         timeoutSeconds: TimeInterval,
         outputLimit: Int = 65_536,
-        appendShellStatus: Bool = true
+        appendShellStatus: Bool = true,
+        statusMarker: String = PrivilegedInvocationMarker.shellStatus(PrivilegedInvocationMarker.randomNonce())
     ) throws -> SetupCommand {
         guard !shellScript.unicodeScalars.contains(where: { scalar in
             scalar.value < 0x20 && scalar.value != 0x0A
@@ -800,22 +920,36 @@ enum DevelopmentTLSMaterial {
         umask 077
         root=\(root)
         stage=\(stage)
+        tls='/etc/helicoid/tls'
         marker='/etc/helicoid/tls/.helicoid-development-tls-v1'
+        marker_tmp='/etc/helicoid/tls/.helicoid-development-tls-v1.tmp'
         stage_owned=0
         created_base=0
         created_tls=0
         cert_installed=0
         key_installed=0
         marker_installed=0
+        marker_tmp_installed=0
         cleanup() {
-          if [ "$cert_installed" = 1 ]; then /bin/rm -f '/etc/helicoid/tls/fullchain.pem'; fi
-          if [ "$key_installed" = 1 ]; then /bin/rm -f '/etc/helicoid/tls/private-key.pem'; fi
+          if [ "$marker_tmp_installed" = 1 ]; then /bin/rm -f "$marker_tmp"; fi
           if [ "$marker_installed" = 1 ]; then /bin/rm -f "$marker"; fi
+          if [ "$cert_installed" = 1 ]; then /bin/rm -f "$tls/fullchain.pem"; fi
+          if [ "$key_installed" = 1 ]; then /bin/rm -f "$tls/private-key.pem"; fi
           if [ "$stage_owned" = 1 ]; then /bin/rm -rf "$stage"; fi
-          if [ "$created_tls" = 1 ]; then /bin/rmdir '/etc/helicoid/tls' 2>/dev/null || true; fi
+          if [ "$created_tls" = 1 ]; then /bin/rmdir "$tls" 2>/dev/null || true; fi
           if [ "$created_base" = 1 ]; then /bin/rmdir '/etc/helicoid' 2>/dev/null || true; fi
         }
         trap cleanup 0 1 2 15
+
+        check_root_file() {
+          # exact root-owned regular 0600 file with non-zero size
+          [ -L "$1" ] && return 1
+          [ -f "$1" ] || return 1
+          uid=$(/usr/bin/stat -f '%u' "$1" 2>/dev/null) || return 1
+          mode=$(/usr/bin/stat -f '%Lp' "$1" 2>/dev/null) || return 1
+          size=$(/usr/bin/stat -f '%z' "$1" 2>/dev/null) || return 1
+          [ "$uid" = "0" ] && [ "$mode" = "600" ] && [ "$size" -gt 0 ]
+        }
 
         if [ -L "$root" ] || { [ -e "$root" ] && [ ! -d "$root" ]; }; then exit 70; fi
         /usr/bin/install -d -m 0700 -o root -g wheel "$root" || exit 71
@@ -832,33 +966,54 @@ enum DevelopmentTLSMaterial {
         actual_key=$(/usr/bin/shasum -a 256 "$stage/private-key.pem" | /usr/bin/awk '{print $1}') || exit 81
         if [ "$actual_key" != \(keyExpected) ]; then exit 82; fi
 
-        if [ -L '/etc/helicoid/tls' ]; then exit 42; fi
-        if [ -e '/etc/helicoid/tls' ]; then
-          if [ ! -d '/etc/helicoid/tls' ]; then exit 42; fi
-          if [ -L '/etc/helicoid/tls/fullchain.pem' ] || [ -L '/etc/helicoid/tls/private-key.pem' ]; then exit 42; fi
-          if [ ! -f "$marker" ] || [ "$(/bin/cat "$marker" 2>/dev/null)" != 'helicoid-development-tls-v1' ]; then
-            exit 42
+        if [ -L "$tls" ] || [ -e "$tls" ]; then
+          if [ -L "$tls" ] || [ ! -d "$tls" ]; then exit 42; fi
+          if [ -e "$marker" ] || [ -L "$marker" ]; then
+            # This workflow's own material. Require the exact root-owned
+            # regular-file layout; never repair or delete anything here.
+            tls_uid=$(/usr/bin/stat -f '%u' "$tls" 2>/dev/null) || exit 43
+            tls_mode=$(/usr/bin/stat -f '%Lp' "$tls" 2>/dev/null) || exit 43
+            [ "$tls_uid" = "0" ] && [ "$tls_mode" = "700" ] || exit 43
+            check_root_file "$marker" || exit 43
+            [ "$(/bin/cat "$marker" 2>/dev/null)" = 'helicoid-development-tls-v1' ] || exit 43
+            check_root_file "$tls/fullchain.pem" || exit 43
+            check_root_file "$tls/private-key.pem" || exit 43
+            exit 0
           fi
-          # This is material this workflow created in an earlier run. Leave it
-          # intact instead of overwriting files a running server may be using.
-          exit 0
+          # Existing material without our marker is operator-owned or unknown.
+          # Leave it exactly as found; the reviewed plan validates it.
+          exit 42
         fi
 
         if [ -L '/etc/helicoid' ]; then exit 85; fi
         if [ -e '/etc/helicoid' ] && [ ! -d '/etc/helicoid' ]; then exit 85; fi
         if [ ! -e '/etc/helicoid' ]; then
-          /usr/bin/install -d -m 0700 -o root -g wheel '/etc/helicoid' || exit 86
           created_base=1
+          /usr/bin/install -d -m 0700 -o root -g wheel '/etc/helicoid' || exit 86
         fi
-        /usr/bin/install -d -m 0700 -o root -g wheel '/etc/helicoid/tls' || exit 87
+        if [ -e "$tls" ] || [ -L "$tls" ]; then exit 75; fi
         created_tls=1
-        marker_installed=1
-        printf 'helicoid-development-tls-v1\n' > "$marker" || exit 88
-        /bin/chmod 0600 "$marker" || exit 89
-        /usr/bin/install -m 0600 -o root -g wheel "$stage/fullchain.pem" '/etc/helicoid/tls/fullchain.pem' || exit 90
+        /usr/bin/install -d -m 0700 -o root -g wheel "$tls" || exit 87
+
+        # Mark cleanup before each install so a partial write is removed.
         cert_installed=1
-        /usr/bin/install -m 0600 -o root -g wheel "$stage/private-key.pem" '/etc/helicoid/tls/private-key.pem' || exit 91
+        /usr/bin/install -m 0600 -o root -g wheel "$stage/fullchain.pem" "$tls/fullchain.pem" || exit 90
         key_installed=1
+        /usr/bin/install -m 0600 -o root -g wheel "$stage/private-key.pem" "$tls/private-key.pem" || exit 91
+        check_root_file "$tls/fullchain.pem" || exit 95
+        check_root_file "$tls/private-key.pem" || exit 95
+
+        # The marker is written atomically last: a complete certificate and key
+        # layout is what makes the development TLS material recognizable.
+        marker_tmp_installed=1
+        printf 'helicoid-development-tls-v1\n' > "$marker_tmp" || exit 92
+        /bin/chmod 0600 "$marker_tmp" || exit 93
+        check_root_file "$marker_tmp" || exit 95
+        marker_installed=1
+        /bin/mv -f "$marker_tmp" "$marker" || exit 94
+        marker_tmp_installed=0
+        check_root_file "$marker" || exit 95
+
         cert_installed=0
         key_installed=0
         marker_installed=0
@@ -899,6 +1054,11 @@ protocol ServerInstallServicing: Sendable {
         configuration: InstallerDeploymentConfiguration,
         package: TrustedServerPackage
     ) async throws -> InstallerOperationStatus
+    /// Recovers the exact durable operation configuration after a restart.
+    /// `nil` means no v2 operation is recorded.
+    func storedConfiguration(
+        package: TrustedServerPackage
+    ) async throws -> InstallerDeploymentConfiguration?
     func cancel(
         configuration: InstallerDeploymentConfiguration,
         operationId: String,
@@ -932,6 +1092,11 @@ extension ServerInstallServicing {
         package: TrustedServerPackage
     ) async throws -> InstallerOperationStatus {
         try await status(configuration: configuration)
+    }
+    func storedConfiguration(
+        package: TrustedServerPackage
+    ) async throws -> InstallerDeploymentConfiguration? {
+        nil
     }
     func cancel(
         configuration: InstallerDeploymentConfiguration,
@@ -1052,6 +1217,13 @@ struct BundledServerInstallService: ServerInstallServicing {
     ) async throws -> InstallerOperationStatus {
         let installClient = try client()
         return try await installClient.status(configuration: configuration, package: package)
+    }
+
+    func storedConfiguration(
+        package: TrustedServerPackage
+    ) async throws -> InstallerDeploymentConfiguration? {
+        let installClient = try client()
+        return try await installClient.storedConfiguration(package: package)
     }
 
     func cancel(

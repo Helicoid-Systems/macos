@@ -1,6 +1,82 @@
 import CryptoKit
 import Darwin
 import Foundation
+import Security
+
+/// Release trust is a property of the Manager binary, not of files an attacker
+/// may replace alongside it. The release privileged path is enabled only when
+/// the running Manager has an independently verified Apple Developer ID
+/// signature and the packaged release trust roots equal keys compiled into the
+/// binary. The default has no compiled keys, so an ordinary or ad-hoc build
+/// fails closed. Development installs remain explicitly ad-hoc.
+struct ServerReleaseTrustPolicy: Sendable {
+    let compiledTrustKeyHexes: [String]
+    let managerIdentityIsTrusted: @Sendable () -> Bool
+
+    init(
+        compiledTrustKeyHexes: [String],
+        managerIdentityIsTrusted: @escaping @Sendable () -> Bool
+    ) {
+        self.compiledTrustKeyHexes = compiledTrustKeyHexes
+            .map { $0.lowercased() }
+            .filter { value in value.count == 64 && value.allSatisfy(\.isHexDigit) }
+        self.managerIdentityIsTrusted = managerIdentityIsTrusted
+    }
+
+    static let production = ServerReleaseTrustPolicy(
+        compiledTrustKeyHexes: ServerInstallContract.compiledReleaseTrustKeyHexes,
+        managerIdentityIsTrusted: {
+            ManagerReleaseIdentity.isDeveloperIDTrusted(
+                teamIdentifier: ServerInstallContract.releaseManagerTeamIdentifier)
+        })
+
+    var isAuthorized: Bool {
+        !compiledTrustKeyHexes.isEmpty && managerIdentityIsTrusted()
+    }
+}
+
+/// Independently verifies that the running Manager is signed by an Apple-
+/// anchored Developer ID certificate for the expected team. An ad-hoc or
+/// unsigned binary fails this check.
+enum ManagerReleaseIdentity {
+    /// Raw values from Security/SecCode.h. Using the numeric flag avoids
+    /// depending on how CF_OPTIONS constants are imported into Swift.
+    private static let signingInformationFlag: UInt32 = 1 << 1 // kSecCSSigningInformation
+    private static let adHocSignatureFlag: UInt32 = 0x0002 // kSecCodeSignatureAdhoc
+
+    static func isDeveloperIDTrusted(teamIdentifier: String) -> Bool {
+        guard !teamIdentifier.isEmpty else { return false }
+
+        var code: SecCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return false }
+
+        let requirementText =
+            "anchor apple generic and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
+        var requirement: SecRequirement?
+        guard SecRequirementCreateWithString(
+                requirementText as CFString, [], &requirement) == errSecSuccess,
+              let requirement,
+              SecCodeCheckValidity(code, [], requirement) == errSecSuccess else {
+            return false
+        }
+
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
+              let staticCode else {
+            return false
+        }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(
+                staticCode,
+                SecCSFlags(rawValue: signingInformationFlag),
+                &information) == errSecSuccess,
+              let dictionary = information as? [String: Any] else {
+            return false
+        }
+        let signatureFlags = (dictionary[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0
+        return (signatureFlags & adHocSignatureFlag) == 0
+    }
+}
 
 /// A package that passed the Manager's independent signature, product,
 /// target, and artifact checks. The helper still re-verifies the package with
@@ -66,7 +142,7 @@ enum ServerPackageAvailability: Equatable, Sendable {
         switch self {
         case .available(let package):
             if package.isDevelopment {
-                return "DEVELOPMENT ONLY: signed development package \(package.product) \(package.version) is present for \(package.target.rawValue)."
+                return "DEVELOPMENT ONLY (ad-hoc development trust, not a signed release): build-pinned development package \(package.product) \(package.version) is present for \(package.target.rawValue)."
             }
             return "Signed macOS server package \(package.product) \(package.version) is present for \(package.target.rawValue)."
         case .unavailable(let reason), .invalid(let reason):
@@ -203,13 +279,18 @@ struct ServerDevelopmentInstallEvidence: Decodable, Equatable, Sendable {
 struct BundledServerPackageProvider: Sendable {
     let rootURL: URL
     let developmentBuild: ServerDevelopmentBuild
+    let releaseTrust: ServerReleaseTrustPolicy
+    private let releaseAuthorized: Bool
 
     init(
         rootURL: URL = Bundle.main.bundleURL,
-        developmentBuild: ServerDevelopmentBuild = .main
+        developmentBuild: ServerDevelopmentBuild = .main,
+        releaseTrust: ServerReleaseTrustPolicy = .production
     ) {
         self.rootURL = rootURL
         self.developmentBuild = developmentBuild
+        self.releaseTrust = releaseTrust
+        self.releaseAuthorized = releaseTrust.isAuthorized
     }
 
     var helperURL: URL {
@@ -293,6 +374,7 @@ struct BundledServerPackageProvider: Sendable {
     }
 
     private var releasePayloadPresent: Bool {
+        guard releaseAuthorized else { return false }
         guard Self.isRegularFileWithoutSymlink(helperURL),
               Self.isExecutableFileWithoutSymlink(helperURL),
               Self.isRegularFileWithoutSymlink(releaseEvidenceURL),
@@ -309,10 +391,19 @@ struct BundledServerPackageProvider: Sendable {
               Self.validateReleaseEvidenceShape(evidence),
               let roots = try? Self.readTrustRoots(trustRootsURL),
               roots.schema == 1,
-              !roots.releaseKeys.isEmpty else {
+              Self.releaseRootsMatch(roots, policy: releaseTrust) else {
             return false
         }
         return true
+    }
+
+    private static func releaseRootsMatch(
+        _ roots: ServerPackageTrustRoots,
+        policy: ServerReleaseTrustPolicy
+    ) -> Bool {
+        let packaged = Set(roots.releaseKeys.map { $0.lowercased() })
+        let compiled = Set(policy.compiledTrustKeyHexes)
+        return !packaged.isEmpty && packaged == compiled
     }
 
     func availability() -> ServerPackageAvailability {
@@ -347,6 +438,10 @@ struct BundledServerPackageProvider: Sendable {
     }
 
     private func releaseAvailability() -> ServerPackageAvailability {
+        guard releaseAuthorized else {
+            return .unavailable(reason:
+                "Release installation requires a Developer ID-signed Manager and release trust keys compiled into this binary. This build is not authorized, so the release privileged path is disabled.")
+        }
         let evidence: ServerReleaseEvidence
         do {
             evidence = try Self.readEvidence(releaseEvidenceURL)
@@ -380,6 +475,10 @@ struct BundledServerPackageProvider: Sendable {
         }
         guard roots.schema == 1, !roots.releaseKeys.isEmpty else {
             return .invalid(reason: "The server trust-root file is invalid or contains no release keys.")
+        }
+        guard Self.releaseRootsMatch(roots, policy: releaseTrust) else {
+            return .invalid(reason:
+                "The packaged release trust roots do not match the release trust keys compiled into this Manager.")
         }
 
         let target: ServerInstallTarget

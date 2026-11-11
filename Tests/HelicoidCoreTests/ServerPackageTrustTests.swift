@@ -10,7 +10,7 @@ struct ServerPackageTrustTests {
         let fixture = try ServerInstallTestSupport.packageFixture()
         defer { fixture.remove() }
 
-        let provider = BundledServerPackageProvider(rootURL: fixture.root)
+        let provider = BundledServerPackageProvider(rootURL: fixture.root, releaseTrust: fixture.releaseTrust)
         #expect(provider.installPayloadPresent)
         let availability = provider.availability()
         guard let package = availability.package else {
@@ -30,7 +30,7 @@ struct ServerPackageTrustTests {
         let fixture = try ServerInstallTestSupport.packageFixture(developmentEvidence: true)
         defer { fixture.remove() }
 
-        let provider = BundledServerPackageProvider(rootURL: fixture.root)
+        let provider = BundledServerPackageProvider(rootURL: fixture.root, releaseTrust: fixture.releaseTrust)
         #expect(!provider.installPayloadPresent)
         guard case .unavailable(let reason) = provider.availability() else {
             Issue.record("Development evidence must remain unavailable")
@@ -44,7 +44,7 @@ struct ServerPackageTrustTests {
         let fixture = try ServerInstallTestSupport.packageFixture(tamperArtifact: true)
         defer { fixture.remove() }
 
-        let provider = BundledServerPackageProvider(rootURL: fixture.root)
+        let provider = BundledServerPackageProvider(rootURL: fixture.root, releaseTrust: fixture.releaseTrust)
         guard case .invalid(let reason) = provider.availability() else {
             Issue.record("Tampered artifact must be invalid")
             return
@@ -64,7 +64,10 @@ struct ServerPackageTrustTests {
         ]
         try ServerInstallTestSupport.jsonData(roots).write(to: fixture.trustRootsURL)
 
-        let provider = BundledServerPackageProvider(rootURL: fixture.root)
+        let provider = BundledServerPackageProvider(
+            rootURL: fixture.root,
+            releaseTrust: ServerInstallTestSupport.authorizedReleaseTrust(
+                keys: [ServerInstallTestSupport.hex(differentKey.publicKey.rawRepresentation)]))
         guard case .invalid(let reason) = provider.availability() else {
             Issue.record("Untrusted signing key must be invalid")
             return
@@ -142,7 +145,8 @@ struct ServerPackageTrustTests {
 
         let provider = BundledServerPackageProvider(
             rootURL: fixture.root,
-            developmentBuild: development.developmentBuild)
+            developmentBuild: development.developmentBuild,
+            releaseTrust: fixture.releaseTrust)
         #expect(provider.payloadKind == .release)
         guard case .invalid = provider.availability() else {
             Issue.record("Broken release evidence must not fall back to development")
@@ -159,7 +163,7 @@ struct ServerPackageTrustTests {
         let fixture = try ServerInstallTestSupport.packageFixture(platform: other)
         defer { fixture.remove() }
 
-        let provider = BundledServerPackageProvider(rootURL: fixture.root)
+        let provider = BundledServerPackageProvider(rootURL: fixture.root, releaseTrust: fixture.releaseTrust)
         guard case .invalid(let reason) = provider.availability() else {
             Issue.record("Wrong target must be invalid")
             return
@@ -179,7 +183,7 @@ struct ServerPackageTrustTests {
             at: artifact,
             withDestinationURL: fixture.helperURL)
 
-        let provider = BundledServerPackageProvider(rootURL: fixture.root)
+        let provider = BundledServerPackageProvider(rootURL: fixture.root, releaseTrust: fixture.releaseTrust)
         #expect(!provider.installPayloadPresent)
         guard case .invalid = provider.availability() else {
             Issue.record("Symlinked artifact must be refused")
@@ -192,7 +196,7 @@ struct ServerPackageTrustTests {
         let fixture = try ServerInstallTestSupport.packageFixture(helperMatchesEvidence: false)
         defer { fixture.remove() }
 
-        let provider = BundledServerPackageProvider(rootURL: fixture.root)
+        let provider = BundledServerPackageProvider(rootURL: fixture.root, releaseTrust: fixture.releaseTrust)
         guard case .invalid(let reason) = provider.availability() else {
             Issue.record("Helper digest mismatch must be invalid")
             return
@@ -206,13 +210,44 @@ struct ServerPackageTrustTests {
         defer { fixture.remove() }
         try Data("not-json".utf8).write(to: fixture.trustRootsURL)
 
-        let provider = BundledServerPackageProvider(rootURL: fixture.root)
+        let provider = BundledServerPackageProvider(rootURL: fixture.root, releaseTrust: fixture.releaseTrust)
         #expect(!provider.installPayloadPresent)
         guard case .unavailable(let reason) = provider.availability() else {
             Issue.record("Malformed trust roots must be unavailable")
             return
         }
         #expect(reason.localizedCaseInsensitiveContains("trust root"))
+    }
+
+    @Test("Release install fails closed without compiled trust keys and a signed Manager")
+    func releasePathFailsClosedWithoutCompiledTrust() throws {
+        let fixture = try ServerInstallTestSupport.packageFixture()
+        defer { fixture.remove() }
+
+        let provider = BundledServerPackageProvider(rootURL: fixture.root, releaseTrust: .production)
+        #expect(!provider.installPayloadPresent)
+        guard case .unavailable(let reason) = provider.availability() else {
+            Issue.record("An unauthorized release build must be unavailable")
+            return
+        }
+        #expect(reason.contains("Developer ID") || reason.contains("not authorized"))
+    }
+
+    @Test("Release install refuses packaged trust roots that were not compiled in")
+    func releasePathRefusesUncompiledTrustRoot() throws {
+        let fixture = try ServerInstallTestSupport.packageFixture()
+        defer { fixture.remove() }
+        let otherKey = Curve25519.Signing.PrivateKey()
+        let policy = ServerInstallTestSupport.authorizedReleaseTrust(
+            keys: [ServerInstallTestSupport.hex(otherKey.publicKey.rawRepresentation)])
+
+        let provider = BundledServerPackageProvider(rootURL: fixture.root, releaseTrust: policy)
+        #expect(!provider.installPayloadPresent)
+        guard case .invalid(let reason) = provider.availability() else {
+            Issue.record("A swapped packaged trust root must be refused")
+            return
+        }
+        #expect(reason.contains("do not match"))
     }
 
     @Test("Strict artifact paths reject traversal and Windows aliases")
