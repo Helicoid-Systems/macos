@@ -9,8 +9,9 @@
 # Reproducibility: the server and core refs are pinned below, but the Manager
 # ref is the triggering ref. A dispatch from another Manager ref can still
 # produce a different archive, so this is not a reproducible release input.
-# The server CI/acceptance for the pinned SHA has not verified the native TLS
-# helper and is not claimed by this workflow.
+# Server CI for the previous pin passed tests but failed clippy; the fix is
+# pending for the pinned SHA. The native TLS helper remains unverified and no
+# CI/acceptance success is claimed by this workflow.
 #
 # The non-privileged server development-feature tests gate this build. The
 # privileged install/rollback acceptance remains in the server repository's
@@ -75,14 +76,14 @@ jobs:
 
       # Pinned server commit. Do not replace this with a branch: the server ref
       # must move only by an explicit commit change so the archive remains
-      # traceable. This pin includes the native TLS helper change, which has not
-      # been verified by server CI/acceptance yet. No server CI/acceptance
-      # success is claimed by this workflow.
+      # traceable. This pin includes the native TLS helper change. Server CI for
+      # the previous pin passed tests but failed clippy, so the fix is pending
+      # for this SHA. No server CI/acceptance success is claimed here.
       - name: Checkout pinned server
         uses: actions/checkout@v4
         with:
           repository: Helicoid-Systems/server
-          ref: 8640a7630e35212c205b7b1a7ab71900f860da2e
+          ref: 39994d071fa74ff2f6079f0a545e109580f9285a
           path: server
           persist-credentials: false
 
@@ -99,7 +100,7 @@ jobs:
           set -euo pipefail
           server_sha="$(git -C server rev-parse HEAD)"
           core_sha="$(git -C core rev-parse HEAD)"
-          test "$server_sha" = "8640a7630e35212c205b7b1a7ab71900f860da2e" || {
+          test "$server_sha" = "39994d071fa74ff2f6079f0a545e109580f9285a" || {
             echo "::error::Server checkout is $server_sha, not the pinned commit."
             exit 1
           }
@@ -715,8 +716,8 @@ jobs:
             echo "It is **not** a release, not notarized, and not for distribution."
             echo ""
             echo "- Manager ref: \`${GITHUB_REF_NAME}\` at \`${GITHUB_SHA}\`"
-            echo "- Server commit: \`8640a7630e35212c205b7b1a7ab71900f860da2e\`"
-            echo "- Server CI/acceptance for that commit: the native TLS helper is unverified; no pass is claimed by this workflow."
+            echo "- Server commit: \`39994d071fa74ff2f6079f0a545e109580f9285a\`"
+            echo "- Server CI/acceptance for that commit: pending (the previous pin passed tests but failed clippy); the native TLS helper is unverified, and no pass is claimed by this workflow."
             if [ -d core/.git ]; then
               echo "- Core commit: \`$(git -C core rev-parse HEAD)\`"
             fi

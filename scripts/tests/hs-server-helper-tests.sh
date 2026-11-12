@@ -4,29 +4,123 @@
 # Uses disposable app bundles and locally compiled fixture Mach-O files. It
 # never installs, launches, inspects system state outside the scratch directory,
 # or deletes pre-existing files.
-set -euo pipefail
+#
+# Diagnostics: an expected refusal is reported by expect_failure, but any other
+# non-zero status (fixture build, codesign, plutil, a runaway set -e abort) is
+# reported with its line, command, stage, and the tail of the captured command
+# output. The same report is appended to $GITHUB_STEP_SUMMARY when that file is
+# set, because the step log can be lost entirely by the CI runner. Build-pinned
+# key material is redacted before anything is printed or summarised. Set
+# HELICOID_TEST_KEEP_SCRATCH=1 to keep the scratch directory on failure.
+set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 HELPER_SCRIPT="$ROOT/scripts/hs-server-helper.sh"
 DEVELOPMENT_BUNDLE_SCRIPT="$ROOT/scripts/hs-server-development-bundle.sh"
-SCRATCH="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/helicoid-helper-tests.XXXXXX")"
-LOG="$SCRATCH/last-command.log"
 PASS_COUNT=0
+SECTION="startup"
+FAILED=0
+KEEP_SCRATCH="${HELICOID_TEST_KEEP_SCRATCH:-0}"
+SCRATCH=""
+LOG=""
 
-cleanup() { /bin/rm -rf "$SCRATCH"; }
-trap cleanup EXIT
+# Append to the CI step summary when available. This survives a lost step log.
+summary() {
+  [ -z "${GITHUB_STEP_SUMMARY:-}" ] || printf '%s\n' "$*" >>"$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+}
 
-pass() { PASS_COUNT=$((PASS_COUNT + 1)); printf 'PASS: %s\n' "$1"; }
+# Diagnostics must never leak key material. The fixture key is synthetic, but a
+# captured command log can contain it and CI logs are permanent.
+redact() {
+  local text="$1"
+  if [ -n "${DEV_KEY_HEX:-}" ]; then
+    text="${text//$DEV_KEY_HEX/<redacted-trust-key>}"
+  fi
+  printf '%s' "$text"
+}
+
+show_last_command_output() {
+  local output
+  [ -n "${LOG:-}" ] && [ -s "$LOG" ] || return 0
+  output="$(redact "$(/usr/bin/tail -n 80 "$LOG")")"
+  printf '%s\n' '--- last captured command output (tail) ---' >&2
+  printf '%s\n' "$output" >&2
+  printf '%s\n' '--- end last captured command output ---' >&2
+}
+
+summary_last_command_output() {
+  [ -n "${LOG:-}" ] && [ -s "$LOG" ] || return 0
+  summary '```'
+  summary "$(redact "$(/usr/bin/tail -n 80 "$LOG")")"
+  summary '```'
+}
+
+cleanup() { [ -z "${SCRATCH:-}" ] || /bin/rm -rf "$SCRATCH" || true; }
+
+# Any command that fails outside an expected-refusal check reaches here. Without
+# this trap, `set -e` aborts with no location and no captured output.
+on_error() {
+  local status="$1" line="$2" context="$3" command="$4"
+  FAILED=1
+  printf 'FAIL: unexpected command failure (status %s)\n' "$status" >&2
+  printf 'FAIL: at line %s in %s (stage: %s)\n' "$line" "$context" "$SECTION" >&2
+  printf 'FAIL: command: %s\n' "$(redact "$command")" >&2
+  show_last_command_output
+  summary "FAIL: unexpected command failure (status $status) at line $line in $context, stage: $SECTION"
+  summary "command: $(redact "$command")"
+  summary_last_command_output
+}
+trap 'on_error "$?" "$LINENO" "${FUNCNAME[1]:-main}" "$BASH_COMMAND"' ERR
+
+on_exit() {
+  local status="$?"
+  trap - EXIT ERR
+  if [ "$status" -eq 0 ]; then
+    [ "$PASS_COUNT" -eq 0 ] || summary "passed: $PASS_COUNT development hs-server helper packaging checks"
+    cleanup
+    return 0
+  fi
+  if [ "$FAILED" != 1 ]; then
+    printf 'FAIL: exited %s without a diagnostic (stage: %s)\n' "$status" "$SECTION" >&2
+    show_last_command_output
+    summary "FAIL: exited $status without a diagnostic (stage: $SECTION)"
+  fi
+  if [ "$KEEP_SCRATCH" = 1 ]; then
+    printf 'note: kept scratch directory for inspection: %s\n' "${SCRATCH:-none}" >&2
+    summary "scratch kept: ${SCRATCH:-none}"
+    return 0
+  fi
+  cleanup
+}
+trap on_exit EXIT
+
+stage() {
+  SECTION="$1"
+  printf 'STAGE: %s\n' "$1"
+  summary "stage: $1"
+}
+
+pass() {
+  PASS_COUNT=$((PASS_COUNT + 1))
+  printf 'PASS: %s\n' "$1"
+  summary "PASS: $1"
+}
 
 fail_test() {
-  printf 'FAIL: %s\n' "$1" >&2
-  [ ! -f "$LOG" ] || { printf '%s\n' '--- last command output ---' >&2; /bin/cat "$LOG" >&2; }
+  local description="$1"
+  FAILED=1
+  printf 'FAIL: %s\n' "$description" >&2
+  printf 'FAIL: at line %s (stage: %s)\n' "${BASH_LINENO[0]:-?}" "$SECTION" >&2
+  show_last_command_output
+  summary "FAIL: $description (stage: $SECTION)"
+  summary_last_command_output
   exit 1
 }
 
 expect_success() {
   local description="$1"
   shift
+  printf 'RUN: %s\n' "$description"
   if ! "$@" >"$LOG" 2>&1; then fail_test "$description"; fi
   pass "$description"
 }
@@ -34,9 +128,32 @@ expect_success() {
 expect_failure() {
   local description="$1"
   shift
-  if "$@" >"$LOG" 2>&1; then fail_test "$description (command unexpectedly succeeded)"; fi
+  printf 'RUN: %s (expecting refusal)\n' "$description"
+  if "$@" >"$LOG" 2>&1; then
+    fail_test "$description (command unexpectedly succeeded)"
+  fi
   pass "$description"
 }
+
+SCRATCH="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/helicoid-helper-tests.XXXXXX")"
+LOG="$SCRATCH/last-command.log"
+
+# Fail with a named requirement instead of an unexplained early abort.
+stage "preflight"
+require_executable() {
+  local path="$1" label="$2"
+  [ -x "$path" ] || fail_test "missing required $label: $path"
+}
+require_command() {
+  local name="$1" label="$2"
+  command -v "$name" >/dev/null 2>&1 || fail_test "missing required $label on PATH: $name"
+}
+require_executable "$HELPER_SCRIPT" "development helper script"
+require_executable "$DEVELOPMENT_BUNDLE_SCRIPT" "development bundle script"
+require_executable /usr/bin/xcrun "xcrun"
+require_executable /usr/bin/codesign "codesign"
+require_executable /usr/bin/plutil "plutil"
+require_command python3 "python3 (used by the development bundle packager)"
 
 HOST_ARCH="$(/usr/bin/uname -m)"
 case "$HOST_ARCH" in
@@ -45,6 +162,7 @@ case "$HOST_ARCH" in
   *) printf 'SKIP: unsupported host architecture %s\n' "$HOST_ARCH"; exit 0 ;;
 esac
 
+stage "fixture builds"
 /bin/cat > "$SCRATCH/main.c" <<'C_EOF'
 int main(void) { return 0; }
 C_EOF
@@ -81,6 +199,7 @@ printf '#!/bin/sh\nexit 0\n' > "$SCRATCH/script"
   -replace -output "$SCRATCH/universal-too-new" "$SCRATCH/universal-bad"
 
 # A capabilities-only Mach-O fixture for the development install packager.
+stage "development install fixtures"
 /bin/cat > "$SCRATCH/hs-server-dev.c" <<'C_EOF'
 #include <stdio.h>
 #include <string.h>
@@ -194,6 +313,7 @@ assert_evidence() {
 }
 
 # Default state and source validation.
+stage "default state and source validation"
 APP="$SCRATCH/Test Manager.app"
 new_app "$APP"
 expect_success "default app has no helper" \
@@ -204,6 +324,7 @@ expect_success "development bundle assert-absent accepts a fresh app path" \
   "$DEVELOPMENT_BUNDLE_SCRIPT" assert-absent --app "$SCRATCH/FreshBundle.app"
 
 DEVELOPMENT_APP="$SCRATCH/DevelopmentBundle.app"
+stage "development install bundle packaging"
 new_app "$DEVELOPMENT_APP"
 DEV_KEY_HEX="$(printf 'a%.0s' {1..64})"
 expect_success "packages development install bundle at the exact package path" \
@@ -238,6 +359,7 @@ expect_failure "check-source rejects a too-new helper" \
   check_file "$SCRATCH/too-new" "$APP"
 
 # Successful packaging and verification.
+stage "successful packaging and verification"
 SOURCE_SHA_BEFORE="$(sha_of "$SCRATCH/valid-host")"
 expect_success "packages a compatible helper" \
   package_file "$SCRATCH/valid-host" "$APP"
@@ -271,6 +393,7 @@ expect_success "packages a path containing shell metacharacters" \
 pass "source path metacharacters are never evaluated"
 
 # Invalid requested helpers fail without touching existing output.
+stage "invalid helper inputs"
 INVALID_APP="$SCRATCH/Invalid.app"
 new_app "$INVALID_APP"
 for spec in \
@@ -296,6 +419,7 @@ expect_success "failed requests leave no helper behind" \
   "$HELPER_SCRIPT" assert-absent --app "$INVALID_APP"
 
 # Existing artifacts are refused and preserved, never replaced or deleted.
+stage "existing artifact refusal"
 CONFLICT_APP="$SCRATCH/Conflict.app"
 new_app "$CONFLICT_APP"
 expect_success "prepare existing helper artifacts" \
@@ -340,6 +464,7 @@ expect_failure "assert-absent refuses pre-existing evidence" \
 pass "assert-absent does not change pre-existing evidence"
 
 # A stale release payload must not survive development repackaging.
+stage "stale release payload refusal"
 RELEASE_APP="$SCRATCH/Release.app"
 new_app "$RELEASE_APP"
 printf '{"schema":1}\n' > "$RELEASE_APP/Contents/Resources/hs-server-release.json"
@@ -364,6 +489,7 @@ expect_failure "assert-absent refuses pre-existing signed server package" \
 pass "stale release payload is refused and preserved"
 
 # Development install payloads are also refused on a repackage.
+stage "development payload refusal"
 DEV_INSTALL_APP="$SCRATCH/DevelopmentInstall.app"
 new_app "$DEV_INSTALL_APP"
 /bin/mkdir -p "$DEV_INSTALL_APP/Contents/Resources/ServerPackage/development"
@@ -379,6 +505,7 @@ expect_failure "development bundle assert-absent refuses the same payload" \
 pass "development install payload is refused and preserved"
 
 # A symlinked bundle directory is refused instead of writing through it.
+stage "symlinked bundle refusal"
 SYMLINK_APP="$SCRATCH/Symlink.app"
 new_app "$SYMLINK_APP"
 /bin/rm -rf "$SYMLINK_APP/Contents/Resources"
@@ -391,6 +518,7 @@ expect_failure "refuses a symlinked bundle resource directory" \
 pass "symlinked bundle directory is not written through"
 
 # A failed commit rolls back only files created by this run.
+stage "commit rollback"
 ROLLBACK_APP="$SCRATCH/Rollback.app"
 new_app "$ROLLBACK_APP"
 /bin/chmod 555 "$ROLLBACK_APP/Contents/Resources"
@@ -404,6 +532,7 @@ expect_failure "failed commit rolls back the linked helper" \
 pass "failed commit rolls back only newly created files"
 
 # Tampering is refused.
+stage "tamper detection"
 TAMPER_APP="$SCRATCH/Tamper.app"
 new_app "$TAMPER_APP"
 expect_success "prepare digest tamper fixture" package_file "$SCRATCH/valid-host" "$TAMPER_APP"
@@ -423,6 +552,7 @@ printf 'tamper' >> "$BYTE_APP/Contents/Helpers/hs-server"
 expect_failure "tampered helper bytes fail verification" \
   "$HELPER_SCRIPT" verify --app "$BYTE_APP"
 
+stage "final checks"
 if /usr/bin/find "$SCRATCH" -maxdepth 1 -type d -name '.hs-server-helper.*' -print -quit | /usr/bin/grep -q .; then
   fail_test "staging directory was left behind"
 fi
