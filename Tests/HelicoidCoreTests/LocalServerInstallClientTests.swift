@@ -55,77 +55,56 @@ private func helperOutput(_ json: Data, status: Int32 = 0) -> SetupCommandResult
     return SetupCommandResult(exitStatus: 0, output: output)
 }
 
-private actor TLSProvisioningRunner: SetupCommandRunning {
-    private var recorded: [SetupCommand] = []
-    private let shellStatus: Int32
-    private let shellError: Data
-    private let shellThrows: SetupCommandError?
-    private let createFiles: Bool
-
-    init(
-        shellStatus: Int32 = 0,
-        shellError: Data = Data(),
-        shellThrows: SetupCommandError? = nil,
-        createFiles: Bool = true
-    ) {
-        self.shellStatus = shellStatus
-        self.shellError = shellError
-        self.shellThrows = shellThrows
-        self.createFiles = createFiles
-    }
-
-    func run(_ command: SetupCommand) async throws -> SetupCommandResult {
-        recorded.append(command)
-        if command.executable == "/usr/bin/openssl" {
-            if createFiles {
-                guard let certificateIndex = command.arguments.firstIndex(of: "-out"),
-                      let keyIndex = command.arguments.firstIndex(of: "-keyout") else {
-                    throw SetupCommandError.launchFailed
-                }
-                try Data("test-certificate".utf8).write(
-                    to: URL(fileURLWithPath: command.arguments[certificateIndex + 1]))
-                try Data("test-private-key".utf8).write(
-                    to: URL(fileURLWithPath: command.arguments[keyIndex + 1]))
-            }
-            return SetupCommandResult(exitStatus: 0, output: Data())
-        }
-        if command.executable == "/usr/bin/osascript" {
-            if let shellThrows {
-                throw shellThrows
-            }
-            if shellStatus == 0 {
-                return SetupCommandResult(
-                    exitStatus: 0,
-                    output: Data("\n\(PrivilegedInvocationMarker.shellStatus(testNonce))0\n".utf8))
-            }
-            return SetupCommandResult(
-                exitStatus: 0,
-                output: Data("\n\(PrivilegedInvocationMarker.shellStatus(testNonce))\(shellStatus)\n".utf8),
-                errorOutput: shellError)
-        }
-        throw SetupCommandError.launchFailed
-    }
-
-    func commands() -> [SetupCommand] { recorded }
+private func tlsMaterialResponse(
+    outcome: String = "provisioned",
+    certificatePath: String = ServerInstallContract.operatorTLSCertificatePath,
+    privateKeyPath: String = ServerInstallContract.operatorTLSPrivateKeyPath,
+    certificateSHA256: String = String(repeating: "a", count: 64),
+    privateKeySHA256: String = String(repeating: "b", count: 64),
+    authorityHost: String = ServerInstallContract.developmentTLSHost,
+    additional: [String: Any] = [:],
+    remove: [String] = []
+) throws -> Data {
+    var object: [String: Any] = [
+        "outcome": outcome,
+        "certificate_path": certificatePath,
+        "private_key_path": privateKeyPath,
+        "certificate_sha256": certificateSHA256,
+        "private_key_sha256": privateKeySHA256,
+        "authority_host": authorityHost,
+    ]
+    for (key, value) in additional { object[key] = value }
+    for key in remove { object.removeValue(forKey: key) }
+    return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
 }
 
-private func stagedShellScript(from appleScript: String) -> String? {
-    guard let start = appleScript.range(of: "printf '%s' '")?.upperBound,
-          let end = appleScript[start...].range(of: "' | /usr/bin/base64 -D")?.lowerBound else {
-        return nil
-    }
-    guard let data = Data(base64Encoded: String(appleScript[start..<end])) else {
-        return nil
-    }
-    return String(data: data, encoding: .utf8)
+private func tlsExistingResponse(
+    outcome: String = "existing_unverified",
+    certificatePath: String = ServerInstallContract.operatorTLSCertificatePath,
+    privateKeyPath: String = ServerInstallContract.operatorTLSPrivateKeyPath,
+    certificatePresent: Bool = true,
+    privateKeyPresent: Bool = false,
+    authorityHost: String = ServerInstallContract.developmentTLSHost,
+    detail: String = "operator TLS material is present",
+    additional: [String: Any] = [:],
+    remove: [String] = []
+) throws -> Data {
+    var object: [String: Any] = [
+        "outcome": outcome,
+        "certificate_path": certificatePath,
+        "private_key_path": privateKeyPath,
+        "certificate_present": certificatePresent,
+        "private_key_present": privateKeyPresent,
+        "authority_host": authorityHost,
+        "detail": detail,
+    ]
+    for (key, value) in additional { object[key] = value }
+    for key in remove { object.removeValue(forKey: key) }
+    return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
 }
 
-private func base64Request(from script: String) -> Data? {
-    guard let start = script.range(of: "printf '%s' '")?.upperBound,
-          let end = script[start...].range(of: "' |")?.lowerBound else {
-        return nil
-    }
-    return Data(base64Encoded: String(script[start..<end]))
+private func rawTLSResponse(_ object: [String: Any]) throws -> Data {
+    try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
 }
 
 @Suite("Local server install client")
@@ -412,79 +391,118 @@ struct LocalServerInstallClientTests {
         #expect(commands.isEmpty)
     }
 
-    @Test("Development TLS is generated then installed through one privileged shell")
+    @Test("Development TLS accepts provisioned and recovered outcomes")
     func developmentTLSProvisioning() async throws {
         let helper = try executableHelper()
         defer { removeHelper(helper) }
-        let runner = TLSProvisioningRunner()
-        let client = makeClient(helper: helper, runner: runner)
+        let package = TrustedServerPackage.testFixture(
+            helperURL: helper,
+            provenance: .development)
 
-        _ = try await client.provisionDevelopmentTLSIfNeeded()
+        for outcome in ["provisioned", "recovered"] {
+            let runner = ScriptedCommandRunner([
+                .success(helperOutput(try tlsMaterialResponse(outcome: outcome)))
+            ])
+            let client = makeClient(helper: helper, runner: runner)
 
-        let commands = await runner.commands()
-        #expect(commands.count == 2)
-        #expect(commands[0].executable == "/usr/bin/openssl")
-        #expect(commands[0].arguments.contains("-extensions"))
-        #expect(commands[1].executable == "/usr/bin/osascript")
-        guard let shell = stagedShellScript(from: commands[1].arguments[1]) else {
-            Issue.record("Could not recover the TLS install script")
-            return
-        }
-        #expect(shell.contains("if [ -L \"$tls\" ] || [ -e \"$tls\" ]"))
-        #expect(shell.contains("/etc/helicoid/tls"))
-        #expect(shell.contains("-m 0600"))
-        #expect(shell.contains("-o root -g wheel"))
-        #expect(shell.contains("exit 0"))
-    }
+            let result = try await client.provisionDevelopmentTLSIfNeeded(package: package)
+            #expect(result == .provisioned)
 
-    @Test("Development TLS provisioning failure is honest and never reports success")
-    func developmentTLSProvisioningFailure() async throws {
-        let helper = try executableHelper()
-        defer { removeHelper(helper) }
-        let runner = TLSProvisioningRunner(
-            shellStatus: 52,
-            shellError: Data("install refused".utf8))
-        let client = makeClient(helper: helper, runner: runner)
-
-        await #expect(throws: LocalServerInstallError.self) {
-            _ = try await client.provisionDevelopmentTLSIfNeeded()
+            let commands = await runner.commands()
+            #expect(commands.count == 1)
+            guard let shell = stagedShellScript(from: commands[0].arguments[1]) else {
+                Issue.record("Could not recover the staged TLS helper script")
+                continue
+            }
+            #expect(shell.contains("provision-macos-tls"))
+            #expect(shell.contains(package.helperSha256))
+            #expect(shell.contains(ServerInstallContract.payloadStagingRoot))
+            #expect(shell.contains("shasum -a 256"))
         }
     }
 
-    @Test("Existing unverified TLS is left untouched and reported")
+    @Test("Existing unverified TLS continues to the reviewed plan")
     func developmentTLSExistingUnverified() async throws {
         let helper = try executableHelper()
         defer { removeHelper(helper) }
-        let runner = TLSProvisioningRunner(shellStatus: 42)
+        let package = TrustedServerPackage.testFixture(
+            helperURL: helper,
+            provenance: .development)
+        let runner = ScriptedCommandRunner([
+            .success(helperOutput(try tlsExistingResponse()))
+        ])
         let client = makeClient(helper: helper, runner: runner)
 
-        let result = try await client.provisionDevelopmentTLSIfNeeded()
+        let result = try await client.provisionDevelopmentTLSIfNeeded(package: package)
         #expect(result == .existingUnverifiedMaterial)
-        let commands = await runner.commands()
-        guard let appleScript = commands.last?.arguments.last,
-              let shell = stagedShellScript(from: appleScript) else {
-            Issue.record("Could not recover the TLS install script")
-            return
-        }
-        #expect(shell.contains("exit 42"))
-        #expect(shell.contains(".helicoid-development-tls-v1"))
-        #expect(shell.contains("created_tls=1"))
-        #expect(shell.contains("cert_installed=1"))
-        #expect(shell.contains("key_installed=1"))
-        #expect(shell.contains("marker_installed=1"))
-        #expect(shell.contains("/bin/rmdir \"$tls\""))
-        #expect(!shell.contains("rm -rf '/etc/helicoid/tls'"))
     }
 
-    @Test("Privileged TLS timeout after dispatch is an unknown outcome")
+    @Test("Post-dispatch TLS result validation failures are unknown outcomes")
+    func developmentTLSStrictResponse() async throws {
+        let helper = try executableHelper()
+        defer { removeHelper(helper) }
+        let package = TrustedServerPackage.testFixture(
+            helperURL: helper,
+            provenance: .development)
+        let responses: [Data] = [
+            try tlsMaterialResponse(certificatePath: "/etc/helicoid/tls/other.pem"),
+            try tlsMaterialResponse(authorityHost: "example.com"),
+            try tlsMaterialResponse(certificateSHA256: "not-a-digest"),
+            try tlsMaterialResponse(privateKeySHA256: String(repeating: "z", count: 64)),
+            try tlsMaterialResponse(additional: ["note": "unexpected"]),
+            try tlsMaterialResponse(remove: ["certificate_sha256"]),
+            try tlsExistingResponse(certificatePath: "/etc/helicoid/tls/other.pem"),
+            try tlsExistingResponse(authorityHost: "example.com"),
+            try tlsExistingResponse(detail: ""),
+            try tlsExistingResponse(additional: ["certificate_sha256": String(repeating: "a", count: 64)]),
+            try tlsExistingResponse(remove: ["detail"]),
+            try rawTLSResponse([
+                "outcome": "existing_unverified",
+                "certificate_path": ServerInstallContract.operatorTLSCertificatePath,
+                "private_key_path": ServerInstallContract.operatorTLSPrivateKeyPath,
+                "certificate_present": "yes",
+                "private_key_present": true,
+                "authority_host": ServerInstallContract.developmentTLSHost,
+                "detail": "bad boolean type",
+            ]),
+            try rawTLSResponse([
+                "outcome": "unknown",
+                "certificate_path": ServerInstallContract.operatorTLSCertificatePath,
+                "private_key_path": ServerInstallContract.operatorTLSPrivateKeyPath,
+                "certificate_sha256": String(repeating: "a", count: 64),
+                "private_key_sha256": String(repeating: "b", count: 64),
+                "authority_host": ServerInstallContract.developmentTLSHost,
+            ]),
+            try rawTLSResponse(["outcome": 7]),
+        ]
+
+        for response in responses {
+            let runner = ScriptedCommandRunner([.success(helperOutput(response))])
+            let client = makeClient(helper: helper, runner: runner)
+            do {
+                _ = try await client.provisionDevelopmentTLSIfNeeded(package: package)
+                Issue.record("Expected the strict TLS response to be treated as an unknown outcome")
+            } catch let error as LocalServerInstallError {
+                guard case .privilegedOutcomeUnknown = error else {
+                    Issue.record("Expected privilegedOutcomeUnknown, got \(error)")
+                    continue
+                }
+            }
+        }
+    }
+
+    @Test("A dispatched TLS provisioner timeout is an unknown outcome")
     func developmentTLSTimeoutUnknown() async throws {
         let helper = try executableHelper()
         defer { removeHelper(helper) }
-        let runner = TLSProvisioningRunner(shellThrows: .timedOut)
+        let package = TrustedServerPackage.testFixture(
+            helperURL: helper,
+            provenance: .development)
+        let runner = ScriptedCommandRunner([.failure(.timedOut)])
         let client = makeClient(helper: helper, runner: runner)
 
         do {
-            _ = try await client.provisionDevelopmentTLSIfNeeded()
+            _ = try await client.provisionDevelopmentTLSIfNeeded(package: package)
             Issue.record("Expected an unknown TLS outcome")
         } catch let error as LocalServerInstallError {
             guard case .privilegedOutcomeUnknown = error else {
@@ -494,92 +512,50 @@ struct LocalServerInstallClientTests {
         }
     }
 
-    @Test("Development TLS script pins source digests and stages root-owned copies")
-    func developmentTLSScriptPinsDigests() async throws {
+    @Test("Release packages cannot request development TLS")
+    func developmentTLSRequiresDevelopmentProvenance() async throws {
         let helper = try executableHelper()
         defer { removeHelper(helper) }
-        let runner = TLSProvisioningRunner()
-        let client = makeClient(helper: helper, runner: runner)
-        _ = try await client.provisionDevelopmentTLSIfNeeded()
-
-        let commands = await runner.commands()
-        guard let appleScript = commands.last?.arguments.last,
-              let shell = stagedShellScript(from: appleScript) else {
-            Issue.record("Could not recover the TLS install script")
-            return
-        }
-        let certificateHash = ServerPackageVerifier.sha256(Data("test-certificate".utf8))
-        let privateKeyHash = ServerPackageVerifier.sha256(Data("test-private-key".utf8))
-        #expect(shell.contains("stage="))
-        #expect(shell.contains(ServerInstallContract.payloadStagingRoot))
-        #expect(shell.contains("actual_cert="))
-        #expect(shell.contains("actual_key="))
-        #expect(shell.contains(certificateHash))
-        #expect(shell.contains(privateKeyHash))
-        #expect(shell.contains("install -d -m 0700 -o root -g wheel"))
-        #expect(shell.contains("if [ -L \"$tls\" ] || [ -e \"$tls\" ]"))
-        #expect(shell.contains("check_root_file"))
-        #expect(shell.contains("exit 42"))
-        #expect(shell.contains("exit 43"))
-        #expect(shell.contains("marker_tmp"))
-        #expect(shell.contains("/bin/mv -f"))
-        if let certRange = shell.range(of: "\"$tls/fullchain.pem\" || exit 90"),
-           let markerWrite = shell.range(of: "printf 'helicoid-development-tls-v1"),
-           let markerRename = shell.range(of: "/bin/mv -f \"$marker_tmp\" \"$marker\"") {
-            #expect(certRange.lowerBound < markerWrite.lowerBound)
-            #expect(markerWrite.lowerBound < markerRename.lowerBound)
-        } else {
-            Issue.record("Expected certificate install before atomic marker rename")
-        }
-    }
-
-    @Test("A signal-style TLS installer status is an unknown outcome")
-    func developmentTLSSignalUnknown() async throws {
-        let helper = try executableHelper()
-        defer { removeHelper(helper) }
-        let runner = TLSProvisioningRunner(shellStatus: 137)
+        let package = TrustedServerPackage.testFixture(
+            helperURL: helper,
+            provenance: .release)
+        let runner = ScriptedCommandRunner([])
         let client = makeClient(helper: helper, runner: runner)
 
         do {
-            _ = try await client.provisionDevelopmentTLSIfNeeded()
-            Issue.record("Expected an unknown TLS outcome")
-        } catch let error as LocalServerInstallError {
-            guard case .privilegedOutcomeUnknown = error else {
-                Issue.record("Expected privilegedOutcomeUnknown, got \(error)")
-                return
-            }
-        }
-    }
-
-    @Test("Existing owned TLS that is not exact root-owned 0600 fails closed untouched")
-    func developmentTLSExistingOwnedInvalid() async throws {
-        let helper = try executableHelper()
-        defer { removeHelper(helper) }
-        let runner = TLSProvisioningRunner(shellStatus: 43)
-        let client = makeClient(helper: helper, runner: runner)
-
-        do {
-            _ = try await client.provisionDevelopmentTLSIfNeeded()
-            Issue.record("Expected a refusal for inexact existing TLS")
+            _ = try await client.provisionDevelopmentTLSIfNeeded(package: package)
+            Issue.record("Expected a provenance refusal")
         } catch let error as LocalServerInstallError {
             guard case .developmentTLSProvisioningFailed(let detail) = error else {
                 Issue.record("Expected developmentTLSProvisioningFailed, got \(error)")
                 return
             }
-            #expect(detail.contains("left untouched"))
+            #expect(detail.contains("development-only"))
+            #expect(detail.contains("No helper was run"))
         }
+        let commands = await runner.commands()
+        #expect(commands.isEmpty)
     }
 
-    @Test("Development TLS generator that writes no files is refused")
-    func developmentTLSGeneratorWithoutFiles() async throws {
+    @Test("The no-package TLS entry point never executes a helper")
+    func developmentTLSNoPackageGated() async throws {
         let helper = try executableHelper()
         defer { removeHelper(helper) }
-        let runner = TLSProvisioningRunner(createFiles: false)
+        let runner = ScriptedCommandRunner([])
         let client = makeClient(helper: helper, runner: runner)
 
-        await #expect(throws: LocalServerInstallError.self) {
+        do {
             _ = try await client.provisionDevelopmentTLSIfNeeded()
+            Issue.record("Expected the no-package entry point to be gated")
+        } catch let error as LocalServerInstallError {
+            guard case .developmentTLSProvisioningFailed(let detail) = error else {
+                Issue.record("Expected developmentTLSProvisioningFailed, got \(error)")
+                return
+            }
+            #expect(detail.contains("verified development package"))
         }
+        let commands = await runner.commands()
+        #expect(commands.isEmpty)
     }
 
     @Test("Only the final nonce-bound status marker is trusted")

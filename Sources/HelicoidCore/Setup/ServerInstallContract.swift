@@ -34,6 +34,7 @@ enum ServerInstallContract {
     /// enables the release privileged path. A release pipeline populates them
     /// in a generated source file at build time.
     static let compiledReleaseTrustKeyHexes: [String] = []
+    static let compiledReleaseHelperSHA256: String = ""
     static let releaseManagerTeamIdentifier: String = ""
 
     static let installerStateDirectory = "/Library/Application Support/Helicoid-Installer"
@@ -57,6 +58,7 @@ enum ServerInstallContract {
     static let operatorTLSDirectory = "/etc/helicoid/tls"
     static let operatorTLSCertificatePath = "/etc/helicoid/tls/fullchain.pem"
     static let operatorTLSPrivateKeyPath = "/etc/helicoid/tls/private-key.pem"
+    static let developmentTLSHost = "127.0.0.1"
 
     static let macosArm64Target = "macos-arm64"
     static let macosX86_64Target = "macos-x86_64"
@@ -209,6 +211,171 @@ enum InstallerJSON {
             return Data(raw[first...last])
         }
         return nil
+    }
+}
+
+// MARK: - macOS development TLS provisioning result
+
+/// Strict response of the feature-gated root helper subcommand
+/// `hs-server installer provision-macos-tls`.
+///
+/// The server emits exactly one of two shapes discriminated by `outcome`:
+/// - `provisioned` / `recovered`: paths, SHA-256 digests, and authority host
+/// - `existing_unverified`: paths, presence flags, authority host, and detail
+enum InstallerMacOSDevelopmentTLSResult: Equatable, Sendable {
+    case provisioned(
+        certificatePath: String,
+        privateKeyPath: String,
+        certificateSHA256: String,
+        privateKeySHA256: String,
+        authorityHost: String)
+    case recovered(
+        certificatePath: String,
+        privateKeyPath: String,
+        certificateSHA256: String,
+        privateKeySHA256: String,
+        authorityHost: String)
+    case existingUnverified(
+        certificatePath: String,
+        privateKeyPath: String,
+        certificatePresent: Bool,
+        privateKeyPresent: Bool,
+        authorityHost: String,
+        detail: String)
+
+    private enum Outcome: String {
+        case provisioned
+        case recovered
+        case existingUnverified = "existing_unverified"
+    }
+
+    private struct ProvisionedResponse: Decodable {
+        let outcome: String
+        let certificatePath: String
+        let privateKeyPath: String
+        let certificateSHA256: String
+        let privateKeySHA256: String
+        let authorityHost: String
+
+        enum CodingKeys: String, CodingKey {
+            case outcome
+            case certificatePath = "certificate_path"
+            case privateKeyPath = "private_key_path"
+            case certificateSHA256 = "certificate_sha256"
+            case privateKeySHA256 = "private_key_sha256"
+            case authorityHost = "authority_host"
+        }
+    }
+
+    private struct ExistingResponse: Decodable {
+        let outcome: String
+        let certificatePath: String
+        let privateKeyPath: String
+        let certificatePresent: Bool
+        let privateKeyPresent: Bool
+        let authorityHost: String
+        let detail: String
+
+        enum CodingKeys: String, CodingKey {
+            case outcome
+            case certificatePath = "certificate_path"
+            case privateKeyPath = "private_key_path"
+            case certificatePresent = "certificate_present"
+            case privateKeyPresent = "private_key_present"
+            case authorityHost = "authority_host"
+            case detail
+        }
+    }
+
+    private static let commonKeys: Set<String> = [
+        "outcome", "certificate_path", "private_key_path", "authority_host",
+    ]
+    private static let provisionedKeys = commonKeys.union([
+        "certificate_sha256", "private_key_sha256",
+    ])
+    private static let existingKeys = commonKeys.union([
+        "certificate_present", "private_key_present", "detail",
+    ])
+    private static let maximumDetailLength = 4096
+
+    static func decodeStrict(_ data: Data) throws -> InstallerMacOSDevelopmentTLSResult {
+        guard let raw = try? JSONSerialization.jsonObject(with: data),
+              let object = raw as? [String: Any],
+              let outcomeRaw = object["outcome"] as? String,
+              let outcome = Outcome(rawValue: outcomeRaw) else {
+            throw LocalServerInstallError.invalidResponse(
+                "The macOS TLS provisioner response did not contain a recognized outcome.")
+        }
+
+        switch outcome {
+        case .provisioned, .recovered:
+            guard Set(object.keys) == provisionedKeys,
+                  let response = try? JSONDecoder().decode(ProvisionedResponse.self, from: data),
+                  response.outcome == outcomeRaw else {
+                throw LocalServerInstallError.invalidResponse(
+                    "The macOS TLS provisioner material response did not match the required fields.")
+            }
+            try validateCommon(
+                certificatePath: response.certificatePath,
+                privateKeyPath: response.privateKeyPath,
+                authorityHost: response.authorityHost)
+            guard isSHA256Hex(response.certificateSHA256),
+                  isSHA256Hex(response.privateKeySHA256) else {
+                throw LocalServerInstallError.invalidResponse(
+                    "The macOS TLS provisioner reported malformed certificate or private-key digests.")
+            }
+            if outcome == .provisioned {
+                return .provisioned(
+                    certificatePath: response.certificatePath,
+                    privateKeyPath: response.privateKeyPath,
+                    certificateSHA256: response.certificateSHA256,
+                    privateKeySHA256: response.privateKeySHA256,
+                    authorityHost: response.authorityHost)
+            }
+            return .recovered(
+                certificatePath: response.certificatePath,
+                privateKeyPath: response.privateKeyPath,
+                certificateSHA256: response.certificateSHA256,
+                privateKeySHA256: response.privateKeySHA256,
+                authorityHost: response.authorityHost)
+        case .existingUnverified:
+            guard Set(object.keys) == existingKeys,
+                  let response = try? JSONDecoder().decode(ExistingResponse.self, from: data),
+                  response.outcome == outcomeRaw,
+                  !response.detail.isEmpty,
+                  response.detail.count <= maximumDetailLength else {
+                throw LocalServerInstallError.invalidResponse(
+                    "The macOS TLS provisioner existing-unverified response did not match the required fields.")
+            }
+            try validateCommon(
+                certificatePath: response.certificatePath,
+                privateKeyPath: response.privateKeyPath,
+                authorityHost: response.authorityHost)
+            return .existingUnverified(
+                certificatePath: response.certificatePath,
+                privateKeyPath: response.privateKeyPath,
+                certificatePresent: response.certificatePresent,
+                privateKeyPresent: response.privateKeyPresent,
+                authorityHost: response.authorityHost,
+                detail: response.detail)
+        }
+    }
+
+    private static func validateCommon(
+        certificatePath: String,
+        privateKeyPath: String,
+        authorityHost: String
+    ) throws {
+        guard certificatePath == ServerInstallContract.operatorTLSCertificatePath,
+              privateKeyPath == ServerInstallContract.operatorTLSPrivateKeyPath,
+              authorityHost == ServerInstallContract.developmentTLSHost else {
+            throw LocalServerInstallError.invalidResponse(
+                "The macOS TLS provisioner reported unexpected certificate/key paths or an unexpected authority host.")
+        }
+    }
+
+    private static func isSHA256Hex(_ value: String) -> Bool {
+        value.count == 64 && value.allSatisfy(\.isHexDigit)
     }
 }
 

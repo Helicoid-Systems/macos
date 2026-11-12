@@ -9,14 +9,19 @@ enum ServerInstallTestSupport {
 
     /// Test-only release policy seam. It authorizes the release path without
     /// an Apple-signed test runner; production defaults to fail-closed.
-    static func authorizedReleaseTrust(keys: [String]) -> ServerReleaseTrustPolicy {
+    static func authorizedReleaseTrust(
+        keys: [String],
+        helperSHA256: String
+    ) -> ServerReleaseTrustPolicy {
         ServerReleaseTrustPolicy(
             compiledTrustKeyHexes: keys,
+            compiledHelperSHA256: helperSHA256,
             managerIdentityIsTrusted: { true })
     }
 
     static let failClosedReleaseTrust = ServerReleaseTrustPolicy(
         compiledTrustKeyHexes: [],
+        compiledHelperSHA256: "",
         managerIdentityIsTrusted: { true })
 
     static func jsonData(_ object: [String: Any]) throws -> Data {
@@ -338,9 +343,16 @@ struct TestPackageFixture {
     }
 
     /// Test-only policy that authorizes the release path with the fixture's
-    /// key. Production uses an Apple-signed Manager and compiled keys.
+    /// key and helper digest. Production uses an Apple-signed Manager and
+    /// compiled keys/digest.
     var releaseTrust: ServerReleaseTrustPolicy {
-        ServerInstallTestSupport.authorizedReleaseTrust(keys: [pinnedKeyHex])
+        ServerInstallTestSupport.authorizedReleaseTrust(
+            keys: [pinnedKeyHex],
+            helperSHA256: helperSHA256)
+    }
+
+    var helperSHA256: String {
+        (try? ServerPackageVerifier.sha256File(helperURL, maxBytes: 512 * 1024 * 1024)) ?? ""
     }
 
     func remove() {
@@ -375,6 +387,7 @@ actor FakeInstallService: ServerInstallServicing {
     private(set) var applyConfigurations: [InstallerDeploymentConfiguration] = []
     private(set) var statusConfigurations: [InstallerDeploymentConfiguration] = []
     private(set) var cancelConfigurations: [InstallerDeploymentConfiguration] = []
+    private(set) var tlsProvisionPackage: TrustedServerPackage?
 
     init(
         installPayloadPresent: Bool = true,
@@ -424,8 +437,11 @@ actor FakeInstallService: ServerInstallServicing {
         return availabilityValue
     }
 
-    func provisionDevelopmentTLSIfNeeded() async throws -> DevelopmentTLSProvisioningResult {
+    func provisionDevelopmentTLSIfNeeded(
+        package: TrustedServerPackage
+    ) async throws -> DevelopmentTLSProvisioningResult {
         calls.append("provisionTLS")
+        tlsProvisionPackage = package
         if let tlsProvisionError { throw tlsProvisionError }
         return tlsProvisionResult
     }
@@ -504,6 +520,7 @@ actor FakeInstallService: ServerInstallServicing {
     func recordedApplyConfigurations() -> [InstallerDeploymentConfiguration] { applyConfigurations }
     func recordedStatusConfigurations() -> [InstallerDeploymentConfiguration] { statusConfigurations }
     func recordedCancelConfigurations() -> [InstallerDeploymentConfiguration] { cancelConfigurations }
+    func recordedTLSProvisionPackage() -> TrustedServerPackage? { tlsProvisionPackage }
 }
 
 actor InMemoryIdentityKeyStore: ManagerIdentityKeyStoring {

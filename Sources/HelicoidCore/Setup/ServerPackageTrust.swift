@@ -11,27 +11,38 @@ import Security
 /// fails closed. Development installs remain explicitly ad-hoc.
 struct ServerReleaseTrustPolicy: Sendable {
     let compiledTrustKeyHexes: [String]
+    let compiledHelperSHA256: String?
     let managerIdentityIsTrusted: @Sendable () -> Bool
 
     init(
         compiledTrustKeyHexes: [String],
+        compiledHelperSHA256: String,
         managerIdentityIsTrusted: @escaping @Sendable () -> Bool
     ) {
         self.compiledTrustKeyHexes = compiledTrustKeyHexes
             .map { $0.lowercased() }
             .filter { value in value.count == 64 && value.allSatisfy(\.isHexDigit) }
+        let helper = compiledHelperSHA256
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        self.compiledHelperSHA256 = (helper.count == 64 && helper.allSatisfy(\.isHexDigit))
+            ? helper
+            : nil
         self.managerIdentityIsTrusted = managerIdentityIsTrusted
     }
 
     static let production = ServerReleaseTrustPolicy(
         compiledTrustKeyHexes: ServerInstallContract.compiledReleaseTrustKeyHexes,
+        compiledHelperSHA256: ServerInstallContract.compiledReleaseHelperSHA256,
         managerIdentityIsTrusted: {
             ManagerReleaseIdentity.isDeveloperIDTrusted(
                 teamIdentifier: ServerInstallContract.releaseManagerTeamIdentifier)
         })
 
     var isAuthorized: Bool {
-        !compiledTrustKeyHexes.isEmpty && managerIdentityIsTrusted()
+        !compiledTrustKeyHexes.isEmpty
+            && compiledHelperSHA256 != nil
+            && managerIdentityIsTrusted()
     }
 }
 
@@ -212,14 +223,18 @@ struct ServerDevelopmentBuild: Equatable, Sendable {
     static let disabled = ServerDevelopmentBuild(isRequested: false, pinnedTrustKeyHex: nil)
 
     static var main: ServerDevelopmentBuild {
-        let info = Bundle.main.infoDictionary
+        fromBundleURL(Bundle.main.bundleURL)
+    }
+
+    static func fromBundleURL(_ url: URL) -> ServerDevelopmentBuild {
+        guard let info = Bundle(url: url)?.infoDictionary else { return .disabled }
         var requested = false
-        if let bool = info?[ServerInstallContract.developmentInstallInfoKey] as? Bool {
+        if let bool = info[ServerInstallContract.developmentInstallInfoKey] as? Bool {
             requested = bool
-        } else if let number = info?[ServerInstallContract.developmentInstallInfoKey] as? NSNumber {
+        } else if let number = info[ServerInstallContract.developmentInstallInfoKey] as? NSNumber {
             requested = number.boolValue
         }
-        let key = info?[ServerInstallContract.developmentTrustKeyInfoKey] as? String
+        let key = info[ServerInstallContract.developmentTrustKeyInfoKey] as? String
         return ServerDevelopmentBuild(isRequested: requested, pinnedTrustKeyHex: key)
     }
 
@@ -462,6 +477,14 @@ struct BundledServerPackageProvider: Sendable {
             helperDigest = try ServerPackageVerifier.sha256File(helperURL, maxBytes: 512 * 1024 * 1024)
         } catch {
             return .invalid(reason: "The release helper could not be verified: \(Self.boundedDetail(error))")
+        }
+        guard let compiledHelper = releaseTrust.compiledHelperSHA256 else {
+            return .invalid(reason:
+                "No release helper digest is compiled into this Manager, so the release privileged path is disabled.")
+        }
+        guard helperDigest == compiledHelper else {
+            return .invalid(reason:
+                "The packaged release helper bytes do not match the digest compiled into this Manager.")
         }
         guard helperDigest == evidence.includedSHA256.lowercased() else {
             return .invalid(reason: "The packaged release helper bytes do not match its release evidence.")

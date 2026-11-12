@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Persists the exact reviewed deployment configuration so a restarted Manager
@@ -11,6 +12,7 @@ protocol ServerInstallConfigurationStoring: Sendable {
 }
 
 struct FileServerInstallConfigurationStore: ServerInstallConfigurationStoring {
+    private static let maximumBytes = 64 * 1024
     let fileURL: URL
 
     init(fileURL: URL = FileServerInstallConfigurationStore.defaultURL()) {
@@ -27,8 +29,39 @@ struct FileServerInstallConfigurationStore: ServerInstallConfigurationStoring {
             .appendingPathComponent("installer-operation-v2.json")
     }
 
+    /// Bounded, non-blocking, no-symlink read. A symlink, FIFO, device, or
+    /// oversized/regular-shape mismatch is treated as no record rather than
+    /// blocking the UI or following attacker-controlled paths.
     func load() -> InstallerDeploymentConfiguration? {
-        guard let data = try? Data(contentsOf: fileURL) else { return nil }
+        let descriptor = open(
+            fileURL.path,
+            O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else { return nil }
+        defer { close(descriptor) }
+
+        var info = stat()
+        guard fstat(descriptor, &info) == 0,
+              (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_size >= 0,
+              info.st_size <= off_t(Self.maximumBytes) else {
+            return nil
+        }
+
+        let total = Int(info.st_size)
+        var data = Data()
+        data.reserveCapacity(total)
+        var buffer = [UInt8](repeating: 0, count: 8 * 1024)
+        var remaining = total
+        while remaining > 0 {
+            let chunk = min(buffer.count, remaining)
+            let count = read(descriptor, &buffer, chunk)
+            guard count > 0 else { return nil }
+            data.append(contentsOf: buffer[0..<count])
+            remaining -= count
+        }
+        // Reject data appended after fstat's size observation.
+        var extra: UInt8 = 0
+        guard read(descriptor, &extra, 1) == 0 else { return nil }
         return try? JSONDecoder().decode(InstallerDeploymentConfiguration.self, from: data)
     }
 

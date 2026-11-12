@@ -216,16 +216,32 @@ prompt. It is still a development build: an unsigned/ad-hoc Manager cannot
 defend against an attacker who can replace the entire app and its Info.plist.
 Do not represent this as a signed release or production trust.
 
-For development installs, the Manager generates disposable self-signed TLS for
-literal `127.0.0.1`, copies it into a root-owned staging directory, pins the
-certificate/key SHA-256 digests in the privileged script, and installs it
-root-owned `0600` under a root-owned `0700` `/etc/helicoid/tls`. Existing TLS
-material is never overwritten: material without the development marker is left
-untouched (exit 42) and the reviewed plan validates it. A failure removes only
-files/directories created by that run, using a marker to recognize its own prior
-dev material. This is not production or public PKI material. Disposable
-machines only: the installer creates a system account/group, product paths, and
-a LaunchDaemon, and it does not establish production readiness or enrollment.
+Release installs are fail-closed unless the running Manager has an
+independently verified Apple Developer ID signature for the compiled team and
+both the release trust keys and the release helper SHA-256 are compiled into the
+Manager. Empty compiled values disable the release privileged path entirely;
+a helper that does not match the compiled digest is refused before staging.
+
+For development installs, TLS provisioning uses the proposed verified server
+helper subcommand `hs-server installer provision-macos-tls`. The Manager stages
+the digest-pinned helper through the existing privileged wrapper, requires a
+verified development package, invokes the subcommand as root, and strictly
+validates its JSON response (`certificate_path`, `private_key_path`,
+`certificate_sha256`, `private_key_sha256`, `authority_host`) against the fixed
+`/etc/helicoid/tls` paths and literal `127.0.0.1`. Unknown fields, unexpected
+paths/hosts, malformed digests, or a timeout/lost response are refused; a
+dispatched timeout is treated as an unknown outcome, as is any post-dispatch
+result the Manager cannot strictly validate. The server is finalizing an
+explicit structured existing-unverified outcome; when published, the Manager
+will map it to the existing-material state and continue to the reviewed plan
+for operator TLS. The helper owns atomic publication, locking, ACLs, ownership,
+and cleanup. The Manager does not
+implement a local TLS publisher and does not run a root interpreter. The server
+API is still under review, so the path remains fail-closed if the helper does
+not expose the subcommand. This is not production or public PKI material.
+Disposable machines only: the installer creates a system account/group, product
+paths, and a LaunchDaemon, and it does not establish production readiness or
+enrollment.
 
 ## Launch modes
 

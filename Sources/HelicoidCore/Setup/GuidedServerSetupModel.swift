@@ -797,7 +797,7 @@ public final class GuidedServerSetupModel {
         case .preflighting:
             "Checking this Mac with administrator authorization…"
         case .provisioningTLS:
-            "DEVELOPMENT ONLY: generating disposable self-signed TLS for 127.0.0.1 if the fixed operator path is absent…"
+            "DEVELOPMENT ONLY: requesting the verified server helper to provision disposable self-signed TLS for 127.0.0.1…"
         case .planning:
             "Creating a configuration-bound reviewed installation plan…"
         case .applying:
@@ -912,7 +912,7 @@ public final class GuidedServerSetupModel {
 
             if package.isDevelopment {
                 installProgress = .provisioningTLS
-                let tlsResult = try await installService.provisionDevelopmentTLSIfNeeded()
+                let tlsResult = try await installService.provisionDevelopmentTLSIfNeeded(package: package)
                 switch tlsResult {
                 case .provisioned:
                     developmentTLSNotice = "Development-only self-signed TLS was provisioned for loopback 127.0.0.1."

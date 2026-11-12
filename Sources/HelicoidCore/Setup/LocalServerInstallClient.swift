@@ -253,126 +253,78 @@ struct LocalServerInstallClient: Sendable {
         return try decode(InstallerDeploymentConfiguration.self, from: data)
     }
 
-    /// Development-only convenience: create disposable self-signed TLS for
-    /// literal 127.0.0.1 when the fixed operator TLS path is absent.
-    ///
-    /// Existing TLS material is never modified or overwritten. The generated
-    /// certificate/key are installed root-owned 0600 in a root-owned 0700
-    /// directory, matching what the server's reviewed plan validates. This is
-    /// not production or public PKI material.
+    /// Convenience for callers that only have the staged helper path. It
+    /// resolves the containing Manager bundle, re-verifies a development
+    /// package through the normal provider, and never executes an unverified
+    /// helper. Prefer `provisionDevelopmentTLSIfNeeded(package:)`.
     func provisionDevelopmentTLSIfNeeded() async throws -> DevelopmentTLSProvisioningResult {
-        let temp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("helicoid-development-tls-\(UUID().uuidString)", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(
-                at: temp,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: NSNumber(value: 0o700)])
-        } catch {
-            throw LocalServerInstallError.developmentTLSPreparationFailed(
-                "a private temporary directory could not be created")
+        let root = helperURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let provider = BundledServerPackageProvider(
+            rootURL: root,
+            developmentBuild: ServerDevelopmentBuild.fromBundleURL(root))
+        guard let package = provider.availability().package, package.isDevelopment else {
+            throw LocalServerInstallError.developmentTLSProvisioningFailed(
+                "A verified development package is required for macOS TLS provisioning. No helper was run.")
         }
-        defer { try? FileManager.default.removeItem(at: temp) }
+        return try await provisionDevelopmentTLSIfNeeded(package: package)
+    }
 
-        let config = temp.appendingPathComponent("openssl.cnf")
-        let certificate = temp.appendingPathComponent("fullchain.pem")
-        let privateKey = temp.appendingPathComponent("private-key.pem")
-        do {
-            try Data(DevelopmentTLSMaterial.opensslConfiguration.utf8).write(to: config, options: .atomic)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: NSNumber(value: 0o600)],
-                ofItemAtPath: config.path)
-        } catch {
-            throw LocalServerInstallError.developmentTLSPreparationFailed(
-                "the temporary OpenSSL configuration could not be written")
+    /// Invokes the feature-gated root helper subcommand
+    /// `hs-server installer provision-macos-tls` through the existing staged,
+    /// digest-pinned privileged wrapper. The helper must be a verified
+    /// development package; its strict JSON result is validated against the
+    /// fixed development TLS paths and loopback authority host.
+    ///
+    /// Existing operator material is not adopted here; the reviewed plan must
+    /// validate it before installation can proceed.
+    func provisionDevelopmentTLSIfNeeded(
+        package: TrustedServerPackage
+    ) async throws -> DevelopmentTLSProvisioningResult {
+        guard package.provenance == .development else {
+            throw LocalServerInstallError.developmentTLSProvisioningFailed(
+                "macOS TLS provisioning is development-only; a release package cannot request it. No helper was run.")
         }
-
-        let generation: SetupCommandResult
+        let response: Data
         do {
-            generation = try await runner.run(SetupCommand(
-                executable: "/usr/bin/openssl",
-                arguments: DevelopmentTLSMaterial.opensslArguments(
-                    configPath: config.path,
-                    certificatePath: certificate.path,
-                    privateKeyPath: privateKey.path),
-                timeoutSeconds: 60,
-                outputLimit: 65_536))
-        } catch let error as SetupCommandError {
-            throw Self.mapDevelopmentTLS(error, stage: "generate")
-        } catch {
-            throw LocalServerInstallError.developmentTLSPreparationFailed(
-                "the TLS generator could not be started")
-        }
-        guard generation.exitStatus == 0,
-              Self.isNonemptyRegularFile(certificate),
-              Self.isNonemptyRegularFile(privateKey) else {
-            throw LocalServerInstallError.developmentTLSPreparationFailed(
-                Self.boundedDiagnostic(generation))
-        }
-
-        let certificateSHA256: String
-        let privateKeySHA256: String
-        do {
-            certificateSHA256 = try ServerPackageVerifier.sha256File(
-                certificate,
-                maxBytes: 64 * 1024)
-            privateKeySHA256 = try ServerPackageVerifier.sha256File(
-                privateKey,
-                maxBytes: 64 * 1024)
-        } catch {
-            throw LocalServerInstallError.developmentTLSPreparationFailed(
-                "the generated TLS material could not be digested")
-        }
-
-        let nonce = markerNonce()
-        let installScript = DevelopmentTLSMaterial.installScript(
-            stagingRoot: ServerInstallContract.payloadStagingRoot,
-            stagingName: "tls-\(UUID().uuidString)",
-            certificatePath: certificate.path,
-            privateKeyPath: privateKey.path,
-            certificateSHA256: certificateSHA256,
-            privateKeySHA256: privateKeySHA256)
-        let command = try PrivilegedShellInvocation.setupCommand(
-            shellScript: installScript,
-            timeoutSeconds: ServerInstallContract.maximumTimeoutSeconds,
-            statusMarker: PrivilegedInvocationMarker.shellStatus(nonce))
-
-        let installation: SetupCommandResult
-        do {
-            installation = try await runner.run(command)
-        } catch let error as SetupCommandError {
+            response = try await runPrivileged(
+                arguments: ["installer", "provision-macos-tls"],
+                request: Data(),
+                package: package,
+                stagingName: UUID().uuidString,
+                stagePackage: false,
+                timeout: Self.operationTimeLimit)
+        } catch let error as LocalServerInstallError {
             switch error {
+            case .authorizationCancelled:
+                throw error
             case .timedOut, .cancelled, .outputExceeded:
                 throw LocalServerInstallError.privilegedOutcomeUnknown(
-                    "The privileged development TLS installer was dispatched but its completion was not observed (\(error)). It may have installed, partially installed, or left no material. Inspect /etc/helicoid/tls before retrying.")
-            default:
-                throw LocalServerInstallError.developmentTLSProvisioningFailed(
-                    "the privileged TLS installer could not be started")
-            }
-        } catch {
-            if Task.isCancelled {
+                    "The privileged macOS TLS provisioner was dispatched but its completion was not observed (\(error)). Inspect \(ServerInstallContract.operatorTLSDirectory) before retrying.")
+            case .invalidResponse:
                 throw LocalServerInstallError.privilegedOutcomeUnknown(
-                    "The privileged development TLS installer was dispatched but local waiting was cancelled. Its outcome is unknown.")
+                    "The privileged macOS TLS provisioner returned an unusable response after dispatch (\(error)). Inspect \(ServerInstallContract.operatorTLSDirectory) before retrying.")
+            default:
+                throw error
             }
-            throw LocalServerInstallError.privilegedOutcomeUnknown(
-                "The privileged development TLS installer was dispatched but its transport failed. Its outcome is unknown.")
         }
 
-        let status = try Self.shellStatus(
-            installation,
-            stage: "install",
-            marker: PrivilegedInvocationMarker.shellStatus(nonce))
-        switch status {
-        case 0:
-            return .provisioned
-        case 42:
-            return .existingUnverifiedMaterial
-        case 43:
-            throw LocalServerInstallError.developmentTLSProvisioningFailed(
-                "existing development TLS material is not the exact root-owned 0600 layout; it was left untouched")
-        default:
-            throw LocalServerInstallError.developmentTLSProvisioningFailed(
-                "the privileged development TLS installer returned exit \(status); it did not report success")
+        do {
+            let result = try InstallerMacOSDevelopmentTLSResult.decodeStrict(response)
+            switch result {
+            case .provisioned, .recovered:
+                return .provisioned
+            case .existingUnverified:
+                return .existingUnverifiedMaterial
+            }
+        } catch let error as LocalServerInstallError {
+            throw LocalServerInstallError.privilegedOutcomeUnknown(
+                "The privileged macOS TLS provisioner returned a result the Manager could not validate (\(error)). It may already have published TLS material. Inspect \(ServerInstallContract.operatorTLSDirectory) before retrying.")
+        } catch {
+            throw LocalServerInstallError.privilegedOutcomeUnknown(
+                "The privileged macOS TLS provisioner returned an unreadable result. It may already have published TLS material. Inspect \(ServerInstallContract.operatorTLSDirectory) before retrying.")
         }
     }
 
@@ -451,60 +403,6 @@ struct LocalServerInstallClient: Sendable {
         case .launchFailed: .helperUnavailable("The helper process could not be launched.")
         case .inputFailed: .invalidConfiguration("The installer request could not be delivered.")
         }
-    }
-
-    private static func mapDevelopmentTLS(
-        _ error: SetupCommandError,
-        stage: String
-    ) -> LocalServerInstallError {
-        switch error {
-        case .timedOut:
-            return .developmentTLSProvisioningFailed("\(stage) timed out")
-        case .cancelled:
-            return .cancelled
-        case .outputExceeded:
-            return .developmentTLSProvisioningFailed("\(stage) produced too much output")
-        default:
-            return .developmentTLSProvisioningFailed("\(stage) could not be started")
-        }
-    }
-
-    private static func shellStatus(
-        _ result: SetupCommandResult,
-        stage: String,
-        marker: String
-    ) throws -> Int32 {
-        guard result.exitStatus == 0 else {
-            if result.exitStatus >= 128 {
-                throw LocalServerInstallError.privilegedOutcomeUnknown(
-                    "\(stage) ended without a normal exit status (\(result.exitStatus)); its outcome is unknown.")
-            }
-            let detail = boundedCombinedDiagnostic(result)
-            let lower = detail.lowercased()
-            if lower.contains("user canceled") || lower.contains("user cancelled")
-                || lower.contains("(-128)") {
-                throw LocalServerInstallError.authorizationCancelled
-            }
-            throw LocalServerInstallError.developmentTLSProvisioningFailed(
-                detail.isEmpty ? "\(stage) failed" : detail)
-        }
-        let text = normalizedOutput(result)
-        guard let parsed = finalStatus(in: text, marker: marker) else {
-            throw LocalServerInstallError.privilegedOutcomeUnknown(
-                "\(stage) completed without a verifiable final status marker; its outcome is unknown")
-        }
-        guard parsed.status < 128 else {
-            throw LocalServerInstallError.privilegedOutcomeUnknown(
-                "\(stage) ended with signal-style status \(parsed.status); its outcome is unknown")
-        }
-        return parsed.status
-    }
-
-    static func isNonemptyRegularFile(_ url: URL) -> Bool {
-        var info = stat()
-        return lstat(url.path, &info) == 0
-            && (info.st_mode & S_IFMT) == S_IFREG
-            && info.st_size > 0
     }
 
     /// Requires the nonce-bound marker to be the final non-empty line and
@@ -650,10 +548,6 @@ enum PrivilegedInvocationMarker {
 
     static func stagingRefusal(_ nonce: String) -> String {
         "__HELICOID_STAGING_REFUSAL_\(nonce)__:"
-    }
-
-    static func shellStatus(_ nonce: String) -> String {
-        "__HELICOID_SHELL_STATUS_\(nonce)__:"
     }
 }
 
@@ -815,8 +709,7 @@ enum PrivilegedHelperInvocation {
         return try PrivilegedShellInvocation.setupCommand(
             shellScript: script,
             timeoutSeconds: timeoutSeconds,
-            outputLimit: ServerInstallContract.maximumHelperResponseBytes,
-            appendShellStatus: false)
+            outputLimit: ServerInstallContract.maximumHelperResponseBytes)
     }
 
     static func isSHA256Hex(_ value: String) -> Bool {
@@ -841,15 +734,13 @@ enum PrivilegedHelperInvocation {
     }
 }
 
-/// Runs one bounded shell script as root. Used only for development-only TLS
-/// material installation, never for package or helper trust decisions.
+/// Runs one bounded shell script as root to stage and execute the verified
+/// helper. The staging script prints its own nonce-bound final status.
 enum PrivilegedShellInvocation {
     static func setupCommand(
         shellScript: String,
         timeoutSeconds: TimeInterval,
-        outputLimit: Int = 65_536,
-        appendShellStatus: Bool = true,
-        statusMarker: String = PrivilegedInvocationMarker.shellStatus(PrivilegedInvocationMarker.randomNonce())
+        outputLimit: Int = 65_536
     ) throws -> SetupCommand {
         guard !shellScript.unicodeScalars.contains(where: { scalar in
             scalar.value < 0x20 && scalar.value != 0x0A
@@ -858,10 +749,7 @@ enum PrivilegedShellInvocation {
                 "The privileged shell script contains unsupported control characters.")
         }
         let encoded = Data(shellScript.utf8).base64EncodedString()
-        var command = "printf '%s' '\(encoded)' | /usr/bin/base64 -D | /bin/sh -s"
-        if appendShellStatus {
-            command += "; status=$?; printf '\\n\(statusMarker)%d\\n' \"$status\"; exit 0"
-        }
+        let command = "printf '%s' '\(encoded)' | /usr/bin/base64 -D | /bin/sh -s"
         let script = "do shell script \(PrivilegedHelperInvocation.appleScriptLiteral(command)) with administrator privileges"
         return SetupCommand(
             executable: "/usr/bin/osascript",
@@ -871,166 +759,15 @@ enum PrivilegedShellInvocation {
     }
 }
 
-/// Disposable development TLS generation. Certificate is self-signed for
-/// literal 127.0.0.1 and is not production or public PKI material.
-enum DevelopmentTLSMaterial {
-    static let opensslConfiguration = """
-    [req]
-    distinguished_name = dn
-    x509_extensions = v3_req
-    prompt = no
-    [dn]
-    CN = 127.0.0.1
-    [v3_req]
-    subjectAltName = IP:127.0.0.1
-    basicConstraints = critical,CA:FALSE
-    keyUsage = critical,digitalSignature,keyEncipherment
-    extendedKeyUsage = serverAuth
-    """
-
-    static func opensslArguments(
-        configPath: String,
-        certificatePath: String,
-        privateKeyPath: String
-    ) -> [String] {
-        [
-            "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes", "-days", "2",
-            "-keyout", privateKeyPath,
-            "-out", certificatePath,
-            "-config", configPath,
-            "-extensions", "v3_req",
-        ]
-    }
-
-    static func installScript(
-        stagingRoot: String,
-        stagingName: String,
-        certificatePath: String,
-        privateKeyPath: String,
-        certificateSHA256: String,
-        privateKeySHA256: String
-    ) -> String {
-        let root = PrivilegedHelperInvocation.shellQuote(stagingRoot)
-        let stage = PrivilegedHelperInvocation.shellQuote(stagingRoot + "/" + stagingName)
-        let certSource = PrivilegedHelperInvocation.shellQuote(certificatePath)
-        let keySource = PrivilegedHelperInvocation.shellQuote(privateKeyPath)
-        let certExpected = PrivilegedHelperInvocation.shellQuote(certificateSHA256.lowercased())
-        let keyExpected = PrivilegedHelperInvocation.shellQuote(privateKeySHA256.lowercased())
-        return """
-        umask 077
-        root=\(root)
-        stage=\(stage)
-        tls='/etc/helicoid/tls'
-        marker='/etc/helicoid/tls/.helicoid-development-tls-v1'
-        marker_tmp='/etc/helicoid/tls/.helicoid-development-tls-v1.tmp'
-        stage_owned=0
-        created_base=0
-        created_tls=0
-        cert_installed=0
-        key_installed=0
-        marker_installed=0
-        marker_tmp_installed=0
-        cleanup() {
-          if [ "$marker_tmp_installed" = 1 ]; then /bin/rm -f "$marker_tmp"; fi
-          if [ "$marker_installed" = 1 ]; then /bin/rm -f "$marker"; fi
-          if [ "$cert_installed" = 1 ]; then /bin/rm -f "$tls/fullchain.pem"; fi
-          if [ "$key_installed" = 1 ]; then /bin/rm -f "$tls/private-key.pem"; fi
-          if [ "$stage_owned" = 1 ]; then /bin/rm -rf "$stage"; fi
-          if [ "$created_tls" = 1 ]; then /bin/rmdir "$tls" 2>/dev/null || true; fi
-          if [ "$created_base" = 1 ]; then /bin/rmdir '/etc/helicoid' 2>/dev/null || true; fi
-        }
-        trap cleanup 0 1 2 15
-
-        check_root_file() {
-          # exact root-owned regular 0600 file with non-zero size
-          [ -L "$1" ] && return 1
-          [ -f "$1" ] || return 1
-          uid=$(/usr/bin/stat -f '%u' "$1" 2>/dev/null) || return 1
-          mode=$(/usr/bin/stat -f '%Lp' "$1" 2>/dev/null) || return 1
-          size=$(/usr/bin/stat -f '%z' "$1" 2>/dev/null) || return 1
-          [ "$uid" = "0" ] && [ "$mode" = "600" ] && [ "$size" -gt 0 ]
-        }
-
-        if [ -L "$root" ] || { [ -e "$root" ] && [ ! -d "$root" ]; }; then exit 70; fi
-        /usr/bin/install -d -m 0700 -o root -g wheel "$root" || exit 71
-        root_uid=$(/usr/bin/stat -f '%u' "$root") || exit 72
-        root_mode=$(/usr/bin/stat -f '%Lp' "$root") || exit 73
-        if [ "$root_uid" != "0" ] || [ "$root_mode" != "700" ]; then exit 74; fi
-        if [ -e "$stage" ] || [ -L "$stage" ]; then exit 75; fi
-        stage_owned=1
-        /usr/bin/install -d -m 0700 -o root -g wheel "$stage" || exit 76
-        /usr/bin/install -m 0600 -o root -g wheel \(certSource) "$stage/fullchain.pem" || exit 77
-        /usr/bin/install -m 0600 -o root -g wheel \(keySource) "$stage/private-key.pem" || exit 78
-        actual_cert=$(/usr/bin/shasum -a 256 "$stage/fullchain.pem" | /usr/bin/awk '{print $1}') || exit 79
-        if [ "$actual_cert" != \(certExpected) ]; then exit 80; fi
-        actual_key=$(/usr/bin/shasum -a 256 "$stage/private-key.pem" | /usr/bin/awk '{print $1}') || exit 81
-        if [ "$actual_key" != \(keyExpected) ]; then exit 82; fi
-
-        if [ -L "$tls" ] || [ -e "$tls" ]; then
-          if [ -L "$tls" ] || [ ! -d "$tls" ]; then exit 42; fi
-          if [ -e "$marker" ] || [ -L "$marker" ]; then
-            # This workflow's own material. Require the exact root-owned
-            # regular-file layout; never repair or delete anything here.
-            tls_uid=$(/usr/bin/stat -f '%u' "$tls" 2>/dev/null) || exit 43
-            tls_mode=$(/usr/bin/stat -f '%Lp' "$tls" 2>/dev/null) || exit 43
-            [ "$tls_uid" = "0" ] && [ "$tls_mode" = "700" ] || exit 43
-            check_root_file "$marker" || exit 43
-            [ "$(/bin/cat "$marker" 2>/dev/null)" = 'helicoid-development-tls-v1' ] || exit 43
-            check_root_file "$tls/fullchain.pem" || exit 43
-            check_root_file "$tls/private-key.pem" || exit 43
-            exit 0
-          fi
-          # Existing material without our marker is operator-owned or unknown.
-          # Leave it exactly as found; the reviewed plan validates it.
-          exit 42
-        fi
-
-        if [ -L '/etc/helicoid' ]; then exit 85; fi
-        if [ -e '/etc/helicoid' ] && [ ! -d '/etc/helicoid' ]; then exit 85; fi
-        if [ ! -e '/etc/helicoid' ]; then
-          created_base=1
-          /usr/bin/install -d -m 0700 -o root -g wheel '/etc/helicoid' || exit 86
-        fi
-        if [ -e "$tls" ] || [ -L "$tls" ]; then exit 75; fi
-        created_tls=1
-        /usr/bin/install -d -m 0700 -o root -g wheel "$tls" || exit 87
-
-        # Mark cleanup before each install so a partial write is removed.
-        cert_installed=1
-        /usr/bin/install -m 0600 -o root -g wheel "$stage/fullchain.pem" "$tls/fullchain.pem" || exit 90
-        key_installed=1
-        /usr/bin/install -m 0600 -o root -g wheel "$stage/private-key.pem" "$tls/private-key.pem" || exit 91
-        check_root_file "$tls/fullchain.pem" || exit 95
-        check_root_file "$tls/private-key.pem" || exit 95
-
-        # The marker is written atomically last: a complete certificate and key
-        # layout is what makes the development TLS material recognizable.
-        marker_tmp_installed=1
-        printf 'helicoid-development-tls-v1\n' > "$marker_tmp" || exit 92
-        /bin/chmod 0600 "$marker_tmp" || exit 93
-        check_root_file "$marker_tmp" || exit 95
-        marker_installed=1
-        /bin/mv -f "$marker_tmp" "$marker" || exit 94
-        marker_tmp_installed=0
-        check_root_file "$marker" || exit 95
-
-        cert_installed=0
-        key_installed=0
-        marker_installed=0
-        created_tls=0
-        created_base=0
-        exit 0
-        """
-    }
-}
-
 /// Model-facing install service. The Manager always uses the bundled release
 /// provider; tests supply bounded fakes through the same seam.
 protocol ServerInstallServicing: Sendable {
     var installPayloadPresent: Bool { get }
     var installPayloadKind: ServerInstallPayloadKind { get }
     func packageAvailability() async -> ServerPackageAvailability
-    func provisionDevelopmentTLSIfNeeded() async throws -> DevelopmentTLSProvisioningResult
+    func provisionDevelopmentTLSIfNeeded(
+        package: TrustedServerPackage
+    ) async throws -> DevelopmentTLSProvisioningResult
     func capabilities() async throws -> InstallerCapabilities
     func capabilities(package: TrustedServerPackage) async throws -> InstallerCapabilities
     func preflight(configuration: InstallerDeploymentConfiguration) async throws -> InstallerPreflightResult
@@ -1074,9 +811,11 @@ protocol ServerInstallServicing: Sendable {
 
 extension ServerInstallServicing {
     var installPayloadKind: ServerInstallPayloadKind { .release }
-    func provisionDevelopmentTLSIfNeeded() async throws -> DevelopmentTLSProvisioningResult {
+    func provisionDevelopmentTLSIfNeeded(
+        package: TrustedServerPackage
+    ) async throws -> DevelopmentTLSProvisioningResult {
         throw LocalServerInstallError.developmentTLSProvisioningFailed(
-            "This install service does not implement development TLS provisioning.")
+            "This install service does not implement macOS development TLS provisioning.")
     }
     func capabilities(package: TrustedServerPackage) async throws -> InstallerCapabilities {
         try await capabilities()
@@ -1140,9 +879,11 @@ struct BundledServerInstallService: ServerInstallServicing {
         }.value
     }
 
-    func provisionDevelopmentTLSIfNeeded() async throws -> DevelopmentTLSProvisioningResult {
+    func provisionDevelopmentTLSIfNeeded(
+        package: TrustedServerPackage
+    ) async throws -> DevelopmentTLSProvisioningResult {
         let installClient = try client()
-        return try await installClient.provisionDevelopmentTLSIfNeeded()
+        return try await installClient.provisionDevelopmentTLSIfNeeded(package: package)
     }
 
     func capabilities() async throws -> InstallerCapabilities {

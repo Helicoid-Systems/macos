@@ -67,7 +67,8 @@ struct ServerPackageTrustTests {
         let provider = BundledServerPackageProvider(
             rootURL: fixture.root,
             releaseTrust: ServerInstallTestSupport.authorizedReleaseTrust(
-                keys: [ServerInstallTestSupport.hex(differentKey.publicKey.rawRepresentation)]))
+                keys: [ServerInstallTestSupport.hex(differentKey.publicKey.rawRepresentation)],
+                helperSHA256: fixture.helperSHA256))
         guard case .invalid(let reason) = provider.availability() else {
             Issue.record("Untrusted signing key must be invalid")
             return
@@ -239,7 +240,8 @@ struct ServerPackageTrustTests {
         defer { fixture.remove() }
         let otherKey = Curve25519.Signing.PrivateKey()
         let policy = ServerInstallTestSupport.authorizedReleaseTrust(
-            keys: [ServerInstallTestSupport.hex(otherKey.publicKey.rawRepresentation)])
+            keys: [ServerInstallTestSupport.hex(otherKey.publicKey.rawRepresentation)],
+            helperSHA256: fixture.helperSHA256)
 
         let provider = BundledServerPackageProvider(rootURL: fixture.root, releaseTrust: policy)
         #expect(!provider.installPayloadPresent)
@@ -248,6 +250,22 @@ struct ServerPackageTrustTests {
             return
         }
         #expect(reason.contains("do not match"))
+    }
+
+    @Test("Release install refuses a helper that does not match the compiled digest")
+    func releasePathRefusesUncompiledHelperDigest() throws {
+        let fixture = try ServerInstallTestSupport.packageFixture()
+        defer { fixture.remove() }
+        let policy = ServerInstallTestSupport.authorizedReleaseTrust(
+            keys: [fixture.pinnedKeyHex],
+            helperSHA256: String(repeating: "0", count: 64))
+
+        let provider = BundledServerPackageProvider(rootURL: fixture.root, releaseTrust: policy)
+        guard case .invalid(let reason) = provider.availability() else {
+            Issue.record("A helper that does not match the compiled digest must be refused")
+            return
+        }
+        #expect(reason.contains("compiled into this Manager"))
     }
 
     @Test("Strict artifact paths reject traversal and Windows aliases")

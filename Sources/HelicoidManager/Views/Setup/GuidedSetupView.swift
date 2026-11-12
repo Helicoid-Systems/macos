@@ -221,7 +221,7 @@ struct GuidedSetupView: View {
             return model.installUnavailableNotice
         }
         if model.isDevelopmentInstall {
-            return "DEVELOPMENT ONLY: the installer will generate disposable self-signed TLS for 127.0.0.1 if absent, then request macOS administrator authorization. Installed is not production readiness."
+            return "DEVELOPMENT ONLY: the verified helper will provision disposable self-signed TLS for 127.0.0.1 through its feature-gated native subcommand, then request macOS administrator authorization. Installed is not production readiness."
         }
         return "The installer will request macOS administrator authorization. No success is shown until the helper returns a verified operation status."
     }

@@ -111,6 +111,8 @@ struct GuidedServerInstallModelTests {
         }
         #expect(provisionIndex < planIndex)
         #expect(provisionIndex < applyIndex)
+        let tlsPackage = await service.recordedTLSProvisionPackage()
+        #expect(tlsPackage?.provenance == .development)
         guard case .installedUnverified = model.installProgress else {
             Issue.record("Expected installed-unverified, got \(model.installProgress)")
             return
