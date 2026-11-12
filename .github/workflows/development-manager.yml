@@ -38,6 +38,7 @@ on:
       - 'scripts/hs-server-helper.sh'
       - 'scripts/hs-server-development-bundle.sh'
       - 'Sources/HelicoidCore/Setup/**'
+      - 'Tests/**'
 
 permissions:
   contents: read
