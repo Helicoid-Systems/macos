@@ -1333,6 +1333,7 @@ struct EndpointEnrollmentClientTests {
             store: store,
             deploymentID: deploymentID
         )
+        // Give fixture setup the full allowed lifetime under CI contention.
         let prepared = try await preparedObservationChallenge(
             client: client,
             deploymentID: deploymentID,
@@ -1340,9 +1341,10 @@ struct EndpointEnrollmentClientTests {
             managerKey: managerKey,
             computerID: transport.computerID,
             endpointPublicKeyHex: endpointPublicKeyHex,
-            lifetimeSeconds: 2
+            lifetimeSeconds: 10
         )
-        try await Task.sleep(nanoseconds: 3_000_000_000)
+        let remaining = prepared.grant.expiresAtUnix - Int64(Date().timeIntervalSince1970)
+        try await Task.sleep(nanoseconds: UInt64(max(0, remaining) + 1) * 1_000_000_000)
 
         await #expect(throws: HelicoidError.authenticationFailed(
             detail: "The endpoint observation grant is invalid or expired."
