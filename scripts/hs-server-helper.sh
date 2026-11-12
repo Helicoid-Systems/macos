@@ -77,7 +77,10 @@ manager_architectures() {
   [ -n "$archs" ] || fail "Manager executable has no architectures: $manager_binary"
   local arch
   for arch in $archs; do
-    [[ "$arch" =~ ^[A-Za-z0-9_]+$ ]] || fail "unexpected Manager architecture: $arch"
+    # Apple's lipo names cpusubtype variants with a dot (`arm64e.x1`); accept
+    # only that alphabet and reject anything option-like.
+    [[ "$arch" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$ ]] \
+      || fail "unexpected Manager architecture: $arch"
   done
   printf '%s' "$archs"
 }
@@ -174,29 +177,17 @@ validate_helper_macho() {
   [ -f "$helper_path" ] || fail "helper path is not a regular file: $helper_path"
   [ -x "$helper_path" ] || fail "helper path is not executable: $helper_path"
 
-  local headers
-  headers="$(/usr/bin/xcrun otool -hv "$helper_path" 2>/dev/null)" \
-    || fail "helper is not a readable Mach-O file: $helper_path"
-  local header_count
-  header_count="$(printf '%s\n' "$headers" \
-    | /usr/bin/awk '/^MH_MAGIC/ { n++ } END { print n + 0 }')"
-  [ "$header_count" -gt 0 ] || fail "helper has no Mach-O header: $helper_path"
-  printf '%s\n' "$headers" | /usr/bin/awk '
-    /^MH_MAGIC/ { seen = 1; if ($5 != "EXECUTE") bad = 1 }
-    END { exit (seen && !bad ? 0 : 1) }
-  ' || fail "helper must contain only Mach-O executable slices: $helper_path"
-
-  local helper_archs arch_count
+  # `lipo -archs` is the authoritative slice list. It can name a cpusubtype
+  # variant (`arm64e.x1`), so the accepted alphabet includes dots.
+  local helper_archs
   helper_archs="$(/usr/bin/xcrun lipo -archs "$helper_path" 2>/dev/null)" \
     || fail "cannot read helper architectures: $helper_path"
   [ -n "$helper_archs" ] || fail "helper has no architectures: $helper_path"
-  arch_count="$(printf '%s\n' "$helper_archs" | /usr/bin/wc -w | /usr/bin/tr -d ' ')"
-  [ "$header_count" = "$arch_count" ] \
-    || fail "helper slice count does not match its architecture list"
 
   local arch required found
   for arch in $helper_archs; do
-    [[ "$arch" =~ ^[A-Za-z0-9_]+$ ]] || fail "unexpected helper architecture: $arch"
+    [[ "$arch" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$ ]] \
+      || fail "unexpected helper architecture: $arch"
   done
   for required in $manager_archs; do
     found=0
@@ -207,32 +198,57 @@ validate_helper_macho() {
       || fail "helper does not contain Manager architecture $required (helper: $helper_archs)"
   done
 
-  local build_info records record_count
-  build_info="$(/usr/bin/xcrun vtool -show-build "$helper_path" 2>/dev/null)" \
-    || fail "cannot read helper deployment target: $helper_path"
-  records="$(printf '%s\n' "$build_info" | /usr/bin/awk '
-    /^Load command/ { build = 0; legacy = 0; next }
-    /cmd LC_BUILD_VERSION/ { build = 1; platform = ""; next }
-    /cmd LC_VERSION_MIN_MACOSX/ { legacy = 1; next }
-    build && /^[[:space:]]*platform[[:space:]]/ { platform = $2; next }
-    build && /^[[:space:]]*minos[[:space:]]/ { print platform " " $2; build = 0; next }
-    legacy && /^[[:space:]]*version[[:space:]]/ { print "MACOS " $2; legacy = 0; next }
-  ')"
-  [ -n "$records" ] || fail "helper has no macOS deployment target: $helper_path"
-  record_count="$(printf '%s\n' "$records" | /usr/bin/awk 'NF { n++ } END { print n + 0 }')"
-  [ "$record_count" = "$arch_count" ] \
-    || fail "helper does not declare a deployment target for every architecture"
+  # Validate every slice named by lipo explicitly with `-arch`. `otool -hv`
+  # and `vtool -show-build` default to the host architecture for a universal
+  # file, which hides the foreign slice (and made a two-slice helper look like
+  # a one-slice helper on Intel). Each slice must be exactly one Mach-O
+  # executable with exactly one macOS deployment target at or below the floor.
+  local minos_values="" headers header_count build_info records record_count
+  local platform minos
+  for arch in $helper_archs; do
+    headers="$(/usr/bin/xcrun otool -arch "$arch" -hv "$helper_path" 2>/dev/null)" \
+      || fail "helper architecture $arch is not a readable Mach-O file: $helper_path"
+    header_count="$(printf '%s\n' "$headers" \
+      | /usr/bin/awk '/^MH_MAGIC/ { n++ } END { print n + 0 }')"
+    [ "$header_count" -eq 1 ] \
+      || fail "helper architecture $arch has $header_count Mach-O headers, expected 1: $helper_path"
+    printf '%s\n' "$headers" | /usr/bin/awk '
+      /^MH_MAGIC/ {
+        filetype = ""
+        for (i = 2; i <= NF; i++) {
+          if ($i ~ /^(OBJECT|EXECUTE|FVMLIB|CORE|PRELOAD|DYLIB|DYLINKER|BUNDLE|DYLIB_STUB|DSYM|KEXT_BUNDLE|FILESET)$/) filetype = $i
+        }
+        if (filetype != "EXECUTE") bad = 1
+      }
+      END { exit bad ? 1 : 0 }
+    ' || fail "helper architecture $arch is not a Mach-O executable slice: $helper_path"
 
-  local platform minos minos_values=""
-  while IFS=' ' read -r platform minos; do
-    [ -n "$platform" ] || continue
-    [ "$platform" = "MACOS" ] || fail "helper slice targets $platform, not macOS"
-    [[ "$minos" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] \
-      || fail "helper has a malformed minimum macOS version: $minos"
-    version_le "$minos" "$minimum_macos" \
-      || fail "helper minimum macOS $minos exceeds the Manager minimum $minimum_macos"
-    minos_values="${minos_values}${minos}"$'\n'
-  done <<< "$records"
+    build_info="$(/usr/bin/xcrun vtool -arch "$arch" -show-build "$helper_path" 2>/dev/null)" \
+      || fail "cannot read the macOS deployment target for helper architecture $arch: $helper_path"
+    records="$(printf '%s\n' "$build_info" | /usr/bin/awk '
+      /^Load command/ { build = 0; legacy = 0; next }
+      /cmd LC_BUILD_VERSION/ { build = 1; platform = ""; next }
+      /cmd LC_VERSION_MIN_MACOSX/ { legacy = 1; next }
+      build && /^[[:space:]]*platform[[:space:]]/ { platform = $2; next }
+      build && /^[[:space:]]*minos[[:space:]]/ { print platform " " $2; build = 0; next }
+      legacy && /^[[:space:]]*version[[:space:]]/ { print "MACOS " $2; legacy = 0; next }
+    ')"
+    [ -n "$records" ] \
+      || fail "helper architecture $arch has no macOS deployment target: $helper_path"
+    record_count="$(printf '%s\n' "$records" | /usr/bin/awk 'NF { n++ } END { print n + 0 }')"
+    [ "$record_count" -eq 1 ] \
+      || fail "helper architecture $arch declares $record_count macOS deployment targets, expected 1: $helper_path"
+
+    while IFS=' ' read -r platform minos; do
+      [ -n "$platform" ] || continue
+      [ "$platform" = "MACOS" ] || fail "helper slice targets $platform, not macOS: $helper_path"
+      [[ "$minos" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] \
+        || fail "helper has a malformed minimum macOS version: $minos"
+      version_le "$minos" "$minimum_macos" \
+        || fail "helper minimum macOS $minos exceeds the Manager minimum $minimum_macos"
+      minos_values="${minos_values}${minos}"$'\n'
+    done <<< "$records"
+  done
   printf '%s' "$minos_values"
 }
 
