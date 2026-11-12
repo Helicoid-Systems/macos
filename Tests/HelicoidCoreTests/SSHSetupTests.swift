@@ -114,9 +114,11 @@ struct SSHSetupTests {
         let start = clock.now
         await #expect(throws: SetupCommandError.timedOut) {
             try await SystemSetupCommandRunner().run(SetupCommand(
-                executable: "/bin/sh", arguments: ["-c", "sleep 2 & wait"], timeoutSeconds: 0.05))
+                executable: "/bin/sh", arguments: ["-c", "sleep 10 & wait"], timeoutSeconds: 0.05))
         }
-        #expect(start.duration(to: clock.now) < .seconds(1))
+        // Still bounded: waiting for the inherited writer would take 10s, while
+        // 5s leaves room for scheduler jitter on a saturated CI runner.
+        #expect(start.duration(to: clock.now) < .seconds(5))
     }
 
     @Test func cancellationEndsChild() async {
@@ -151,7 +153,9 @@ struct SSHSetupTests {
                 input: Data(repeating: 0x41, count: 65_536),
                 timeoutSeconds: 0.05))
         }
-        #expect(start.duration(to: clock.now) < .seconds(1))
+        // Still bounded: returning with the child would take 10s, while 5s
+        // leaves room for scheduler jitter on a saturated CI runner.
+        #expect(start.duration(to: clock.now) < .seconds(5))
     }
 
     @Test func cancelledChildIsGoneWhenReturnIsObserved() async throws {

@@ -119,10 +119,23 @@ struct ServerPackageTrustTests {
 
     @Test("Development evidence helper digest must match the bundled helper")
     func developmentHelperDigestMismatchRefused() throws {
-        let fixture = try ServerInstallTestSupport.packageFixture(
-            developmentInstall: true,
-            helperMatchesEvidence: false)
+        let fixture = try ServerInstallTestSupport.packageFixture(developmentInstall: true)
         defer { fixture.remove() }
+        // Rewrite the otherwise valid evidence so it names different helper
+        // bytes. The fixture option cannot express this for the development
+        // payload, and the provider must hash the bundled helper rather than
+        // trust either evidence digest.
+        let evidenceURL = fixture.root.appendingPathComponent(
+            "Contents/Resources/hs-server-development-install.json")
+        guard var evidence = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: evidenceURL)) as? [String: Any] else {
+            Issue.record("Could not read the development install evidence")
+            return
+        }
+        evidence["helperSha256"] = String(repeating: "e", count: 64)
+        try JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+            .write(to: evidenceURL)
+
         let provider = BundledServerPackageProvider(
             rootURL: fixture.root,
             developmentBuild: fixture.developmentBuild)

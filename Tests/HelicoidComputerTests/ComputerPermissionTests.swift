@@ -370,37 +370,45 @@ struct ComputerPermissionRowActionTests {
 @Suite("Screen capture teardown fence")
 struct ScreenCaptureGateTests {
     @Test("Closing waits for an in-flight frame callback and blocks later delivery")
-    func closeSerializesWithFrameDelivery() async {
+    func closeSerializesWithFrameDelivery() {
+        // OS threads, not cooperative-pool tasks: the test deliberately blocks
+        // while the callback holds the gate lock, so a saturated parallel test
+        // executor must not be able to starve the delivery or close side. Each
+        // wait stays bounded, so a broken fence fails instead of hanging.
         let gate = ScreenCaptureGate(
-            deadline: ContinuousClock().now.advanced(by: .seconds(10)),
+            deadline: ContinuousClock().now.advanced(by: .seconds(60)),
             ownerMatches: { true },
             permissionAvailable: { true }
         )
         let callbackEntered = DispatchSemaphore(value: 0)
         let finishCallback = DispatchSemaphore(value: 0)
-        let delivery = Task.detached {
-            gate.deliverIfAuthorized {
+        let deliveryReturned = DispatchSemaphore(value: 0)
+        let delivery = Thread {
+            if gate.deliverIfAuthorized({
                 callbackEntered.signal()
-                _ = waitForSemaphore(finishCallback, timeout: 2)
+                _ = waitForSemaphore(finishCallback, timeout: 10)
+            }) {
+                deliveryReturned.signal()
             }
         }
+        delivery.start()
 
-        #expect(waitForSemaphore(callbackEntered, timeout: 1) == .success)
+        #expect(waitForSemaphore(callbackEntered, timeout: 10) == .success)
 
         let closeStarted = DispatchSemaphore(value: 0)
         let closeReturned = DispatchSemaphore(value: 0)
-        let closing = Task.detached {
+        let closing = Thread {
             closeStarted.signal()
             gate.close()
             closeReturned.signal()
         }
-        #expect(waitForSemaphore(closeStarted, timeout: 1) == .success)
+        closing.start()
+        #expect(waitForSemaphore(closeStarted, timeout: 10) == .success)
         #expect(waitForSemaphore(closeReturned, timeout: 0.05) == .timedOut)
 
         finishCallback.signal()
-        #expect(await delivery.value)
-        #expect(waitForSemaphore(closeReturned, timeout: 1) == .success)
-        await closing.value
+        #expect(waitForSemaphore(deliveryReturned, timeout: 10) == .success)
+        #expect(waitForSemaphore(closeReturned, timeout: 10) == .success)
 
         var laterCallbackRan = false
         #expect(!gate.deliverIfAuthorized { laterCallbackRan = true })

@@ -970,15 +970,15 @@ public final class GuidedServerSetupModel {
                     installProgress = .failed(reason: message)
                 } else if local == .cancelled {
                     installProgress = dispatchStarted
-                        ? .outcomeUnknown(reason: message)
+                        ? .outcomeUnknown(reason: Self.unknownOutcomeMessage(message))
                         : .cancelled(reason: message)
                 } else if local == .timedOut || local == .outputExceeded {
                     installProgress = dispatchStarted
-                        ? .outcomeUnknown(reason: message)
+                        ? .outcomeUnknown(reason: Self.unknownOutcomeMessage(message))
                         : .failed(reason: message)
                 } else if case .invalidResponse = local {
                     installProgress = dispatchStarted
-                        ? .outcomeUnknown(reason: message)
+                        ? .outcomeUnknown(reason: Self.unknownOutcomeMessage(message))
                         : .failed(reason: message)
                 } else if case .authorizationFailed = local {
                     installProgress = .failed(reason: message)
@@ -1206,7 +1206,10 @@ public final class GuidedServerSetupModel {
                 field: label,
                 detail: "Enter a normalized absolute ASCII path.")
         }
-        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        // The leading separator yields one empty component; skip it so a
+        // normalized absolute path is not rejected for its own root marker.
+        // Interior empty components are already refused by the "//" check.
+        let components = path.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
         guard components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
             throw HelicoidError.invalidInput(
                 field: label,
@@ -1298,6 +1301,12 @@ public final class GuidedServerSetupModel {
             text = error.localizedDescription
         }
         return String(LocalServerInstallClient.sanitized(text).prefix(2_048))
+    }
+
+    /// A post-dispatch outcome that cannot be classified must direct the
+    /// operator to the read-only status path before any retry.
+    private static func unknownOutcomeMessage(_ message: String) -> String {
+        "\(message) Refresh status before any retry."
     }
 
     static func statusSummary(_ status: InstallerOperationStatus) -> String {

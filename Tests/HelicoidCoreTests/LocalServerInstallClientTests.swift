@@ -201,7 +201,6 @@ struct LocalServerInstallClientTests {
 
         let commands = await runner.commands()
         #expect(commands.count == 1)
-        #expect(commands[0].arguments[1].contains("--state-dir"))
         guard let script = commands[0].arguments.last,
               let shell = stagedShellScript(from: script),
               let request = base64Request(from: shell),
@@ -209,6 +208,10 @@ struct LocalServerInstallClientTests {
             Issue.record("Could not recover the apply request")
             return
         }
+        // The apply arguments are inside the base64-encoded staged shell; the
+        // AppleScript wrapper only carries the encoded bytes.
+        #expect(shell.contains(
+            "'--state-dir' '\(ServerInstallContract.installerStateDirectory)'"))
         let product = (object["plan"] as? [String: Any])?["product"] as? String
         let confirm = object["confirm"] as? Bool
         let reviewedDigest = object["reviewed_plan_digest"] as? String
@@ -248,7 +251,6 @@ struct LocalServerInstallClientTests {
 
         let commands = await runner.commands()
         #expect(commands.count == 1)
-        #expect(commands[0].arguments[1].contains("--state-dir"))
         guard let script = commands[0].arguments.last,
               let shell = stagedShellScript(from: script),
               let request = base64Request(from: shell),
@@ -256,6 +258,10 @@ struct LocalServerInstallClientTests {
             Issue.record("Could not recover the cancel request")
             return
         }
+        // The cancel arguments are inside the base64-encoded staged shell; the
+        // AppleScript wrapper only carries the encoded bytes.
+        #expect(shell.contains(
+            "'--state-dir' '\(ServerInstallContract.installerStateDirectory)'"))
         let operationId = object["operation_id"] as? String
         let confirm = object["confirm"] as? Bool
         let confirmUnverified = object["confirm_unverified_completion"] as? Bool
