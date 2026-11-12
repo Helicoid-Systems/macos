@@ -107,6 +107,25 @@ private func rawTLSResponse(_ object: [String: Any]) throws -> Data {
     try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
 }
 
+private func stagedShellScript(from appleScript: String) -> String? {
+    guard let start = appleScript.range(of: "printf '%s' '")?.upperBound,
+          let end = appleScript[start...].range(of: "' | /usr/bin/base64 -D")?.lowerBound else {
+        return nil
+    }
+    guard let data = Data(base64Encoded: String(appleScript[start..<end])) else {
+        return nil
+    }
+    return String(data: data, encoding: .utf8)
+}
+
+private func base64Request(from script: String) -> Data? {
+    guard let start = script.range(of: "printf '%s' '")?.upperBound,
+          let end = script[start...].range(of: "' |")?.lowerBound else {
+        return nil
+    }
+    return Data(base64Encoded: String(script[start..<end]))
+}
+
 @Suite("Local server install client")
 struct LocalServerInstallClientTests {
     @Test("Capabilities are read directly without an administrator prompt")

@@ -222,8 +222,8 @@ both the release trust keys and the release helper SHA-256 are compiled into the
 Manager. Empty compiled values disable the release privileged path entirely;
 a helper that does not match the compiled digest is refused before staging.
 
-For development installs, TLS provisioning uses the proposed verified server
-helper subcommand `hs-server installer provision-macos-tls`. The Manager stages
+For development installs, TLS provisioning uses the verified server helper
+subcommand `hs-server installer provision-macos-tls`. The Manager stages
 the digest-pinned helper through the existing privileged wrapper, requires a
 verified development package, invokes the subcommand as root, and strictly
 validates its JSON response (`certificate_path`, `private_key_path`,
@@ -231,14 +231,14 @@ validates its JSON response (`certificate_path`, `private_key_path`,
 `/etc/helicoid/tls` paths and literal `127.0.0.1`. Unknown fields, unexpected
 paths/hosts, malformed digests, or a timeout/lost response are refused; a
 dispatched timeout is treated as an unknown outcome, as is any post-dispatch
-result the Manager cannot strictly validate. The server is finalizing an
-explicit structured existing-unverified outcome; when published, the Manager
-will map it to the existing-material state and continue to the reviewed plan
-for operator TLS. The helper owns atomic publication, locking, ACLs, ownership,
-and cleanup. The Manager does not
-implement a local TLS publisher and does not run a root interpreter. The server
-API is still under review, so the path remains fail-closed if the helper does
-not expose the subcommand. This is not production or public PKI material.
+result the Manager cannot strictly validate. An explicit structured
+`existing_unverified` outcome is validated against those same fixed paths and
+host, including its presence flags and bounded detail, and mapped to the
+existing-material state so the reviewed plan continues for operator TLS. The
+helper owns atomic publication, locking, ACLs, ownership, and cleanup. The
+Manager does not implement a local TLS publisher and does not run a root
+interpreter. The path remains fail-closed if the helper does not expose the
+subcommand. This is not production or public PKI material.
 Disposable machines only: the installer creates a system account/group, product
 paths, and a LaunchDaemon, and it does not establish production readiness or
 enrollment.

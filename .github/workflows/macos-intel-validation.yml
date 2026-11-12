@@ -1,0 +1,66 @@
+# macOS Intel validation — Helicoid Manager / Helicoid Computer
+#
+# Runs the unprivileged macOS test, helper-packaging, and release-build steps on
+# a native Intel (x86_64) GitHub-hosted runner. macOS arm64 runner allocation
+# has been unreliable, so this gives Intel coverage without depending on it.
+#
+# Scope and limits:
+#   * This workflow validates x86_64 only. It does NOT verify or claim ARM
+#     (macos-15 / arm64) behavior; `.github/workflows/macos.yml` remains the ARM
+#     workflow and is unchanged.
+#   * No privileged operations: no installer, no root steps, no signing,
+#     notarization, or release publishing.
+#   * Push runs are limited to the trusted branch below. `workflow_dispatch` is
+#     also available; a new workflow file is not dispatchable until it reaches
+#     the default branch.
+#   * Builds and tests run only in GitHub Actions.
+
+name: macOS Intel validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/macos-native-combined
+    paths:
+      - '.github/workflows/macos-intel-validation.yml'
+      - 'Package.swift'
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'Resources/**'
+      - 'scripts/**'
+
+jobs:
+  test-and-build:
+    name: Intel test and build
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 26+ / Swift 6.2+
+        run: |
+          # Prefer an installed Xcode that supports swift-tools-version 6.2.
+          if [ -d /Applications/Xcode_26.4.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.4.app/Contents/Developer
+          elif [ -d /Applications/Xcode_26.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+          else
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          fi
+          xcodebuild -version
+          swift --version
+          swift package dump-package >/dev/null
+
+      - name: Test
+        run: |
+          xcrun swift test --package-path .
+
+      - name: Test development hs-server helper packaging
+        run: |
+          ./scripts/tests/hs-server-helper-tests.sh
+
+      - name: Build release
+        run: |
+          xcrun swift build -c release --package-path .
