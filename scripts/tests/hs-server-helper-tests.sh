@@ -290,7 +290,7 @@ DEV_ARTIFACT_SHA="$(sha_of "$DEV_PACKAGE/artifacts/hs-server")"
 }
 EOF
 /bin/chmod 644 "$DEV_PACKAGE/manifest.json"
-/usr/bin/dd if=/dev/zero of="$DEV_PACKAGE/manifest.sig" bs=64 count=1 2>/dev/null
+/bin/dd if=/dev/zero of="$DEV_PACKAGE/manifest.sig" bs=64 count=1
 /bin/chmod 644 "$DEV_PACKAGE/manifest.sig"
 
 assert_evidence() {
