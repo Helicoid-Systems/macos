@@ -620,6 +620,46 @@ struct GuidedServerInstallModelTests {
         #expect(model.canCheckInstallStatus)
     }
 
+    @Test("An unreadable stored configuration is not treated as no record")
+    @MainActor
+    func unreadableStoredConfigurationIsNotNoRecord() async throws {
+        let none = try ServerInstallTestSupport.operationStatus(
+            state: "not_installed",
+            serviceInstalled: false,
+            operationId: nil)
+        let service = FakeInstallService(
+            package: .testFixture(),
+            capabilities: try ServerInstallTestSupport.capabilities(),
+            preflight: try ServerInstallTestSupport.preflight(),
+            plan: try ServerInstallTestSupport.planResult(),
+            apply: none,
+            status: none,
+            cancel: none,
+            storedConfigurationError: .invalidResponse("stored operation record decode failed"))
+        let model = makeGuidedInstallModel(service: service)
+        advanceToInstall(model)
+
+        await model.refreshInstallStatus()
+
+        let calls = await service.recordedCalls()
+        #expect(calls.contains("storedConfiguration"))
+        // A read failure must not fall through to a status probe with
+        // invented defaults, which would look like a fresh Mac with no record.
+        #expect(!calls.contains("status"))
+        #expect(model.installProgress != .notStarted)
+        #expect(model.installOperationConfiguration == nil)
+        #expect(model.installStatus == nil)
+        #expect(model.installStatusSummary == nil)
+        guard case .attentionRequired(let summary) = model.installProgress else {
+            Issue.record("Expected an unreadable-record attention state, got \(model.installProgress)")
+            return
+        }
+        #expect(summary.contains("recorded configuration could not be read"))
+        #expect(summary.contains("stored operation record decode failed"))
+        #expect(model.blocker?.contains("recorded configuration could not be read") == true)
+        #expect(model.canCheckInstallStatus)
+    }
+
     @Test("Check status stays available after a failed attempt")
     @MainActor
     func checkStatusAfterFailure() async throws {

@@ -487,7 +487,7 @@ actor FakeInstallService: ServerInstallServicing {
         statusConfigurations.append(configuration)
         if let statusError { throw statusError }
         if statusRejectsOtherConfigurations && configuration != statusValue.configuration {
-            throw .helperFailed(
+            throw LocalServerInstallError.helperFailed(
                 status: 1,
                 detail: "operation record does not match the requested deployment configuration")
         }
