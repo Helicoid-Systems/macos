@@ -53,13 +53,13 @@ jobs:
           swift --version
           swift package dump-package >/dev/null
 
-      - name: Test
-        run: |
-          xcrun swift test --package-path .
-
       - name: Test development hs-server helper packaging
         run: |
           ./scripts/tests/hs-server-helper-tests.sh
+
+      - name: Test
+        run: |
+          xcrun swift test --package-path .
 
       - name: Build release
         run: |
