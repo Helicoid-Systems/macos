@@ -6,6 +6,12 @@
 # Developer ID signature, notarization, or production acceptance here. Do not
 # distribute the resulting archive as a production build.
 #
+# One native, single-architecture artifact is built per matrix leg: arm64 on
+# macos-15 and x86_64 on macos-15-intel. Artifact and archive names carry the
+# architecture, and each leg asserts that its runner architecture matches its
+# matrix entry. Neither leg produces a universal binary, and the Intel leg makes
+# no ARM claim (nor the ARM leg an Intel claim).
+#
 # Reproducibility: the server and core refs are pinned below, but the Manager
 # ref is the triggering ref. A dispatch from another Manager ref can still
 # produce a different archive, so this is not a reproducible release input.
@@ -51,11 +57,28 @@ concurrency:
 
 jobs:
   build-development-manager:
-    name: Build development Manager and hs-server package
+    name: Build development Manager and hs-server package (${{ matrix.arch }})
     # Development artifacts only for the canonical repository on github.com.
     if: ${{ github.repository == 'Helicoid-Systems/macos' && github.server_url == 'https://github.com' && github.event.repository.fork == false }}
-    runs-on: macos-15
+    strategy:
+      # Each architecture is an independent artifact; one leg failing must not
+      # suppress the other leg's archive.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            platform: macos-arm64
+          - runner: macos-15-intel
+            arch: x86_64
+            platform: macos-x86_64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    env:
+      HELICOID_DEVELOPMENT_ARCH: ${{ matrix.arch }}
+      HELICOID_DEVELOPMENT_PLATFORM: ${{ matrix.platform }}
+      HELICOID_MANAGER_RUNNER: ${{ matrix.runner }}
+      HELICOID_MANAGER_ARCHIVE: Helicoid-Manager-development-macos-${{ matrix.arch }}.zip
     steps:
       - name: Require GitHub-hosted macOS runner
         run: |
@@ -68,6 +91,16 @@ jobs:
             echo "::error::This development build requires macOS."
             exit 1
           }
+          test -n "${HELICOID_DEVELOPMENT_ARCH:-}" || {
+            echo "::error::The matrix architecture is not set."
+            exit 1
+          }
+          host_arch="$(uname -m)"
+          test "$host_arch" = "$HELICOID_DEVELOPMENT_ARCH" || {
+            echo "::error::Runner architecture $host_arch does not match the matrix architecture $HELICOID_DEVELOPMENT_ARCH."
+            exit 1
+          }
+          echo "Building for $HELICOID_DEVELOPMENT_PLATFORM on $HELICOID_MANAGER_RUNNER ($host_arch)."
 
       - name: Checkout Manager (macos)
         uses: actions/checkout@v4
@@ -317,11 +350,24 @@ jobs:
           )"
           [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 
-          case "$(uname -m)" in
-            arm64) platform="macos-arm64" ;;
-            x86_64) platform="macos-x86_64" ;;
-            *) echo "::error::unsupported macOS runner architecture"; exit 1 ;;
+          # The package platform comes from the matrix, not from the host. The
+          # host assertion prevents an artifact from being labelled with an
+          # architecture other than the one this runner actually built.
+          host_arch="$(uname -m)"
+          test "$host_arch" = "$HELICOID_DEVELOPMENT_ARCH" || {
+            echo "::error::Runner architecture $host_arch does not match the matrix architecture $HELICOID_DEVELOPMENT_ARCH."
+            exit 1
+          }
+          case "$host_arch" in
+            arm64) host_platform="macos-arm64" ;;
+            x86_64) host_platform="macos-x86_64" ;;
+            *) echo "::error::unsupported macOS runner architecture: $host_arch"; exit 1 ;;
           esac
+          test "$host_platform" = "$HELICOID_DEVELOPMENT_PLATFORM" || {
+            echo "::error::Host platform $host_platform does not match the matrix platform $HELICOID_DEVELOPMENT_PLATFORM."
+            exit 1
+          }
+          platform="$HELICOID_DEVELOPMENT_PLATFORM"
 
           HELICOID_OPENSSL="$HELICOID_OPENSSL" \
             "$GITHUB_WORKSPACE/server/scripts/package-macos-development.sh" \
@@ -344,7 +390,6 @@ jobs:
           test -x "$package_dir/artifacts/hs-server"
 
           echo "HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR=$package_dir" >> "$GITHUB_ENV"
-          echo "HELICOID_DEVELOPMENT_PLATFORM=$platform" >> "$GITHUB_ENV"
           echo "Packaged development hs-server $version for $platform."
 
       - name: Build full development Manager app
@@ -395,6 +440,22 @@ jobs:
 
           # Re-run the repository's development-only bundle verifier.
           ./scripts/hs-server-development-bundle.sh verify --app "$app"
+
+          # Each matrix leg must produce one native, single-architecture binary.
+          # A universal or wrong-arch binary would make the architecture-specific
+          # artifact name misleading.
+          expected_arch="$HELICOID_DEVELOPMENT_ARCH"
+          for binary in \
+            "$app/Contents/MacOS/HelicoidManager" \
+            "$helper" \
+            "$package/artifacts/hs-server" \
+            "$server_bin"; do
+            actual_archs="$(/usr/bin/xcrun lipo -archs "$binary")"
+            if [ "$actual_archs" != "$expected_arch" ]; then
+              echo "::error::$binary has architectures '$actual_archs', expected exactly '$expected_arch'."
+              exit 1
+            fi
+          done
 
           # Independently verify the signed package manifest using only the
           # public build pin. The private key was already removed.
@@ -647,13 +708,14 @@ jobs:
         run: |
           set -euo pipefail
           app="$PWD/dist/Helicoid Manager.app"
-          archive="$PWD/dist/Helicoid-Manager-development.zip"
+          archive="$PWD/dist/$HELICOID_MANAGER_ARCHIVE"
           extract="$(mktemp -d "$HELICOID_DEVELOPMENT_WORK/zip-check.XXXXXX")"
 
           rm -f "$archive"
 
           # ditto preserves executable modes and bundle structure. The archive
-          # is deliberately named as a development build.
+          # is deliberately named as a development build and carries the
+          # architecture it was built for.
           /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
           test -s "$archive"
           /usr/bin/unzip -t "$archive" >/dev/null
@@ -694,8 +756,8 @@ jobs:
       - name: Upload development Manager archive
         uses: actions/upload-artifact@v4
         with:
-          name: helicoid-manager-development-macos
-          path: macos/dist/Helicoid-Manager-development.zip
+          name: helicoid-manager-development-macos-${{ matrix.arch }}
+          path: macos/dist/Helicoid-Manager-development-macos-${{ matrix.arch }}.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -703,19 +765,21 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          archive="$GITHUB_WORKSPACE/macos/dist/Helicoid-Manager-development.zip"
+          archive="$GITHUB_WORKSPACE/macos/dist/$HELICOID_MANAGER_ARCHIVE"
           if [ ! -f "$archive" ]; then
             echo "No development Manager archive was produced; skipping the development-only summary."
             exit 0
           fi
 
           {
-            echo "## DEVELOPMENT ONLY — Helicoid Manager"
+            echo "## DEVELOPMENT ONLY — Helicoid Manager (${HELICOID_DEVELOPMENT_ARCH})"
             echo ""
             echo "This artifact is an ad-hoc-signed development build containing the"
             echo "\`macos-dev-install\` server helper and signed development package."
             echo "It is **not** a release, not notarized, and not for distribution."
             echo ""
+            echo "- Architecture: \`${HELICOID_DEVELOPMENT_ARCH}\` (native, single-architecture \`${HELICOID_DEVELOPMENT_PLATFORM}\`; not universal)"
+            echo "- Runner: \`${HELICOID_MANAGER_RUNNER}\`"
             echo "- Manager ref: \`${GITHUB_REF_NAME}\` at \`${GITHUB_SHA}\`"
             echo "- Server commit: \`39994d071fa74ff2f6079f0a545e109580f9285a\`"
             echo "- Server CI/acceptance for that commit: pending (the previous pin passed tests but failed clippy); the native TLS helper is unverified, and no pass is claimed by this workflow."
@@ -725,10 +789,10 @@ jobs:
             echo "- Reproducibility: server and core are pinned, but the Manager ref is the triggering ref; this archive is not a reproducible release input."
             echo "- Gates: non-privileged server development-feature tests and Manager Swift tests. Privileged install/rollback acceptance is a separate server workflow."
             echo "- Feature probe: \`installer capabilities-v2\` asserted install/cancel, macos_launchd, loopback_development, the durable journal, and cancellation; full acceptance is not claimed."
-            echo "- Archive: \`Helicoid-Manager-development.zip\`"
+            echo "- Archive: \`${HELICOID_MANAGER_ARCHIVE}\`"
             echo "- Archive SHA-256: \`$(shasum -a 256 "$archive" | awk '{print $1}')\`"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "::warning::DEVELOPMENT ONLY: ad-hoc-signed Manager with macos-dev-install helper/package; not a release or notarized build."
+          echo "::warning::DEVELOPMENT ONLY: ad-hoc-signed ${HELICOID_DEVELOPMENT_ARCH} Manager with macos-dev-install helper/package; not a release or notarized build."
 
       - name: Remove ephemeral development signing key
         if: always()
