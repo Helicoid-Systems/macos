@@ -1021,8 +1021,7 @@ public final class GuidedServerSetupModel {
                 if let persisted = configurationStore.load() {
                     configuration = persisted
                     installOperationConfiguration = persisted
-                } else if let fetched = try? await installService.storedConfiguration(package: package),
-                          let stored = fetched {
+                } else if let stored = try await installService.storedConfiguration(package: package) {
                     // Server-authoritative recovery for installations created
                     // before this Manager persisted the configuration locally.
                     _ = try? configurationStore.save(stored)
@@ -1085,8 +1084,7 @@ public final class GuidedServerSetupModel {
         package: TrustedServerPackage,
         current: InstallerDeploymentConfiguration
     ) async -> InstallerDeploymentConfiguration? {
-        guard let fetched = try? await installService.storedConfiguration(package: package),
-              let recovered = fetched,
+        guard let recovered = try? await installService.storedConfiguration(package: package),
               recovered != current else {
             return nil
         }
