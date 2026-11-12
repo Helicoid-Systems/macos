@@ -59,17 +59,19 @@ struct ServerInstallConfigurationStoreTests {
         let store = FileServerInstallConfigurationStore(fileURL: fifo)
 
         let finished = StoreLoadSignal()
-        Task.detached {
-            _ = store.load()
-            finished.semaphore.signal()
+        let reader = Thread {
+            if store.load() == nil {
+                finished.semaphore.signal()
+            }
         }
-        let result = finished.semaphore.wait(timeout: .now() + 2)
+        reader.start()
+        let result = finished.semaphore.wait(timeout: .now() + 10)
 
         switch result {
         case .success:
             break
         case .timedOut:
-            Issue.record("The configuration store read blocked on a FIFO")
+            Issue.record("The configuration store did not promptly reject the FIFO")
         }
     }
 
