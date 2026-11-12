@@ -1,0 +1,430 @@
+# Real Manager -> local server installation acceptance on a disposable
+# GitHub-hosted macOS runner.
+#
+# This workflow is not a release pipeline. It builds the pinned development
+# server helper/package and the development Manager in the same job, then runs a
+# Swift integration suite through the packaged Manager's real
+# LocalServerInstallClient. The only test-only seam replaces the exact
+# production `osascript ... with administrator privileges` invocation with
+# `sudo -n /bin/sh -c <same command>`; production code has no bypass.
+#
+# Coverage:
+#   * The matrix runs both macOS runner architectures independently, each on its
+#     own disposable GitHub-hosted runner: macos-15 (arm64) and
+#     macos-15-intel (x86_64), each for the client and model modes.
+#   * Nothing is shared between matrix jobs: no artifact upload/download and no
+#     cross-job build reuse. Architecture is derived from the live host in every
+#     script and is asserted against the matrix entry, so the same scripts build
+#     and validate the matching arm64 or x86_64 payload.
+#
+# Safety model and limitations:
+#   * Runs only for Helicoid-Systems/macos, on a GitHub-hosted runner, from the
+#     exact ref refs/heads/codex/macos-native-combined.
+#   * No protected environment, OIDC trust, or non-ephemeral runner is assumed.
+#     A compromised workflow, token, or runner can defeat these guards. The only
+#     containment is that the runner is destroyed after the job.
+#   * `workflow_dispatch` from any other ref is refused by the job guard.
+#   * The suite proves every fixed resource absent with root lstat, explicit
+#     dscl record-not-found, and explicit launchd not-found. Only then does it
+#     write a marker bound to repository, exact branch, github.run_id,
+#     github.run_attempt, and a per-run nonce.
+#   * Cleanup is authorized only by validated marker content. Missing, forged,
+#     stale, or malformed markers authorize no deletion.
+#   * The `_helicoid` identity is deleted only after a valid install receipt
+#     proves the product, account/group, and matching UID/GID. Otherwise it is
+#     preserved and the job fails.
+#
+# A new workflow file is not dispatchable from the default branch until merged.
+# The narrow trusted-branch push trigger makes the first run possible without
+# widening this privileged acceptance to pull requests or other branches.
+
+name: Manager server installation acceptance (macOS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/macos-native-combined
+    paths:
+      - '.github/workflows/manager-server-acceptance.yml'
+      - 'Package.swift'
+      - 'Sources/HelicoidCore/Setup/**'
+      - 'Tests/HelicoidCoreTests/ManagerServerAcceptanceTests.swift'
+      - 'scripts/build.sh'
+      - 'scripts/hs-server-helper.sh'
+      - 'scripts/hs-server-development-bundle.sh'
+      - 'scripts/run-manager-server-acceptance.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    name: Manager installer (${{ matrix.arch }}, ${{ matrix.mode }})
+    # Privileged host acceptance only for the canonical repository on
+    # github.com, on a GitHub-hosted runner, from the exact trusted ref.
+    # Each matrix entry targets its own disposable runner; nothing is shared.
+    if: ${{ github.repository == 'Helicoid-Systems/macos' && github.server_url == 'https://github.com' && github.event.repository.fork == false && github.ref == 'refs/heads/codex/macos-native-combined' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    concurrency:
+      group: manager-server-acceptance-${{ github.ref }}-${{ matrix.arch }}-${{ matrix.mode }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            mode: client
+          - runner: macos-15
+            arch: arm64
+            mode: model
+          - runner: macos-15-intel
+            arch: x86_64
+            mode: client
+          - runner: macos-15-intel
+            arch: x86_64
+            mode: model
+    steps:
+      - name: Require trusted repository, exact ref, GitHub-hosted macOS runner, and matrix architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "Helicoid-Systems/macos"
+          test "$GITHUB_REF" = "refs/heads/codex/macos-native-combined"
+          test "${RUNNER_ENVIRONMENT:-}" = "github-hosted"
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          test -x /usr/bin/python3
+          /usr/bin/sudo -n /usr/bin/true
+          /usr/bin/sudo -n /bin/launchctl print system >/dev/null
+          echo "HELICOID_ACCEPTANCE_ARCH=$EXPECTED_ARCH" >> "$GITHUB_ENV"
+
+      - name: Checkout Manager (macos)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: macos
+          persist-credentials: false
+
+      - name: Checkout pinned server
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Helicoid-Systems/server
+          # Server native TLS helper commit. This SHA passed the unprivileged
+          # Intel server tests and clippy in
+          # https://github.com/Helicoid-Systems/server/actions/runs/43205758079.
+          # Unprivileged ARM coverage and the privileged Manager acceptance are
+          # still pending, so this pin is not yet verified on those hosts. Do not
+          # replace this pin with a branch.
+          ref: 39994d071fa74ff2f6079f0a545e109580f9285a
+          path: server
+          persist-credentials: false
+
+      - name: Checkout pinned core
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Helicoid-Systems/core
+          ref: 5d3f98eaad86330010e1bdaf4731189b286e0dbe
+          path: core
+          persist-credentials: false
+
+      - name: Verify pinned commits
+        run: |
+          set -euo pipefail
+          test "$(git -C server rev-parse HEAD)" = "39994d071fa74ff2f6079f0a545e109580f9285a"
+          test "$(git -C core rev-parse HEAD)" = "5d3f98eaad86330010e1bdaf4731189b286e0dbe"
+          echo "Server commit: $(git -C server rev-parse HEAD)"
+          echo "Core commit: $(git -C core rev-parse HEAD)"
+
+      - name: Create run-bound clean-state marker identity
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/codex/macos-native-combined"
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          nonce="$(/usr/bin/uuidgen | /usr/bin/tr -d '-' | /usr/bin/tr 'A-Z' 'a-z')"
+          [[ "$nonce" =~ ^[0-9a-f]{32}$ ]]
+          marker="$RUNNER_TEMP/helicoid-manager-acceptance-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${nonce}.clean"
+          test ! -e "$marker"
+          test ! -L "$marker"
+          echo "HELICOID_MANAGER_ACCEPTANCE_NONCE=$nonce" >> "$GITHUB_ENV"
+          echo "HELICOID_MANAGER_ACCEPTANCE_MARKER=$marker" >> "$GITHUB_ENV"
+          echo "Prepared a run-bound marker identity; the suite establishes the marker only after root clean-state checks."
+
+      - name: Select Xcode with Swift 6.2+
+        run: |
+          set -euo pipefail
+          # Prefer a modern Xcode explicitly. On the Intel image the default
+          # Xcode is 16.4, which cannot parse swift-tools-version 6.2, so the
+          # fallback below is only acceptable when it is itself new enough; the
+          # Swift version assertion makes that failure legible instead of a
+          # confusing manifest parse error.
+          if [ -d /Applications/Xcode_26.4.app ]; then
+            /usr/bin/sudo /usr/bin/xcode-select -s /Applications/Xcode_26.4.app/Contents/Developer
+          elif [ -d /Applications/Xcode_26.3.app ]; then
+            /usr/bin/sudo /usr/bin/xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+          else
+            /usr/bin/sudo /usr/bin/xcode-select -s /Applications/Xcode.app/Contents/Developer
+          fi
+          xcodebuild -version
+          swift --version
+          swift_version="$(swift -version 2>&1 | sed -n 's/.*version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p' | head -n 1)"
+          # shellcheck disable=SC2086
+          set -- $swift_version
+          if [ "$#" -ne 2 ]; then
+            echo "::error::cannot determine the selected Swift version"
+            exit 1
+          fi
+          if [ "$1" -lt 6 ] || { [ "$1" -eq 6 ] && [ "$2" -lt 2 ]; }; then
+            echo "::error::Swift 6.2+ is required (found $1.$2)"
+            exit 1
+          fi
+          (cd macos && swift package dump-package >/dev/null)
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch pinned
+
+      - name: Install OpenSSL 3 with Ed25519 support
+        run: |
+          set -euo pipefail
+          brew install openssl@3
+          openssl_prefix="$(brew --prefix openssl@3)"
+          test -x "$openssl_prefix/bin/openssl"
+          "$openssl_prefix/bin/openssl" version
+          "$openssl_prefix/bin/openssl" pkeyutl -help 2>&1 | grep -a -- '-rawin' >/dev/null
+          echo "HELICOID_OPENSSL=$openssl_prefix/bin/openssl" >> "$GITHUB_ENV"
+
+      - name: Generate ephemeral pinned development Ed25519 key
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/helicoid-manager-acceptance"
+          key_dir="$work/key"
+          mkdir -m 0700 -p "$work" "$key_dir"
+          chmod 0700 "$work" "$key_dir"
+          key="$key_dir/signing-key.pem"
+          der="$key_dir/public-key.der"
+          "$HELICOID_OPENSSL" genpkey -algorithm ED25519 -out "$key"
+          chmod 0600 "$key"
+          test -f "$key" && test ! -L "$key"
+          test "$(stat -f '%Lp' "$key")" = "600"
+          "$HELICOID_OPENSSL" pkey -in "$key" -pubout -outform DER -out "$der"
+          chmod 0600 "$der"
+          test "$(wc -c < "$der" | tr -d ' ')" = "44"
+          key_hex="$(python3 - "$der" <<'PY'
+          import sys
+          from pathlib import Path
+          raw = Path(sys.argv[1]).read_bytes()
+          if len(raw) != 44 or raw[:12] != bytes.fromhex("302a300506032b6570032100"):
+              raise SystemExit("unexpected Ed25519 SubjectPublicKeyInfo")
+          print(raw[-32:].hex())
+          PY
+          )"
+          [[ "$key_hex" =~ ^[0-9a-f]{64}$ ]]
+          rm -f -- "$der"
+          echo "HELICOID_MANAGER_ACCEPTANCE_WORK=$work" >> "$GITHUB_ENV"
+          echo "HELICOID_MACOS_DEV_TRUST_KEY=$key_hex" >> "$GITHUB_ENV"
+          echo "Generated the ephemeral development key; only the public pin is exported."
+
+      - name: Validate packaging and acceptance scripts
+        run: |
+          set -euo pipefail
+          bash -n macos/scripts/build.sh
+          bash -n macos/scripts/hs-server-helper.sh
+          bash -n macos/scripts/hs-server-development-bundle.sh
+          bash -n macos/scripts/run-manager-server-acceptance.sh
+          bash -n server/scripts/package-macos-development.sh
+
+      - name: Gate server development-feature tests
+        working-directory: server
+        run: |
+          set -euo pipefail
+          test -n "${HELICOID_MACOS_DEV_TRUST_KEY:-}"
+          HELICOID_MACOS_DEV_TRUST_KEY="$HELICOID_MACOS_DEV_TRUST_KEY" \
+            cargo test --locked \
+              --features macos-dev-install \
+              --lib \
+              --test installer_macos_plan \
+              --test installer_macos_capabilities \
+              --test installer_macos_launchd \
+              --test installer_macos_dev_install
+
+      - name: Build and ad-hoc sign development hs-server
+        working-directory: server
+        run: |
+          set -euo pipefail
+          test -n "${HELICOID_MACOS_DEV_TRUST_KEY:-}"
+          HELICOID_MACOS_DEV_TRUST_KEY="$HELICOID_MACOS_DEV_TRUST_KEY" \
+            cargo build --locked --release --features macos-dev-install
+          server_bin="target/release/hs-server"
+          test -x "$server_bin"
+          /usr/bin/codesign --force --sign - "$server_bin"
+          /usr/bin/codesign --verify --strict "$server_bin"
+          "$server_bin" installer capabilities-v2 > "$HELICOID_MANAGER_ACCEPTANCE_WORK/hs-server-capabilities.json"
+          python3 - "$HELICOID_MANAGER_ACCEPTANCE_WORK/hs-server-capabilities.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              capabilities = json.load(handle)
+
+          if capabilities.get("contract_version") != 2:
+              raise SystemExit("installer capabilities contract_version is not 2")
+          actions = capabilities.get("supported_actions")
+          if not isinstance(actions, list) or "install" not in actions or "cancel" not in actions:
+              raise SystemExit(f"macos-dev-install feature is not active: {actions!r}")
+          if "macos_launchd" not in capabilities.get("supported_deployment_kinds", []):
+              raise SystemExit("installer does not advertise macos_launchd")
+          if "loopback_development" not in capabilities.get("supported_network_scopes", []):
+              raise SystemExit("installer does not advertise loopback_development")
+          if capabilities.get("durable_operation_journal") is not True:
+              raise SystemExit("macos-dev-install did not enable the durable operation journal")
+          if capabilities.get("cancellation") is not True:
+              raise SystemExit("macos-dev-install did not enable cancellation")
+          print("Validated macos-dev-install capabilities:", ", ".join(actions))
+          PY
+
+      - name: Package and sign exact development hs-server package
+        run: |
+          set -euo pipefail
+          work="$HELICOID_MANAGER_ACCEPTANCE_WORK"
+          key_path="$work/key/signing-key.pem"
+          key_dir="$(dirname "$key_path")"
+          server_bin="$GITHUB_WORKSPACE/server/target/release/hs-server"
+          package_dir="$work/hs-server-package"
+          test ! -e "$package_dir"
+          test -f "$key_path" && test ! -L "$key_path"
+          test "$(stat -f '%Lp' "$key_path")" = "600"
+
+          cleanup_signing_key() {
+            rm -f -- "$key_path" "$key_dir/public-key.der"
+            rmdir "$key_dir" 2>/dev/null || true
+          }
+          trap cleanup_signing_key EXIT
+
+          version="$(python3 - "$GITHUB_WORKSPACE/server/Cargo.toml" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          match = re.search(r'(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', text)
+          if match is None:
+              raise SystemExit("cannot read the server package version from Cargo.toml")
+          print(match.group(1))
+          PY
+          )"
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+
+          case "$(uname -m)" in
+            arm64) platform="macos-arm64" ;;
+            x86_64) platform="macos-x86_64" ;;
+            *) echo "::error::unsupported macOS runner architecture"; exit 1 ;;
+          esac
+          # Platform is derived from the live host, then asserted against the
+          # matrix entry so a mislabeled runner cannot silently build and test a
+          # foreign architecture.
+          test "$(uname -m)" = "${HELICOID_ACCEPTANCE_ARCH:?}"
+          test "$platform" = "macos-$HELICOID_ACCEPTANCE_ARCH"
+
+          HELICOID_OPENSSL="$HELICOID_OPENSSL" \
+            "$GITHUB_WORKSPACE/server/scripts/package-macos-development.sh" \
+            "$server_bin" "$version" "$platform" \
+            "$key_path" "$package_dir" \
+            | tee "$work/package.out"
+
+          cleanup_signing_key
+          trap - EXIT
+          packaged_hex="$(sed -n 's/^verification_key_hex=//p' "$work/package.out")"
+          test "$packaged_hex" = "$HELICOID_MACOS_DEV_TRUST_KEY"
+          test -d "$package_dir" && test ! -L "$package_dir"
+          test -f "$package_dir/manifest.json"
+          test -f "$package_dir/manifest.sig"
+          test -x "$package_dir/artifacts/hs-server"
+          echo "HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR=$package_dir" >> "$GITHUB_ENV"
+          echo "HELICOID_DEVELOPMENT_PLATFORM=$platform" >> "$GITHUB_ENV"
+
+      - name: Build full development Manager app
+        working-directory: macos
+        env:
+          HELICOID_HS_SERVER_PATH: ${{ github.workspace }}/server/target/release/hs-server
+          HELICOID_DIST_DIR: ${{ github.workspace }}/macos/dist
+        run: |
+          set -euo pipefail
+          test -n "${HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR:-}"
+          test -n "${HELICOID_MACOS_DEV_TRUST_KEY:-}"
+          test ! -e "$HELICOID_MANAGER_ACCEPTANCE_WORK/key/signing-key.pem"
+          export HELICOID_HS_SERVER_DEVELOPMENT_PACKAGE_DIR
+          export HELICOID_MACOS_DEV_TRUST_KEY
+          ./scripts/build.sh
+
+      - name: Verify packaged development Manager payload
+        working-directory: macos
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          app="$PWD/dist/Helicoid Manager.app"
+          helper="$app/Contents/Helpers/hs-server"
+          manager_bin="$app/Contents/MacOS/HelicoidManager"
+          package="$app/Contents/Resources/ServerPackage/development/package"
+          test -d "$app"
+          test -x "$manager_bin"
+          test -f "$helper" && test -x "$helper"
+          test -d "$package"
+          # The payload must match the matrix architecture this job claims to
+          # cover. Both the Manager and the helper are single-slice host builds.
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          test "$(/usr/bin/lipo -archs "$manager_bin")" = "$EXPECTED_ARCH"
+          test "$(/usr/bin/lipo -archs "$helper")" = "$EXPECTED_ARCH"
+          ./scripts/hs-server-development-bundle.sh verify --app "$app"
+          /usr/bin/codesign --verify --deep --strict "$app"
+          python3 - "$app/Contents/Info.plist" "$HELICOID_MACOS_DEV_TRUST_KEY" <<'PY'
+          import plistlib
+          import sys
+
+          with open(sys.argv[1], "rb") as handle:
+              info = plistlib.load(handle)
+          if info.get("HelicoidServerDevelopmentInstall") is not True:
+              raise SystemExit("Manager Info.plist does not request the development install path")
+          if str(info.get("HelicoidServerDevelopmentTrustKey", "")).lower() != sys.argv[2].lower():
+              raise SystemExit("Manager Info.plist trust key does not equal the build pin")
+          if info.get("CFBundleIdentifier") != "systems.helicoid.manager.dev":
+              raise SystemExit("Manager bundle identifier is not the development identifier")
+          print("Verified development Manager Info.plist pin.")
+          PY
+          echo "HELICOID_ACCEPTANCE_MANAGER_APP=$app" >> "$GITHUB_ENV"
+
+      - name: Run privileged Manager acceptance (${{ matrix.arch }}, ${{ matrix.mode }})
+        working-directory: macos
+        env:
+          HELICOID_ACCEPTANCE_MANAGER_APP: ${{ github.workspace }}/macos/dist/Helicoid Manager.app
+        run: ./scripts/run-manager-server-acceptance.sh "${{ matrix.mode }}"
+
+      - name: Fallback cleanup after interruption
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ "${GITHUB_REPOSITORY:-}" != "Helicoid-Systems/macos" ] \
+            || [ "${GITHUB_REF:-}" != "refs/heads/codex/macos-native-combined" ] \
+            || [ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ] \
+            || [ "${GITHUB_ACTIONS:-}" != "true" ]; then
+            echo "Refusing fallback cleanup outside the trusted repo/ref/hosted runner."
+            exit 0
+          fi
+          work="${HELICOID_MANAGER_ACCEPTANCE_WORK:-${RUNNER_TEMP:-/tmp}/helicoid-manager-acceptance}"
+          /bin/rm -f "$work/key/signing-key.pem" "$work/key/public-key.der"
+          /bin/rmdir "$work/key" 2>/dev/null || true
+          if [ -z "${HELICOID_MANAGER_ACCEPTANCE_NONCE:-}" ] \
+            || [ -z "${HELICOID_MANAGER_ACCEPTANCE_MARKER:-}" ]; then
+            echo "No run-bound marker identity was established; no cleanup is authorized."
+            exit 0
+          fi
+          if [ ! -x ./macos/scripts/run-manager-server-acceptance.sh ]; then
+            echo "Acceptance script is unavailable; no host cleanup was started by this job."
+            exit 0
+          fi
+          ./macos/scripts/run-manager-server-acceptance.sh cleanup
