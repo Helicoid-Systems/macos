@@ -344,7 +344,7 @@ cleanup() {
 	elif [ "$marker_status" -ne 0 ]; then
 		printf 'Error: the run-bound marker is present but invalid; refusing all cleanup\n' >&2
 		if [ -n "${work:-}" ] && [ -d "$work" ]; then
-			/usr/bin/rm -rf -- "$work" || :
+			/bin/rm -rf -- "$work" || :
 		fi
 		return 1
 	fi
@@ -377,7 +377,7 @@ cleanup() {
 			for _ in {1..20}; do
 				state=$(service_state)
 				[ "$state" = present ] || break
-				/usr/bin/sleep 0.5
+				/bin/sleep 0.5
 			done
 			if [ "$state" != absent ]; then
 				printf 'Error: launchd job did not stop cleanly (%s, bootout status %s)\n' \
@@ -489,7 +489,7 @@ cleanup() {
 	}
 
 	if [ "$cleanup_failed" -eq 0 ]; then
-		if ! /usr/bin/rm -f -- "$marker"; then
+		if ! /bin/rm -f -- "$marker"; then
 			printf 'Error: could not remove the run-bound marker\n' >&2
 			cleanup_failed=1
 		fi
@@ -497,7 +497,7 @@ cleanup() {
 		printf 'Error: cleanup did not fully verify; the run-bound marker is preserved\n' >&2
 	fi
 	if [ -n "${work:-}" ] && [ -d "$work" ]; then
-		/usr/bin/rm -rf -- "$work" || :
+		/bin/rm -rf -- "$work" || :
 	fi
 	return "$cleanup_failed"
 }
